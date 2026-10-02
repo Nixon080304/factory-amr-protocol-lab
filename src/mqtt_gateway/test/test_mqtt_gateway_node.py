@@ -1,13 +1,13 @@
-"""Real ROS action exchange; only the broker transport is replaced."""
+"""MQTT adapter real ROS exchanges; only the broker transport is replaced."""
 import json
 import threading
 import time
 
 import pytest
 import rclpy
-from rclpy.action import ActionServer, GoalResponse
+from rclpy.action import ActionClient, ActionServer, GoalResponse
 from rclpy.context import Context
-from rclpy.executors import MultiThreadedExecutor
+from rclpy.executors import MultiThreadedExecutor, SingleThreadedExecutor
 from factory_interfaces.action import ExecuteFactoryMission
 from factory_interfaces.msg import ProtocolEvent
 from geometry_msgs.msg import PoseWithCovarianceStamped
@@ -31,7 +31,7 @@ class Broker:
 
 
 @pytest.fixture
-def rig():
+def rig(request):
     context = Context()
     rclpy.init(context=context, domain_id=77)
     broker = Broker()
@@ -46,9 +46,11 @@ def rig():
         time.sleep(peer.get_parameter('execute_delay_sec').value)
         handle.succeed()
         return ExecuteFactoryMission.Result(success=True, final_state='COMPLETED')
-    server = ActionServer(peer, ExecuteFactoryMission, '/factory/execute_mission', execute,
-                          goal_callback=lambda goal: GoalResponse.REJECT if busy[0] else GoalResponse.ACCEPT)
-    executor = MultiThreadedExecutor(num_threads=3, context=context)
+    server = None if getattr(request, 'param', True) is False else ActionServer(
+        peer, ExecuteFactoryMission, '/factory/execute_mission', execute,
+        goal_callback=lambda goal: GoalResponse.REJECT if busy[0] else GoalResponse.ACCEPT)
+    executor = (SingleThreadedExecutor(context=context) if getattr(request, 'param', '') == 'result-transport'
+                else MultiThreadedExecutor(num_threads=3, context=context))
     executor.add_node(node)
     executor.add_node(peer)
     def wait(predicate):
@@ -57,7 +59,8 @@ def rig():
             executor.spin_once(timeout_sec=0.02)
         assert predicate()
     yield broker, node, executed, busy, wait, peer
-    server.destroy()
+    if server is not None:
+        server.destroy()
     executor.shutdown()
     node.destroy_node()
     peer.destroy_node()
@@ -127,6 +130,7 @@ def test_validation_busy_and_bounded_reconnect_replay(rig):
     busy[0] = True
     request(broker, 'busy')
     wait(lambda: any(s['error_code'] == 'ROBOT_BUSY' for s in statuses(broker)))
+    assert [s['state'] for s in statuses(broker)] == ['FAILED']
     broker.message(b'{invalid')
     wait(lambda: any(s['error_code'] == 'INVALID_MISSION' for s in statuses(broker)))
     assert not executed
@@ -185,4 +189,64 @@ def test_goal_acceptance_preserves_feedback_received_before_response(rig):
     request(broker)
     wait(lambda: any(s['state'] == 'LOADING' for s in statuses(broker)) and node.current_mission_id == 'M-001')
     assert node.current_state == 'LOADING'
+    assert [s['state'] for s in statuses(broker)][:2] == ['RECEIVED', 'LOADING']
     wait(lambda: any(s['state'] == 'COMPLETED' for s in statuses(broker)))
+
+
+@pytest.mark.parametrize('rig', ['result-transport'], indirect=True)
+def test_feedback_before_acceptance_waits_for_received_then_preserves_order(rig):
+    broker, node, _, _, wait, peer = rig
+    wait(lambda: node.connected and node.action.server_is_ready())
+    node.timer.cancel()
+    request(broker, 'early-feedback')
+    node._drain()
+    # Poll the real ActionClient feedback while acceptance consumption is paused.
+    wait(lambda: statuses(broker) or bool(node.awaiting_acceptance.get('early-feedback')))
+    assert statuses(broker) == []
+    assert node.registry.state_for('early-feedback') is None
+    wait(lambda: not node.completions.empty())
+    node._drain()
+    assert [s['state'] for s in statuses(broker)][:2] == ['RECEIVED', 'LOADING']
+    assert node.current_state == 'LOADING'
+    node.timer.reset()
+    wait(lambda: any(s['state'] == 'COMPLETED' for s in statuses(broker)))
+
+
+@pytest.mark.parametrize('rig', [False], indirect=True)
+def test_unavailable_server_does_not_publish_received(rig):
+    broker, node, executed, _, wait, peer = rig
+    events = []
+    subscription = peer.create_subscription(ProtocolEvent, '/factory/protocol_events', events.append, 100)
+    wait(lambda: node.events.get_subscription_count() > 0)
+    request(broker, 'unavailable')
+    wait(lambda: 'unavailable' in node.pending and bool(events))
+    assert statuses(broker) == []
+    assert 'unavailable' in node.pending
+    assert not executed
+    assert [event.event for event in events] == ['mqtt_acceptance_started']
+    peer.destroy_subscription(subscription)
+
+
+@pytest.mark.parametrize('rig', ['result-transport'], indirect=True)
+def test_destroyed_result_client_finishes_acceptance_exactly_once(rig):
+    broker, node, _, _, wait, peer = rig
+    events = []
+    subscription = peer.create_subscription(ProtocolEvent, '/factory/protocol_events', events.append, 100)
+    wait(lambda: node.events.get_subscription_count() > 0 and node.action.server_is_ready())
+    # Hold adapter response consumption, not the real ROS goal exchange.
+    node.timer.cancel()
+    request(broker, 'result-transport')
+    node._drain()
+    wait(lambda: not node.completions.empty())
+    node.action.destroy()
+    node._drain()
+    # Restore an owned real client for normal node teardown and executor polling.
+    node.action = ActionClient(node, ExecuteFactoryMission, '/factory/execute_mission',
+                               callback_group=node.protocol_group)
+    node.events.publish(ProtocolEvent(event='test_delivery_barrier'))
+    wait(lambda: any(e.event == 'test_delivery_barrier' for e in events))
+    wait(lambda: any(s['error_code'] == 'MISSION_TRANSPORT_ERROR' for s in statuses(broker)))
+    assert [e.outcome for e in events if e.event == 'mqtt_acceptance_finished'] == ['SUCCEEDED']
+    assert statuses(broker)[0]['state'] == 'RECEIVED'
+    assert statuses(broker)[-1]['state'] == 'FAILED'
+    peer.destroy_subscription(subscription)

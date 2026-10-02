@@ -1,4 +1,4 @@
-"""Actual DDS event conversion and isolated observer failures."""
+"""Observer actual DDS event conversion and isolated failures."""
 import json
 import time
 import rclpy

@@ -1,4 +1,4 @@
-"""Real transfer service; fake only the Modbus socket/client boundary."""
+"""Modbus real transfer service; fake only the socket/client boundary."""
 import asyncio
 import json
 import time

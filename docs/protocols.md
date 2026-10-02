@@ -234,6 +234,15 @@ and `state_changed` protocol events, both reliable with depth 100. Humble action
 clients can discard feedback received before their goal response registers the
 goal ID; observed action feedback remains ordered but may omit initial states.
 
+The MQTT gateway publishes `RECEIVED` only after the action server confirms
+acceptance. An unavailable server leaves the request pending without publishing
+`RECEIVED`; rejection publishes `FAILED` with `ROBOT_BUSY`. Feedback observed
+before the gateway consumes acceptance is buffered (latest 100 samples), then
+published in observed order after `RECEIVED`. Each acceptance attempt emits
+exactly one finish event. A result subscription or result transport failure
+after acceptance publishes `FAILED` with `MISSION_TRANSPORT_ERROR` without
+reopening or changing the successful acceptance phase.
+
 The MQTT adapter samples `/amcl_pose` and `/odom` with best-effort delivery.
 Telemetry publishes every 0.5 seconds at MQTT QoS 0 with fields `robot_id`,
 `mission_id`, `state`, `frame_id`, `x`, `y`, `yaw`, `linear_velocity`,

@@ -1,5 +1,6 @@
 """Serialized ROS/MQTT adapter with bounded reconnect state replay."""
 from datetime import datetime, timezone
+from collections import deque
 import json
 import math
 import queue
@@ -43,6 +44,7 @@ class MqttGatewayNode(Node):
         self.connected = False
         self.sequence = {}
         self.pending = {}
+        self.awaiting_acceptance = {}
         self.client = mqtt_client or MqttClient(host, port)
         self.client.set_handlers(lambda raw: self._enqueue('request', raw[:4097]),
                                  lambda connected: self._enqueue('connection', connected))
@@ -190,39 +192,57 @@ class MqttGatewayNode(Node):
             self._event(mission_id, 'mqtt_duplicate', 'SUCCEEDED', 'Duplicate mission')
             return
         self._event(mission_id, 'mqtt_acceptance_started')
-        self.publish_status(mission_id, 'RECEIVED', mission.pickup, 'Mission validated')
         self.pending[mission_id] = mission
 
     def _dispatch(self, mission):
         request = ExecuteFactoryMission.Goal(mission_id=mission.mission_id, robot_id=mission.robot_id,
                                              pickup_station=mission.pickup, dropoff_station=mission.dropoff, part=mission.part)
         try:
+            self.awaiting_acceptance[mission.mission_id] = deque(maxlen=100)
             future = self.action.send_goal_async(request,
-                feedback_callback=lambda feedback: self.publish_status(mission.mission_id, feedback.feedback.state,
-                                                                        feedback.feedback.station, feedback.feedback.detail))
+                feedback_callback=lambda feedback: self._feedback(mission.mission_id, feedback.feedback))
             future.add_done_callback(lambda result: self.completions.put(('accepted', mission, result)))
         except Exception as error:
-            self._failed(mission.mission_id, error)
+            self._acceptance_failed(mission.mission_id, error)
 
-    def _failed(self, mission_id, error):
+    def _acceptance_failed(self, mission_id, error):
+        self.awaiting_acceptance.pop(mission_id, None)
         self.get_logger().error(f'Mission {mission_id}: ROS action boundary failed: {error}')
         self._event(mission_id, 'mqtt_acceptance_finished', 'FAILED', 'MISSION_TRANSPORT_ERROR')
         self.publish_status(mission_id, 'FAILED', detail=str(error), error_code='MISSION_TRANSPORT_ERROR')
+
+    def _feedback(self, mission_id, feedback):
+        buffered = self.awaiting_acceptance.get(mission_id)
+        if buffered is not None:
+            # Keep observed feedback ordered after confirmed acceptance; bound memory.
+            buffered.append(feedback)
+            return
+        self.publish_status(mission_id, feedback.state, feedback.station, feedback.detail)
 
     def _accepted(self, mission, future):
         try:
             handle = future.result()
             if not handle.accepted:
+                self.awaiting_acceptance.pop(mission.mission_id, None)
                 self._event(mission.mission_id, 'mqtt_acceptance_finished', 'FAILED', 'ROBOT_BUSY')
                 self.publish_status(mission.mission_id, 'FAILED', detail='Robot rejected valid mission', error_code='ROBOT_BUSY')
                 return
-            self._event(mission.mission_id, 'mqtt_acceptance_finished', 'SUCCEEDED')
-            self.current_mission_id = mission.mission_id
-            latest = self.registry.state_for(mission.mission_id)
-            self.current_state = latest['state'] if latest else 'RECEIVED'
+        except Exception as error:
+            self._acceptance_failed(mission.mission_id, error)
+            return
+        self._event(mission.mission_id, 'mqtt_acceptance_finished', 'SUCCEEDED')
+        self.current_mission_id = mission.mission_id
+        self.publish_status(mission.mission_id, 'RECEIVED', mission.pickup, 'Mission accepted')
+        for feedback in self.awaiting_acceptance.pop(mission.mission_id, ()):
+            self._feedback(mission.mission_id, feedback)
+        try:
             handle.get_result_async().add_done_callback(lambda result: self.completions.put(('result', mission, result)))
         except Exception as error:
-            self._failed(mission.mission_id, error)
+            self._result_failed(mission.mission_id, error)
+
+    def _result_failed(self, mission_id, error):
+        self.get_logger().error(f'Mission {mission_id}: ROS result failed: {error}')
+        self.publish_status(mission_id, 'FAILED', detail=str(error), error_code='MISSION_TRANSPORT_ERROR')
 
     def _result(self, mission, future):
         try:
@@ -230,8 +250,7 @@ class MqttGatewayNode(Node):
             self.publish_status(mission.mission_id, result.final_state, mission.dropoff if result.success else '',
                                 result.message, result.error_code or None)
         except Exception as error:
-            self.get_logger().error(f'Mission {mission.mission_id}: ROS result failed: {error}')
-            self.publish_status(mission.mission_id, 'FAILED', detail=str(error), error_code='MISSION_TRANSPORT_ERROR')
+            self._result_failed(mission.mission_id, error)
 
     def destroy_node(self):
         try:
