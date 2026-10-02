@@ -175,6 +175,7 @@ class SimulationFaults:
         self.generation += 1
         generation = self.generation
         if not self.client.service_is_ready():
+            done(False)
             return False
         request = self.service_type.Request()
         request.state.name = 'wrong_marker_station'
