@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+cmake_minimum_required(VERSION 3.8)
+project(factory_simulation)
+find_package(ament_cmake REQUIRED)
+install(DIRECTORY urdf worlds models launch DESTINATION share/${PROJECT_NAME})
+if(BUILD_TESTING)
+  find_package(ament_cmake_pytest REQUIRED)
+  find_package(launch_testing_ament_cmake REQUIRED)
+  ament_add_pytest_test(test_assets test/test_assets.py)
+  add_launch_test(test/test_simulation_topics.py TIMEOUT 90)
+endif()
+ament_package()
