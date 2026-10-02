@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+string mission_id
+string robot_id
+string pickup_station
+string dropoff_station
+string part
+---
+bool success
+string final_state
+string error_code
+string message
+---
+string state
+string station
+string detail
+float32 progress

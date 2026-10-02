@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+string mission_id
+string station_id
+string part
+---
+bool accepted
+string error_code
+string message

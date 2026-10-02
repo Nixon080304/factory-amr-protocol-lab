@@ -1,2 +1,26 @@
 .worktrees/
 .superpowers/
+
+# Local Python environment and caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# ROS build products
+/build/
+/install/
+/log/
+
+# Generated reports and recorded simulation data
+/reports/
+.coverage
+htmlcov/
+*.bag
+*.db3
+*.mcap
+/bags/
+.gazebo/
+gazebo_logs/
+*.log

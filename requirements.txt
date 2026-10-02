@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
+jsonschema==4.26.0
+paho-mqtt==2.1.0
+pymodbus==3.15.0
