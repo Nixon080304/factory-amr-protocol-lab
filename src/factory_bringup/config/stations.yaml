@@ -1,0 +1,13 @@
+# All poses refer to base_footprint in the map frame.
+frame_id: map
+stations:
+  assembly:
+    x: -3.0
+    y: 0.8
+    yaw: 1.5707963267948966
+    marker_id: 10
+  inspection:
+    x: 3.0
+    y: 0.8
+    yaw: 1.5707963267948966
+    marker_id: 20

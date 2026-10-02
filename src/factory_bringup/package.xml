@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<package format="3">
+  <name>factory_bringup</name>
+  <version>0.1.0</version>
+  <description>Committed factory map, AMCL localization, and Nav2 motion.</description>
+  <maintainer email="maintainers@example.com">Factory AMR Protocol Lab maintainers</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>factory_simulation</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>nav2_bringup</exec_depend>
+  <exec_depend>nav2_amcl</exec_depend>
+  <exec_depend>nav2_map_server</exec_depend>
+  <exec_depend>nav2_navfn_planner</exec_depend>
+  <exec_depend>dwb_core</exec_depend>
+  <exec_depend>nav2_velocity_smoother</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+  <test_depend>ament_cmake_pytest</test_depend>
+  <test_depend>launch_testing_ament_cmake</test_depend>
+  <test_depend>python3-yaml</test_depend>
+  <test_depend>rclpy</test_depend>
+  <test_depend>action_msgs</test_depend>
+  <test_depend>geometry_msgs</test_depend>
+  <test_depend>nav_msgs</test_depend>
+  <test_depend>nav2_msgs</test_depend>
+  <test_depend>lifecycle_msgs</test_depend>
+  <test_depend>tf2_ros</test_depend>
+  <test_depend>gazebo_msgs</test_depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>
