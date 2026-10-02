@@ -70,7 +70,12 @@
         <min_angle>-${pi}</min_angle><max_angle>${pi}</max_angle></horizontal></scan>
         <range><min>0.12</min><max>12</max><resolution>0.01</resolution></range></ray>
       <plugin name="lidar_ros" filename="libgazebo_ros_ray_sensor.so">
-        <ros><remapping>~/out:=scan</remapping></ros>
+        <ros><remapping>~/out:=scan</remapping>
+          <qos><topic name="scan"><publisher>
+            <reliability>best_effort</reliability><durability>volatile</durability>
+            <history depth="5">keep_last</history>
+          </publisher></topic></qos>
+        </ros>
         <output_type>sensor_msgs/LaserScan</output_type><frame_name>base_scan</frame_name>
       </plugin>
     </sensor>
@@ -91,6 +96,16 @@
         <clip><near>0.02</near><far>12</far></clip>
       </camera>
       <plugin name="camera_ros" filename="libgazebo_ros_camera.so">
+        <ros><qos>
+          <topic name="camera/image_raw"><publisher>
+            <reliability>best_effort</reliability><durability>volatile</durability>
+            <history depth="5">keep_last</history>
+          </publisher></topic>
+          <topic name="camera/camera_info"><publisher>
+            <reliability>best_effort</reliability><durability>volatile</durability>
+            <history depth="5">keep_last</history>
+          </publisher></topic>
+        </qos></ros>
         <camera_name>camera</camera_name><frame_name>camera_optical_frame</frame_name>
       </plugin>
     </sensor>

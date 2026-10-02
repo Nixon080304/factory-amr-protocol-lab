@@ -42,6 +42,8 @@ def test_successful_factory_mission():
     os.environ["ROS_DOMAIN_ID"] = "80"
     os.environ["ROS_LOCALHOST_ONLY"] = "1"
     from factory_interfaces.msg import ProtocolEvent, StationDetection
+    import cv2
+    from cv_bridge import CvBridge
     from factory_simulation.entity_probe import get_entity_pose
     from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
     from lifecycle_msgs.srv import GetState
@@ -70,7 +72,7 @@ def test_successful_factory_mission():
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="system-" + uuid.uuid4().hex)
 
     def on_connect(client, userdata, flags, reason, properties):
-        client.subscribe("factory/missions/M-001/status", qos=1)
+        client.subscribe("factory/missions/+/status", qos=1)
         client.subscribe("factory/robots/amr_01/availability", qos=1)
 
     def on_message(client, userdata, message):
@@ -83,6 +85,22 @@ def test_successful_factory_mission():
     rclpy.init()
     node = rclpy.create_node("factory_system_probe", parameter_overrides=[Parameter("use_sim_time", value=True)])
     localization_samples = []
+    rendered_images = {}
+    bridge = CvBridge()
+    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+    parameters = (cv2.aruco.DetectorParameters() if hasattr(cv2.aruco, "DetectorParameters")
+                  else cv2.aruco.DetectorParameters_create())
+    parameters.minMarkerDistanceRate = 0.03
+
+    def camera(message):
+        source = stamp(message.header.stamp)
+        images.append(source)
+        assert (message.width, message.height) == (640, 480)
+        assert message.header.frame_id == "camera_optical_frame"
+        pixels = bridge.imgmsg_to_cv2(message, desired_encoding="bgr8")
+        _, ids, _ = cv2.aruco.detectMarkers(pixels, dictionary, parameters=parameters)
+        if ids is not None:
+            rendered_images[source] = (set(int(value) for value in ids.reshape(-1)), pixels)
 
     def localization(message):
         poses.append(message)
@@ -99,8 +117,8 @@ def test_successful_factory_mission():
         node.create_subscription(PoseWithCovarianceStamped, "/amcl_pose", localization,
                                  QoSProfile(depth=10, durability=DurabilityPolicy.TRANSIENT_LOCAL)),
         node.create_subscription(String, "/factory/mission_state", lambda message: states.append(message.data), 100),
-        node.create_subscription(Image, "/camera/image_raw", lambda message: images.append(stamp(message.header.stamp)),
-                                 QoSProfile(depth=100, reliability=ReliabilityPolicy.RELIABLE)),
+        node.create_subscription(Image, "/camera/image_raw", camera,
+                                 QoSProfile(depth=100, reliability=ReliabilityPolicy.BEST_EFFORT)),
         node.create_subscription(PoseStamped, "/factory/navigation_goal", goals.append,
                                  QoSProfile(depth=10, durability=DurabilityPolicy.TRANSIENT_LOCAL)),
         node.create_subscription(Marker, "/factory/station_markers", markers.append, 10),
@@ -171,9 +189,12 @@ def test_successful_factory_mission():
         assert [entry[0][2] for entry in before] == [0, 0]
         assert node.count_publishers("/odom") == 1
         assert node.count_publishers("/cmd_vel") == 1
-        camera_endpoints = node.get_publishers_info_by_topic("/camera/image_raw")
-        assert len(camera_endpoints) == 1
-        assert camera_endpoints[0].qos_profile.reliability == ReliabilityPolicy.RELIABLE
+        for topic in ("/camera/image_raw", "/camera/camera_info", "/scan"):
+            endpoints = node.get_publishers_info_by_topic(topic)
+            assert len(endpoints) == 1
+            profile = endpoints[0].qos_profile
+            assert profile.reliability == ReliabilityPolicy.BEST_EFFORT, topic
+            assert profile.durability == DurabilityPolicy.VOLATILE, topic
         result = subprocess.run([str(ROOT / "scripts/send_demo_mission.sh")], env=environment,
                                 cwd=ROOT, capture_output=True, text=True, timeout=15)
         assert result.returncode == 0, result.stderr
@@ -190,8 +211,12 @@ def test_successful_factory_mission():
                            if stamp(starts[0].stamp) < stamp(item.header.stamp) <= stamp(finishes[0].stamp)
                            and item.station_id == station and item.marker_id == marker})
 
-        # Assert delivered source-image evidence immediately at each transfer,
-        # not by assuming cross-topic delivery order or waiting until mission end.
+        def rendered_overlap(times, marker):
+            return [value for value in times[:5]
+                    if value in rendered_images and marker in rendered_images[value][0]]
+
+        # Independent best-effort subscribers need not receive identical subsets.
+        # Correlate a decoded rendered frame exactly within the five-source window.
         for leg, station, marker in [("pickup", "assembly", 10), ("dropoff", "inspection", 20)]:
             wait(lambda: any(event.event == f"perception_{leg}_finished" for event in events)
                  or any(item["state"] == "FAILED" for item in statuses),
@@ -201,9 +226,9 @@ def test_successful_factory_mission():
 
             def source_evidence_delivered():
                 times = phase_image_stamps(leg, station, marker)
-                return len(times) >= 5 and times[4] - times[0] <= 1.5 and all(value in images for value in times)
+                return len(times) >= 5 and times[4] - times[0] <= 1.5 and bool(rendered_overlap(times, marker))
 
-            wait(source_evidence_delivered, 2, f"{station}: five fresh detections need their exact rendered source images")
+            wait(source_evidence_delivered, 2, f"{station}: five fresh detections need a decoded exact rendered source frame")
         wait(lambda: any(item["state"] in ("COMPLETED", "FAILED") for item in statuses),
              max(0, mission_deadline - time.monotonic()),
              "mission did not terminate")
@@ -237,9 +262,11 @@ def test_successful_factory_mission():
                             <= stamp(finish[0].stamp) and item.station_id == station and item.marker_id == marker]
             times = sorted(set(stamp(item.header.stamp) for item in observations))
             assert len(times) >= 5 and times[4] - times[0] <= 1.5, (station, times)
-            wait(lambda: all(value in images for value in times), 2,
-                 f"{station}: detections must refer to actual rendered image stamps; missing="
-                 f"{[value for value in times if value not in images]}")
+            wait(lambda: bool(rendered_overlap(times, marker)), 2,
+                 f"{station}: confirmed window lacks a decoded exact rendered source frame")
+            overlaps = rendered_overlap(times, marker)
+            image_path = output / f"{station}_{marker}_rendered.png"
+            assert cv2.imwrite(str(image_path), rendered_images[overlaps[0]][1])
             transfer = [event for event in events if event.event == f"modbus_{leg}_finished"]
             assert len(transfer) == 1 and transfer[0].protocol == "MODBUS" and transfer[0].outcome == "SUCCEEDED"
             detail = json.loads(transfer[0].detail)
@@ -249,6 +276,7 @@ def test_successful_factory_mission():
                 assert sum(event.event == phase + "_started" for event in events) == 1
                 assert sum(event.event == phase + "_finished" for event in events) == 1
             evidence[station] = {"marker": marker, "fresh_detection_count": len(times), "image_stamps": times,
+                                 "received_rendered_source_stamps": overlaps, "rendered_png": str(image_path),
                                  "window_sec": times[4] - times[0], "transfer": detail}
         after = plc_snapshot()
         assert [entry[0][2] for entry in after] == [1, 1]
@@ -287,11 +315,25 @@ def test_successful_factory_mission():
         assert sum(event.event == "mission_started" for event in events) == 1
         assert plc_snapshot() == after
         assert len(payloads) == 3
+        second = {"mission_id": "M-002", "robot_id": "amr_01", "pickup": "assembly",
+                  "dropoff": "inspection", "part": "motor"}
+        client.publish("factory/missions/request", json.dumps(second), qos=1).wait_for_publish(timeout=5)
+        wait(lambda: any(item["mission_id"] == "M-002" and item["state"] == "FAILED"
+                         for item in statuses), 5, "consumed payload did not require restart")
+        refused = [item for item in statuses if item["mission_id"] == "M-002"]
+        assert [item["state"] for item in refused] == ["RECEIVED", "FAILED"], refused
+        assert refused[-1]["error_code"] == "RESTART_REQUIRED"
+        wait(lambda: any(event.mission_id == "M-002" and event.event == "mission_rejected"
+                         and event.detail == "RESTART_REQUIRED" for event in events), 5,
+             "explicit lifecycle rejection missing")
+        assert sum(event.event == "mission_started" for event in events) == 1
+        assert len(goals) == 2 and plc_snapshot() == after and len(payloads) == 3
         proof = {"output_dir": str(output), "states": states, "stations": evidence,
                  "plc_before": before, "plc_after": after, "payloads": payloads, "final_pose": final,
                  "part_world_pose": {"x": part.position.x, "y": part.position.y, "z": part.position.z},
                  "odom_publishers": node.count_publishers("/odom"), "cmd_vel_publishers": node.count_publishers("/cmd_vel"),
                  "action_executions": 1, "mqtt_completed_before_duplicate": 1, "mqtt_completed_after_duplicate": 2,
+                 "next_mission": refused,
                  "trace": str(trace), "report": str(report)}
         (output / "system-proof.json").write_text(json.dumps(proof, indent=2) + "\n")
         print(json.dumps(proof, indent=2))

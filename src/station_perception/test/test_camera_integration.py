@@ -23,7 +23,7 @@ import launch_testing
 import pytest
 import rclpy
 from rclpy.parameter import Parameter
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import DurabilityPolicy, ReliabilityPolicy, qos_profile_sensor_data
 from sensor_msgs.msg import Image
 import yaml
 
@@ -86,6 +86,12 @@ class TestCamera(unittest.TestCase):
         evidence.mkdir(parents=True, exist_ok=True)
         try:
             self.spin_until(lambda: bool(images), 30, "rendered camera image did not arrive")
+            for topic in ("/camera/image_raw", "/camera/camera_info", "/scan"):
+                endpoints = self.node.get_publishers_info_by_topic(topic)
+                self.assertEqual(len(endpoints), 1)
+                profile = endpoints[0].qos_profile
+                self.assertEqual(profile.reliability, ReliabilityPolicy.BEST_EFFORT, topic)
+                self.assertEqual(profile.durability, DurabilityPolicy.VOLATILE, topic)
             for station_id, station in stations.items():
                 pose = Pose()
                 pose.position.x = station["x"]
@@ -108,6 +114,7 @@ class TestCamera(unittest.TestCase):
                 processed = 0
                 station_deadline = min(self.deadline, time.monotonic() + 15)
                 matched = None
+                confirmation_messages = []
                 while not confirmed and time.monotonic() < station_deadline:
                     rclpy.spin_once(self.node, timeout_sec=0.05)
                     for message in detections[processed:]:
@@ -120,6 +127,7 @@ class TestCamera(unittest.TestCase):
                         self.assertEqual(message.header.frame_id, "camera_optical_frame")
                         self.assertGreater(message.confidence, 0.005)
                         self.assertLess(message.confidence, 0.1)
+                        confirmation_messages.append(message)
                         confirmed = window.observe(message.station_id, stamp)
                         if confirmed:
                             matched = message
@@ -129,8 +137,14 @@ class TestCamera(unittest.TestCase):
                     cv2.imwrite(str(evidence / f"{station_id}_failure.png"),
                                 bridge.imgmsg_to_cv2(image, desired_encoding="bgr8"))
                 self.assertTrue(confirmed, f"{station_id}: no five rendered marker detections at configured pose")
-                self.spin_until(lambda: stamp_seconds(matched.header) in images, 2,
-                                "detection must preserve an actual camera image timestamp")
+                # Best-effort subscribers can receive different subsets. Require
+                # exact source correlation within the confirmed five-image window.
+                confirmation_messages = confirmation_messages[-5:]
+                self.spin_until(lambda: any(stamp_seconds(message.header) in images
+                                           for message in confirmation_messages), 2,
+                                "confirmation needs an actual rendered source image")
+                matched = next(message for message in confirmation_messages
+                               if stamp_seconds(message.header) in images)
                 image = images[stamp_seconds(matched.header)]
                 pixels = bridge.imgmsg_to_cv2(image, desired_encoding="bgr8")
                 pure = ArucoStationDetector().detect(pixels)[0]

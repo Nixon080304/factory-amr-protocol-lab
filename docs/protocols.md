@@ -202,6 +202,7 @@ outcome. A terminal core requires explicit `reset()` before another mission.
 | Duplicate mission, same payload | Return current or final state; no second execution |
 | Duplicate mission, changed payload | Reject with `MISSION_ID_CONFLICT` |
 | Another valid mission while busy | Reject with `ROBOT_BUSY` |
+| Another valid idle mission after successful pickup | Acknowledge transport, then abort with `RESTART_REQUIRED`; restart the full simulation |
 | ROS mission transport exception | Publish `MISSION_TRANSPORT_ERROR`; do not resend the goal automatically |
 | MQTT disconnect | Continue the local mission, queue state transitions, reconnect with backoff |
 | Nav2 goal rejected or aborted | Clear costmaps, retry once, then `NAVIGATION_FAILED` |
@@ -242,6 +243,18 @@ published in observed order after `RECEIVED`. Each acceptance attempt emits
 exactly one finish event. A result subscription or result transport failure
 after acceptance publishes `FAILED` with `MISSION_TRANSPORT_ERROR` without
 reopening or changing the successful acceptance phase.
+
+After the first successful pickup, the process-local single-part lifecycle
+requires restarting the full simulation. Another valid idle goal is accepted
+only to return an immediate aborted action result: `success=false`,
+`final_state=FAILED`, `error_code=RESTART_REQUIRED`. Its `mission_rejected`
+protocol event carries that code; no `mission_started`, navigation, or PLC
+transfer occurs. The MQTT gateway publishes `RECEIVED` followed by
+`FAILED/RESTART_REQUIRED`. Action acceptance acknowledges transport, not physical
+execution. Completion or cancellation/failure after successful pickup preserves
+this guard; failures before successful pickup permit new requests. Identical-ID
+MQTT replay remains unchanged. Invalid and busy goals retain their existing
+rejection precedence. Restarting only the coordinator does not reset the part.
 
 The MQTT adapter samples `/amcl_pose` and `/odom` with best-effort delivery.
 Telemetry publishes every 0.5 seconds at MQTT QoS 0 with fields `robot_id`,

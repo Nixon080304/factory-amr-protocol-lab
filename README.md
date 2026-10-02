@@ -95,6 +95,10 @@ The successful simulation baseline is implemented. Reliability scenarios, CI,
 and publication remain later work. Vanished or hung transfer gateways can leave
 a stopped robot with a pending mission and unknown PLC state. No bound on
 every mission or crash recovery is claimed. Restart the simulation to reset
-the single-part lifecycle.
+the single-part lifecycle. After successful pickup, another valid mission
+returns `FAILED/RESTART_REQUIRED` without moving or transferring, even if the
+first mission later fails or is canceled. Failures before successful pickup
+permit a new mission; identical MQTT IDs still replay their recorded status.
+The guard is process-local: restart the full demo rather than only the coordinator.
 
 Licensed under Apache-2.0. See [LICENSE](LICENSE).

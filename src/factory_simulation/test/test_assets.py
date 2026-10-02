@@ -65,6 +65,21 @@ def test_robot_has_exactly_one_of_each_sensor_and_one_odometry_source():
     assert float(origin.get("xyz").split()[2]) > 0.25
 
 
+def test_sensor_publisher_configuration_uses_sensor_data_qos():
+    # DDS discovery reports reliability/durability, but Humble does not expose
+    # remote history/depth. Verify those configured policies in generated URDF.
+    root = robot()
+    publishers = {}
+    for topic in root.findall(".//sensor/plugin/ros/qos/topic"):
+        publishers[topic.get("name")] = topic.find("publisher")
+    assert set(publishers) == {"camera/image_raw", "camera/camera_info", "scan"}
+    for topic, publisher in publishers.items():
+        assert publisher.findtext("reliability") == "best_effort", topic
+        assert publisher.findtext("durability") == "volatile", topic
+        assert publisher.findtext("history") == "keep_last", topic
+        assert int(publisher.find("history").get("depth")) == 5, topic
+
+
 def models_with_poses():
     root = world()
     result = []

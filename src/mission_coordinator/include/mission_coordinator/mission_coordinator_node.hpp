@@ -47,6 +47,7 @@ private:
   std::map<std::string, std::vector<double>> poses_;
   geometry_msgs::msg::Pose pose_;
   bool pose_valid_{false}, reserved_{false}, navigation_completed_{false};
+  bool restart_required_{false};
   uint64_t mission_generation_{0};
   double phase_started_{0}, localization_started_{0}, timeout_{10}, navigation_timeout_{120};
   double last_stamp_{-1};

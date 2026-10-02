@@ -187,6 +187,45 @@ TEST_F(CoordinatorTest, RejectsInvalidAndBusyGoals) {
   pump(10);
   EXPECT_TRUE(std::any_of(events.begin(), events.end(), [](auto e) {return e.mission_id=="second" && e.detail=="ROBOT_BUSY";}));
 }
+TEST_F(CoordinatorTest, CompletedPayloadRequiresRestartBeforeAnotherExecution) {
+  ASSERT_TRUE(finish(send("first")).result->success);
+  auto second=send("second"); ASSERT_NE(second,nullptr);
+  auto result=finish(second);
+  EXPECT_EQ(result.code,rclcpp_action::ResultCode::ABORTED);
+  EXPECT_FALSE(result.result->success);
+  EXPECT_EQ(result.result->final_state,"FAILED");
+  EXPECT_EQ(result.result->error_code,"RESTART_REQUIRED");
+  EXPECT_EQ(result.result->message,"Restart the full simulation before another payload mission");
+  pump(10);
+  EXPECT_EQ(transfers.size(),2u);
+  EXPECT_EQ(nav_handles.size(),2u);
+  EXPECT_EQ(std::count_if(events.begin(),events.end(),[](auto e){return e.event=="mission_started";}),1);
+  EXPECT_TRUE(std::any_of(events.begin(),events.end(),[](auto e){return e.mission_id=="second" && e.event=="mission_rejected" && e.detail=="RESTART_REQUIRED";}));
+}
+TEST_F(CoordinatorTest, PrePickupTransferFailureAllowsNewMission) {
+  transfer_error="PLC_FAULT";
+  EXPECT_EQ(finish(send("failed")).result->error_code,"PLC_FAULT");
+  transfer_error.clear();
+  EXPECT_TRUE(finish(send("retry")).result->success);
+  EXPECT_EQ(transfers.size(),3u);
+}
+TEST_F(CoordinatorTest, CancellationAfterSuccessfulPickupRequiresRestart) {
+  hold_navigation=true;
+  auto handle=send("first");
+  for(int i=0;i<50 && nav_handles.empty();++i) {pump();}
+  ASSERT_EQ(nav_handles.size(),1u);
+  nav_handles.front()->succeed(std::make_shared<Nav::Result>());
+  for(int i=0;i<100 && nav_handles.size()<2;++i) {pump();}
+  ASSERT_EQ(transfers.size(),1u);
+  ASSERT_EQ(nav_handles.size(),2u);
+  client->async_cancel_goal(handle); pump(10);
+  EXPECT_EQ(finish(handle).result->error_code,"MISSION_CANCELED");
+  auto result=finish(send("second"));
+  EXPECT_EQ(result.code,rclcpp_action::ResultCode::ABORTED);
+  EXPECT_EQ(result.result->error_code,"RESTART_REQUIRED");
+  EXPECT_EQ(transfers.size(),1u);
+  EXPECT_EQ(nav_handles.size(),2u);
+}
 TEST_F(CoordinatorTest, ClearsBothCostmapsBeforeSoleRetry) {
   fail_navigation=1;
   auto result=finish(send());
@@ -418,6 +457,9 @@ TEST_F(CoordinatorTest, SuccessfulTransferCompletesPendingCancelAsRosCanceled) {
   EXPECT_EQ(finished.code,rclcpp_action::ResultCode::CANCELED);
   EXPECT_EQ(finished.result->error_code,"MISSION_CANCELED");
   EXPECT_EQ(transfers.size(),1u);
+  hold_transfer_station.clear();
+  EXPECT_EQ(finish(send("after_cancel")).result->error_code,"RESTART_REQUIRED");
+  EXPECT_EQ(transfers.size(),1u);
 }
 TEST_F(CoordinatorTest, FailedTransferPreservesPlcErrorDuringPendingCancel) {
   hold_transfer_station="inspection";
@@ -431,4 +473,7 @@ TEST_F(CoordinatorTest, FailedTransferPreservesPlcErrorDuringPendingCancel) {
   auto finished=finish(handle);
   EXPECT_EQ(finished.code,rclcpp_action::ResultCode::ABORTED);
   EXPECT_EQ(finished.result->error_code,"PLC_FAULT");
+  hold_transfer_station.clear();
+  EXPECT_EQ(finish(send("after_failure")).result->error_code,"RESTART_REQUIRED");
+  EXPECT_EQ(transfers.size(),2u);
 }

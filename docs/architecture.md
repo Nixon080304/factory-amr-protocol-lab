@@ -107,6 +107,15 @@ terminal reset clears pending evidence. No future evidence permits a transfer.
 The action result owns the terminal MQTT status, including its final error code;
 terminal feedback does not publish an additional completion.
 
+Gazebo publishes camera images, camera calibration, and LiDAR with sensor-data
+QoS: best-effort, volatile, keep-last depth 5. Independent best-effort subscribers
+can receive different subsets. Acceptance requires five fresh correct detector
+source timestamps within the perception phase and independently decodes at least
+one actual rendered frame with an exact timestamp in that five-image window.
+It records all detector timestamps separately from received rendered frames.
+The coordinator still requires all five distinct source observations; the
+independent probe does not assert that every subscriber receives every image.
+
 ## Running and observing
 
 Run `scripts/setup_dev.sh` once, then `DISPLAY=:0 scripts/run_demo.sh`.
@@ -135,6 +144,16 @@ Version 1 supports one robot, one motor part, and one fixed route. Resetting the
 single-part lifecycle requires restarting the simulation. Registries and active
 aggregation are process-local. Restart recovery, reliability scenarios, CI,
 and publication remain later work.
+
+The first successful pickup commits the process-local lifecycle, including a
+pickup that finishes during cancellation. Completion, later failure, and later
+cancellation do not release it. Another valid idle request acknowledges action
+transport and immediately aborts with `FAILED/RESTART_REQUIRED` and a
+`mission_rejected` event, without navigation, transfer, or `mission_started`.
+Action acceptance here acknowledges transport, not physical execution. Restart
+the full simulation, not only the coordinator, before another payload mission.
+Failures before successful pickup permit a new request. Identical MQTT mission
+IDs still replay their existing status without another action.
 
 A vanished or hung gateway after transfer dispatch can leave the mission
 pending with the robot stopped and PLC state unknown. Cancellation during

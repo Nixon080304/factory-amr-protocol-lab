@@ -51,6 +51,16 @@ MissionCoordinatorNode::MissionCoordinatorNode(const rclcpp::NodeOptions & optio
       return rclcpp_action::CancelResponse::ACCEPT;
     },
     [this](auto handle) {
+      if (restart_required_) {
+        // Goal rejection cannot carry a typed reason. Acknowledge transport,
+        // then return the lifecycle error without starting physical execution.
+        auto result=std::make_shared<Mission::Result>();
+        result->success=false; result->final_state="FAILED"; result->error_code="RESTART_REQUIRED";
+        result->message="Restart the full simulation before another payload mission";
+        event("mission_rejected", "FAILED", result->error_code, handle->get_goal()->mission_id);
+        handle->abort(result); reserved_=false;
+        return;
+      }
       goal_=handle; ++mission_generation_; pose_valid_=false;
       auto request=handle->get_goal();
       event("mission_started");
@@ -175,7 +185,14 @@ void MissionCoordinatorNode::transfer() {
   try {transfer_client_->async_send_request(request, [this,generation](rclcpp::Client<Transfer>::SharedFuture future) {
     if (!goal_ || generation!=mission_generation_) {return;}
     TransitionResult result;
-    try {auto response=future.get(); event("transfer_result",response->accepted ? "SUCCEEDED" : "FAILED",response->error_code); result=response->accepted ? machine_.transfer_succeeded() : machine_.transfer_failed(response->error_code.empty() ? "PLC_TIMEOUT" : response->error_code);}
+    try {
+      auto response=future.get();
+      // Successful pickup consumes the only part, even when cancellation is
+      // pending and transfer_succeeded() immediately ends the mission.
+      if (response->accepted && machine_.state()==MissionState::Loading) {restart_required_=true;}
+      event("transfer_result",response->accepted ? "SUCCEEDED" : "FAILED",response->error_code);
+      result=response->accepted ? machine_.transfer_succeeded() : machine_.transfer_failed(response->error_code.empty() ? "PLC_TIMEOUT" : response->error_code);
+    }
     catch (const std::exception & error) {RCLCPP_ERROR(get_logger(), "Mission %s: %s", machine_.mission().mission_id.c_str(),error.what()); result=machine_.transfer_failed("PLC_TIMEOUT");}
     transition(result);
     if (result.state==MissionState::Completed || result.state==MissionState::Failed) {finish(result.error_code);} else {navigate();}
