@@ -29,19 +29,19 @@ void NavigationAdapter::navigate(const geometry_msgs::msg::PoseStamped & pose, s
   try {client_->async_send_goal(request, options);}
   catch (const std::exception &) {++generation_; done(false);}
 }
-void NavigationAdapter::clear_costmaps(std::function<void(bool)> done) {
+void NavigationAdapter::clear_costmaps(std::function<void(bool)> done, std::function<void(const std::string &)> on_cleared) {
   const auto generation=++generation_;
   if (!local_->service_is_ready() || !global_->service_is_ready()) {done(false); return;}
   auto remaining=std::make_shared<int>(2);
   auto success=std::make_shared<bool>(true);
-  auto callback=[this, generation, remaining, success, done](rclcpp::Client<Clear>::SharedFuture future) {
+  auto callback=[this, generation, remaining, success, done, on_cleared](const std::string & service, rclcpp::Client<Clear>::SharedFuture future) {
     if (generation != generation_) {return;}
-    try {future.get();} catch (const std::exception &) {*success=false;}
+    try {future.get(); if (on_cleared) {on_cleared(service);}} catch (const std::exception &) {*success=false;}
     if (--*remaining == 0) {done(*success);}
   };
   try {
-    local_->async_send_request(std::make_shared<Clear::Request>(), callback);
-    global_->async_send_request(std::make_shared<Clear::Request>(), callback);
+    local_->async_send_request(std::make_shared<Clear::Request>(), [callback](rclcpp::Client<Clear>::SharedFuture future) {callback("/local_costmap/clear_entirely_local_costmap", future);});
+    global_->async_send_request(std::make_shared<Clear::Request>(), [callback](rclcpp::Client<Clear>::SharedFuture future) {callback("/global_costmap/clear_entirely_global_costmap", future);});
   } catch (const std::exception &) {++generation_; done(false);}
 }
 void NavigationAdapter::cancel() {

@@ -12,7 +12,7 @@ class NavigationAdapter {
 public:
   explicit NavigationAdapter(rclcpp::Node * node);
   void navigate(const geometry_msgs::msg::PoseStamped & pose, std::function<void(bool)> done);
-  void clear_costmaps(std::function<void(bool)> done);
+  void clear_costmaps(std::function<void(bool)> done, std::function<void(const std::string &)> on_cleared = {});
   void cancel();
 private:
   using Nav = nav2_msgs::action::NavigateToPose;

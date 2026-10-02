@@ -4,6 +4,8 @@
 #include <cmath>
 #include <regex>
 #include <stdexcept>
+#include <iomanip>
+#include <sstream>
 
 namespace mission_coordinator {
 MissionCoordinatorNode::MissionCoordinatorNode(const rclcpp::NodeOptions & options)
@@ -18,6 +20,9 @@ MissionCoordinatorNode::MissionCoordinatorNode(const rclcpp::NodeOptions & optio
   navigation_timeout_=declare_parameter("navigation_timeout_sec", 120.0);
   if (!std::isfinite(timeout_) || timeout_<=0 || !std::isfinite(navigation_timeout_) || navigation_timeout_<=0) {throw std::invalid_argument("timeouts must be finite and positive");}
   events_=create_publisher<factory_interfaces::msg::ProtocolEvent>("/factory/protocol_events", rclcpp::QoS(100).reliable());
+  fault_acks_=create_publisher<factory_interfaces::msg::FaultCommand>("/factory/faults/acknowledgements", rclcpp::QoS(100).reliable());
+  fault_commands_=create_subscription<factory_interfaces::msg::FaultCommand>("/factory/faults/commands", rclcpp::QoS(100).reliable(),
+    [this](factory_interfaces::msg::FaultCommand::SharedPtr message) {fault_command(*message);});
   states_=create_publisher<std_msgs::msg::String>("/factory/mission_state", rclcpp::QoS(100).reliable());
   transfer_client_=create_client<Transfer>("/factory/transfer_part");
   localization_=create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>("/amcl_pose", rclcpp::SensorDataQoS(),
@@ -103,7 +108,10 @@ void MissionCoordinatorNode::navigate() {
   pose.pose.position.x=coordinates[0]; pose.pose.position.y=coordinates[1];
   pose.pose.orientation.z=std::sin(coordinates[2]/2); pose.pose.orientation.w=std::cos(coordinates[2]/2);
   const auto generation=mission_generation_;
-  navigation_.navigate(pose, [this,generation](bool success) {
+  std::ostringstream detail;
+  detail << std::setprecision(17) << "{\"station\":\"" << machine_.current_station() << "\",\"pose\":[" << coordinates[0] << "," << coordinates[1] << "," << coordinates[2] << "]}";
+  event("navigation_goal_requested", "", detail.str());
+  auto done=[this,generation](bool success) {
     if (!goal_ || generation!=mission_generation_ || active_phase_.find("navigation_")!=0) {return;}
     event(active_phase_+"_finished", success ? "SUCCEEDED" : "FAILED"); active_phase_.clear();
     if (success) {
@@ -113,13 +121,69 @@ void MissionCoordinatorNode::navigate() {
       auto result=machine_.navigation_failed(); transition(result);
       if (result.state==MissionState::Failed) {finish(result.error_code); return;}
       phase_started_=now().seconds();
+      event("navigation_recovery_started");
       navigation_.clear_costmaps([this,generation](bool cleared) {
         if (!goal_ || generation!=mission_generation_ || machine_.state()!=MissionState::Recovering) {return;}
+        event("navigation_recovery_finished", cleared ? "SUCCEEDED" : "FAILED");
         if (!cleared) {finish("NAVIGATION_FAILED"); return;}
         event("retry"); transition(machine_.recovery_ready()); navigate();
+      }, [this,generation](const std::string & service) {
+        if (goal_ && generation==mission_generation_ && machine_.state()==MissionState::Recovering) {
+          event("costmap_cleared", "SUCCEEDED", "{\"service\":\""+service+"\"}");
+        }
       });
     }
-  });
+  };
+  if (reject_navigation()) {done(false);} else {navigation_.navigate(pose, done);}
+}
+void MissionCoordinatorNode::fault_event(const std::string & name, const factory_interfaces::msg::FaultCommand & control) {
+  factory_interfaces::msg::ProtocolEvent message;
+  message.stamp=now(); message.mission_id=control.mission_id;
+  message.protocol="FAULT"; message.direction="INTERNAL"; message.event=name; message.outcome="SUCCEEDED";
+  message.detail="{\"name\":\""+control.name+"\",\"station\":\""+control.station+"\"}";
+  events_->publish(message);
+}
+void MissionCoordinatorNode::fault_command(const factory_interfaces::msg::FaultCommand & message) {
+  if (!message.owner.empty() && message.owner!="mission_coordinator") {return;}
+  if (message.reset) {
+    for (const auto & fault:navigation_faults_) {fault_event("fault_reset", fault.command);}
+    navigation_faults_.clear();
+  } else {
+    if ((message.name!="nav_reject_once" && message.name!="nav_reject_twice") ||
+        !std::regex_match(message.mission_id, std::regex("[A-Za-z0-9_-]{1,64}")) ||
+        (!message.station.empty() && message.station!="assembly" && message.station!="inspection") ||
+        message.activation_point!="navigation_start" || !std::isfinite(message.duration) || message.duration<=0) {return;}
+    navigation_faults_.erase(std::remove_if(navigation_faults_.begin(),navigation_faults_.end(),[&message](const auto & entry) {
+      return entry.command.name==message.name && entry.command.mission_id==message.mission_id && entry.command.station==message.station;
+    }),navigation_faults_.end());
+    navigation_faults_.push_back({message,message.name=="nav_reject_once" ? 1 : 2,false,{}});
+  }
+  factory_interfaces::msg::FaultCommand ack;
+  ack.command_id=message.command_id; ack.owner="mission_coordinator"; ack.acknowledged=true; fault_acks_->publish(ack);
+}
+bool MissionCoordinatorNode::reject_navigation() {
+  const auto current=std::chrono::steady_clock::now();
+  for (auto entry=navigation_faults_.begin(); entry!=navigation_faults_.end();) {
+    if (entry->activated && std::chrono::duration<double>(current-entry->started).count()>=entry->command.duration) {
+      fault_event("fault_reset",entry->command); entry=navigation_faults_.erase(entry); continue;
+    }
+    if (entry->command.mission_id==machine_.mission().mission_id &&
+        (entry->command.station.empty() || entry->command.station==machine_.current_station())) {
+      if (!entry->activated) {
+        entry->activated=true;
+        entry->started=current;
+        fault_event("fault_activated",entry->command);
+        if (entry->command.one_shot) {fault_event("fault_consumed",entry->command);}
+      }
+      if (--entry->remaining==0) {
+        if (entry->command.one_shot) {fault_event("fault_reset",entry->command); navigation_faults_.erase(entry);}
+        else {entry->remaining=entry->command.name=="nav_reject_once" ? 1 : 2;}
+      }
+      return true;
+    }
+    ++entry;
+  }
+  return false;
 }
 void MissionCoordinatorNode::verify_station() {
   navigation_completed_=false;

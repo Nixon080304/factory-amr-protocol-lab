@@ -36,6 +36,8 @@
     </link></model>
     <include><uri>model://assembly_station</uri><name>assembly_station</name><pose>-3 2 0 0 0 0</pose></include>
     <include><uri>model://inspection_station</uri><name>inspection_station</name><pose>3 2 0 0 0 0</pose></include>
+    <!-- Fault board stays below the floor unless an explicit matching control activates it. -->
+    <include><uri>model://wrong_marker_station</uri><name>wrong_marker_station</name><pose>0 0 -10 0 0 0</pose></include>
     <!-- The visual payload uses explicit poses, including stable storage below the floor. -->
     <include><uri>model://factory_part</uri><name>factory_part</name><static>true</static><pose>-3 2 0.65 0 0 0</pose></include>
     <!-- Separate collision-free stripes animate above each fixed conveyor surface. -->

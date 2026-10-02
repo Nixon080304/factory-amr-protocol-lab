@@ -1,0 +1,7 @@
+<?xml version="1.0"?>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<sdf version="1.6"><model name="wrong_marker_station"><static>true</static><link name="board">
+  <!-- Collision-free opaque board covers the original marker without altering navigation geometry. -->
+  <visual name="backing"><pose>0 0.003 0 0 0 0</pose><geometry><box><size>0.30 0.004 0.30</size></box></geometry><material><ambient>1 1 1 1</ambient><diffuse>1 1 1 1</diffuse></material></visual>
+  <visual name="marker_plane"><pose>0 0 0 1.5707963267948966 0 0</pose><geometry><plane><normal>0 0 1</normal><size>0.22 0.22</size></plane></geometry><material><script><uri>model://inspection_station/materials/scripts</uri><uri>model://inspection_station/materials/textures</uri><name>Factory/InspectionMarker</name></script></material></visual>
+</link></model></sdf>

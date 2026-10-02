@@ -48,6 +48,8 @@ def generate_launch_description():
                {"output_dir": ParameterValue(LaunchConfiguration("output_dir"), value_type=str)}),
               ("station_perception", "station_detector", "station_detector", {"stations_file": str(stations_file)}),
               ("payload_simulator", "payload_simulator", "payload_simulator", {}),
+              ("fault_injector", "fault_injector", "fault_injector",
+               {"fault_owners": ["mqtt_gateway", "modbus_gateway", "mission_coordinator", "simulation", "qos_experiment"]}),
               ("factory_bringup", "factory_visualization", "factory_visualization", {"stations_file": str(stations_file)}),
           ]],
     ])

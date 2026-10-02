@@ -34,6 +34,9 @@ protected:
     clock_pub = peer->create_publisher<rosgraph_msgs::msg::Clock>("/clock", 10);
     pose_pub = peer->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>("/amcl_pose", rclcpp::SensorDataQoS());
     detection_pub = peer->create_publisher<factory_interfaces::msg::StationDetection>("/factory/station_detection", rclcpp::SensorDataQoS());
+    fault_pub = peer->create_publisher<factory_interfaces::msg::FaultCommand>("/factory/faults/commands", 100);
+    fault_ack_sub = peer->create_subscription<factory_interfaces::msg::FaultCommand>("/factory/faults/acknowledgements", 100,
+      [this](factory_interfaces::msg::FaultCommand::SharedPtr ack) {fault_acks.push_back(*ack);});
     events_sub = peer->create_subscription<factory_interfaces::msg::ProtocolEvent>(
       "/factory/protocol_events", rclcpp::QoS(100).reliable(),
       [this](factory_interfaces::msg::ProtocolEvent::SharedPtr event) {events.push_back(*event);});
@@ -121,6 +124,19 @@ protected:
     if (future.wait_for(0s)!=std::future_status::ready) {throw std::runtime_error("mission result timeout");}
     return future.get();
   }
+  void configure_fault(std::string name, std::string mission="test", std::string station="assembly", bool reset=false, bool one_shot=true) {
+    for (int i=0;i<100 && !fault_pub->get_subscription_count();++i) {pump();}
+    factory_interfaces::msg::FaultCommand command;
+    command.command_id=++fault_id; command.owner="mission_coordinator"; command.name=name;
+    command.mission_id=mission; command.station=station; command.activation_point="navigation_start";
+    command.duration=10.0; command.reset=reset; command.one_shot=one_shot;
+    fault_pub->publish(command);
+    auto acknowledged=[&] {return std::any_of(fault_acks.begin(),fault_acks.end(),[&](const auto & ack) {
+      return ack.command_id==fault_id && ack.owner=="mission_coordinator" && ack.acknowledged;
+    });};
+    for (int i=0;i<100 && !acknowledged();++i) {pump();}
+    ASSERT_TRUE(acknowledged());
+  }
   rclcpp::executors::SingleThreadedExecutor executor;
   std::shared_ptr<mission_coordinator::MissionCoordinatorNode> coordinator;
   rclcpp::Node::SharedPtr peer;
@@ -129,6 +145,10 @@ protected:
   rclcpp::Publisher<rosgraph_msgs::msg::Clock>::SharedPtr clock_pub;
   rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pose_pub;
   rclcpp::Publisher<factory_interfaces::msg::StationDetection>::SharedPtr detection_pub;
+  rclcpp::Publisher<factory_interfaces::msg::FaultCommand>::SharedPtr fault_pub;
+  rclcpp::Subscription<factory_interfaces::msg::FaultCommand>::SharedPtr fault_ack_sub;
+  std::vector<factory_interfaces::msg::FaultCommand> fault_acks;
+  uint64_t fault_id{0};
   rclcpp::Subscription<factory_interfaces::msg::ProtocolEvent>::SharedPtr events_sub;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr states_sub;
   rclcpp::Service<factory_interfaces::srv::TransferPart>::SharedPtr transfer;
@@ -240,6 +260,42 @@ TEST_F(CoordinatorTest, SecondNavigationFailureIsTerminal) {
   EXPECT_EQ(result.code, rclcpp_action::ResultCode::ABORTED);
   EXPECT_EQ(result.result->error_code, "NAVIGATION_FAILED");
   EXPECT_TRUE(transfers.empty());
+}
+TEST_F(CoordinatorTest, FaultForAnotherMissionNeverRejectsNavigationAndResetRemovesIt) {
+  configure_fault("nav_reject_twice","other");
+  EXPECT_TRUE(finish(send()).result->success);
+  EXPECT_EQ(nav_handles.size(),2u);
+  EXPECT_EQ(clear_count,0);
+  EXPECT_FALSE(std::any_of(events.begin(),events.end(),[](const auto & event) {return event.event=="fault_activated";}));
+  configure_fault("","","",true); pump(10);
+  EXPECT_EQ(std::count_if(events.begin(),events.end(),[](const auto & event) {
+    return event.event=="fault_reset" && event.mission_id=="other";
+  }),1);
+}
+TEST_F(CoordinatorTest, InspectionFaultDoesNotRejectPickupNavigation) {
+  configure_fault("nav_reject_twice","test","inspection");
+  EXPECT_EQ(finish(send()).result->error_code,"NAVIGATION_FAILED");
+  ASSERT_EQ(transfers.size(),1u);
+  EXPECT_EQ(transfers.front().station_id,"assembly");
+  EXPECT_EQ(nav_handles.size(),1u);
+  EXPECT_EQ(clear_count,2);
+}
+TEST_F(CoordinatorTest, ResetAcknowledgementDisarmsNavigationBeforeMission) {
+  configure_fault("nav_reject_twice");
+  configure_fault("","","",true);
+  EXPECT_TRUE(finish(send()).result->success);
+  EXPECT_EQ(clear_count,0);
+  EXPECT_EQ(nav_handles.size(),2u);
+}
+TEST_F(CoordinatorTest, PersistentRejectionRemainsEnabledUntilAcknowledgedReset) {
+  configure_fault("nav_reject_once","test","assembly",false,false);
+  EXPECT_EQ(finish(send()).result->error_code,"NAVIGATION_FAILED");
+  EXPECT_TRUE(nav_handles.empty());
+  EXPECT_TRUE(transfers.empty());
+  EXPECT_EQ(clear_count,2);
+  EXPECT_FALSE(std::any_of(events.begin(),events.end(),[](const auto & event) {return event.event=="fault_consumed";}));
+  configure_fault("","","",true); pump(10);
+  EXPECT_EQ(std::count_if(events.begin(),events.end(),[](const auto & event) {return event.event=="fault_reset";}),1);
 }
 TEST_F(CoordinatorTest, WrongMarkerNeverContactsPLC) {
   auto result=finish(send(), true, true, 20);
