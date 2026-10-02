@@ -36,3 +36,7 @@ class MissionRegistry:
 
     def state_for(self, mission_id: str) -> dict[str, object] | None:
         return deepcopy(self._states.get(mission_id))
+
+    def payload_for(self, mission_id: str) -> MissionPayload | None:
+        """Return the frozen registered identity without altering mission state."""
+        return self._missions.get(mission_id)

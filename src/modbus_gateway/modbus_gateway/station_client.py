@@ -24,7 +24,7 @@ class NetworkFailure(Exception):
 class StationClient:
     def __init__(self, host="127.0.0.1", port=1502, *,
                  response_timeout=address.RESPONSE_TIMEOUT,
-                 transfer_timeout=2.0):
+                 transfer_timeout=2.0, on_retry=None, on_state=None):
         if any(not math.isfinite(value) or value <= 0
                for value in (response_timeout, transfer_timeout)):
             raise ValueError("timeouts must be finite and positive")
@@ -33,6 +33,17 @@ class StationClient:
         self.response_timeout = response_timeout
         self.transfer_timeout = transfer_timeout
         self._lock = asyncio.Lock()
+        self._on_retry = on_retry
+        self._on_state = on_state
+
+    @staticmethod
+    def _notify(callback, *args):
+        # Observation must never change the PLC handshake outcome.
+        if callback is not None:
+            try:
+                callback(*args)
+            except Exception:
+                pass
 
     async def _network(self, operation, *, retry=True, deadline=None):
         """Retry only idempotent operations, with no hidden library retries."""
@@ -56,6 +67,7 @@ class StationClient:
                 delay = delays[attempt]
                 if deadline is not None and asyncio.get_running_loop().time() + delay >= deadline:
                     break
+                self._notify(self._on_retry, attempt + 1, delay)
                 await asyncio.sleep(delay)
         message = str(last_error) or f"PLC response timeout after {self.response_timeout}s"
         raise NetworkFailure(message) from last_error
@@ -75,6 +87,7 @@ class StationClient:
         counter = 0
         stale = False
         connected_once = False
+        last_state = None
         result = TransferResult(False, "PLC_TIMEOUT", "PLC did not respond", counter)
 
         async def request(method, *args, retry=True, deadline=None, **kwargs):
@@ -86,10 +99,15 @@ class StationClient:
             return await self._network(operation, retry=retry, deadline=deadline)
 
         async def state(deadline=None):
+            nonlocal last_state
             coils = await request(client.read_coils, 0, count=5, deadline=deadline)
             registers = await request(client.read_holding_registers, 0, count=4, deadline=deadline)
             if len(coils.bits) < 5 or len(registers.registers) != 4:
                 raise NetworkFailure("incomplete PLC state response")
+            observed = (tuple(coils.bits[:5]), tuple(registers.registers))
+            if observed != last_state:
+                last_state = observed
+                self._notify(self._on_state, unit_id, list(observed[0]), list(observed[1]))
             return coils.bits, registers.registers
 
         def fault(registers):

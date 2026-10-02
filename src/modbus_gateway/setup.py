@@ -16,4 +16,5 @@ setup(
     maintainer_email="nixonedwardwinata2004@gmail.com",
     description="Bounded Modbus transfer handshakes for factory stations.",
     license="Apache-2.0",
+    entry_points={"console_scripts": ["modbus_gateway = modbus_gateway.node:main"]},
 )

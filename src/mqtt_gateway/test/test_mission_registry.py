@@ -60,3 +60,10 @@ def test_saved_state_is_independent_of_callers_nested_mutations():
 def test_rejects_state_update_for_unregistered_mission():
     with pytest.raises(KeyError):
         MissionRegistry().update_state("unknown", {"state": "COMPLETED"})
+
+
+def test_payload_lookup_returns_only_registered_immutable_identity():
+    registry = MissionRegistry()
+    assert registry.payload_for('M-001') is None
+    registry.register(MISSION)
+    assert registry.payload_for('M-001') == MISSION

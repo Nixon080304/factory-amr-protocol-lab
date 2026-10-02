@@ -11,11 +11,12 @@ setup(
         ("share/ament_index/resource_index/packages", ["resource/mqtt_gateway"]),
         ("share/mqtt_gateway", ["package.xml"]),
     ],
-    install_requires=["setuptools", "jsonschema==4.26.0"],
+    install_requires=["setuptools", "jsonschema==4.26.0", "paho-mqtt==2.1.0"],
     extras_require={"test": ["pytest"]},
     zip_safe=False,
     maintainer="Nixon Edward Winata",
     maintainer_email="nixonedwardwinata2004@gmail.com",
     description="Validated MQTT mission identity and reconnect buffering.",
     license="Apache-2.0",
+    entry_points={"console_scripts": ["mqtt_gateway = mqtt_gateway.node:main"]},
 )

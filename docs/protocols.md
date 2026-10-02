@@ -81,7 +81,11 @@ JSON fields will be defined with the robot adapter.
 Duplicate IDs with the same canonical payload return the current or final state
 without another execution. JSON key order does not change mission identity.
 Changed payloads for the same ID return `MISSION_ID_CONFLICT`. The registry is
-in memory; process-restart recovery is outside version 1. Only one mission may
+checked after structural validation and before configured-value validation, so
+a changed, structurally valid part or route for a known ID is a conflict.
+Malformed or incorrectly typed known-ID requests still return `INVALID_MISSION`.
+Unknown IDs must pass the full version-1 configuration checks before registration.
+The registry is in memory; process-restart recovery is outside version 1. Only one mission may
 run at a time; another valid mission returns `ROBOT_BUSY`.
 
 ## Modbus TCP
@@ -198,6 +202,7 @@ outcome. A terminal core requires explicit `reset()` before another mission.
 | Duplicate mission, same payload | Return current or final state; no second execution |
 | Duplicate mission, changed payload | Reject with `MISSION_ID_CONFLICT` |
 | Another valid mission while busy | Reject with `ROBOT_BUSY` |
+| ROS mission transport exception | Publish `MISSION_TRANSPORT_ERROR`; do not resend the goal automatically |
 | MQTT disconnect | Continue the local mission, queue state transitions, reconnect with backoff |
 | Nav2 goal rejected or aborted | Clear costmaps, retry once, then `NAVIGATION_FAILED` |
 | Required marker missing | Wait up to 10 seconds, then `STATION_NOT_CONFIRMED` |
@@ -209,6 +214,57 @@ outcome. A terminal core requires explicit `reset()` before another mission.
 
 Errors include a stable machine-readable code and concise human-readable detail.
 Operational adapters must log mission ID, robot ID, station, and current state.
+
+### ROS adapter executables
+
+Run `mission_coordinator/mission_coordinator`, `mqtt_gateway/mqtt_gateway`,
+`modbus_gateway/modbus_gateway`, and `protocol_observer/protocol_observer` with
+`ros2 run <package> <executable>`. All four adapters enforce simulation time.
+The coordinator serves `/factory/execute_mission` and consumes
+`/factory/transfer_part`, `/navigate_to_pose`, `/amcl_pose`, and
+`/factory/station_detection`. Station parameters are
+`stations.assembly.pose` and `stations.inspection.pose`, each `[x, y, yaw]`
+in the map frame. Verification requires current-leg navigation success, a
+map-frame localization pose within 0.25 m and 0.25 rad, and five strictly
+increasing correct-marker image stamps within 1.5 seconds. The verification
+timeout defaults to 10 simulation seconds.
+
+The complete transition stream is `/factory/mission_state` (`std_msgs/String`)
+and `state_changed` protocol events, both reliable with depth 100. Humble action
+clients can discard feedback received before their goal response registers the
+goal ID; observed action feedback remains ordered but may omit initial states.
+
+The MQTT adapter samples `/amcl_pose` and `/odom` with best-effort delivery.
+Telemetry publishes every 0.5 seconds at MQTT QoS 0 with fields `robot_id`,
+`mission_id`, `state`, `frame_id`, `x`, `y`, `yaw`, `linear_velocity`,
+`angular_velocity`, and `timestamp`. Positions use meters, yaw uses radians,
+and velocities use meters/second and radians/second. Localization supplies the
+pose when available; otherwise odometry supplies its actual frame. Reconnection
+replays at most 100 status events in order and only the latest telemetry sample.
+The broker parameters default to `broker_host=127.0.0.1`, `broker_port=1883`.
+
+The Modbus adapter defaults to `plc_host=127.0.0.1`, `plc_port=1502`, and
+`motor_part_code=1`. It owns both Modbus phase boundaries, emits `retry` for
+network retries and `station_state_changed` for changed PLC snapshots, and
+includes the exact successful cycle counter in the transfer finish detail.
+The service runs in a separate mutually exclusive callback group so its bounded
+socket work does not prevent ROS clock updates.
+
+Cancellation during a transfer waits for the actual PLC outcome. A successful
+pending transfer returns ROS canceled with `MISSION_CANCELED`; a failed transfer
+returns ROS aborted with the PLC error. No synthetic simulation-time transfer
+timeout discards an in-flight outcome. If the gateway disappears or hangs after
+dispatch, the mission can remain pending with the robot stopped and the PLC
+state unknown. Process-crash recovery is outside version 1; tests and system
+tools must still impose their own outer deadlines.
+
+The observer writes `protocol_events.jsonl` and `mission_<SHA256(mission_id)>.md` under
+`output_dir` (default `artifacts/traces`). Later correlated phase events refresh
+an already generated terminal report. Trace or report failures are logged locally
+and never send mission commands or alter the mission outcome.
+The report name uses the full lowercase SHA-256 hex digest of the UTF-8 mission
+ID; the original ID remains in the report contents. No incoming ID or event text
+is used directly as a path component.
 
 ## Observer event contract
 

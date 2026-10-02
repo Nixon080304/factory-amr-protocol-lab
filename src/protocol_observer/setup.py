@@ -17,4 +17,5 @@ setup(
     maintainer_email="nixonedwardwinata2004@gmail.com",
     description="Append-only protocol traces and deterministic mission reports.",
     license="Apache-2.0",
+    entry_points={"console_scripts": ["protocol_observer = protocol_observer.node:main"]},
 )

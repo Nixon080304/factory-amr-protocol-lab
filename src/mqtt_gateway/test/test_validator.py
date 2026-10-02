@@ -70,3 +70,13 @@ def test_enforces_raw_byte_limit_before_decode():
     with pytest.raises(MissionValidationError) as error:
         validator.validate(b"\xff" * 4097)
     assert "4096" in error.value.reason
+
+
+def test_structural_parse_keeps_configuration_validation_explicit():
+    validator = MissionValidator()
+    parsed = validator.parse_structure(VALID.replace(b'"motor"', b'"gear"'))
+    assert parsed.part == 'gear'
+    with pytest.raises(MissionValidationError):
+        validator.validate_configuration(parsed)
+    with pytest.raises(MissionValidationError):
+        validator.parse_structure(VALID.replace(b'"motor"', b'123'))

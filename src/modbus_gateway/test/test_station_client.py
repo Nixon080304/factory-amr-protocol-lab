@@ -24,6 +24,22 @@ def test_network_retries_initial_attempt_plus_three_with_exact_delays(monkeypatc
     assert delays == [0.5, 1.0, 2.0]
 
 
+def test_retry_hook_reports_only_actual_retries(monkeypatch):
+    observed = []
+    attempts = []
+    async def sleep(delay):
+        pass
+    async def operation():
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise OSError('retry hook fixture')
+        return 42
+    monkeypatch.setattr(asyncio, 'sleep', sleep)
+    client = StationClient(on_retry=lambda attempt, delay: observed.append((attempt, delay)))
+    assert asyncio.run(client._network(operation)) == 42
+    assert observed == [(1, 0.5), (2, 1.0)]
+
+
 def test_network_exhaustion_stops_after_four_attempts(monkeypatch):
     delays = []
     attempts = []

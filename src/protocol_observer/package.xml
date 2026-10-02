@@ -6,6 +6,8 @@
   <description>Append-only protocol traces and deterministic mission reports.</description>
   <maintainer email="nixonedwardwinata2004@gmail.com">Nixon Edward Winata</maintainer>
   <license>Apache-2.0</license>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>factory_interfaces</exec_depend>
   <test_depend>python3-pytest</test_depend>
   <export>
     <build_type>ament_python</build_type>
