@@ -36,7 +36,17 @@
     </link></model>
     <include><uri>model://assembly_station</uri><name>assembly_station</name><pose>-3 2 0 0 0 0</pose></include>
     <include><uri>model://inspection_station</uri><name>inspection_station</name><pose>3 2 0 0 0 0</pose></include>
-    <include><uri>model://factory_part</uri><name>factory_part</name><pose>-3 2 0.65 0 0 0</pose></include>
+    <!-- The visual payload uses explicit poses, including stable storage below the floor. -->
+    <include><uri>model://factory_part</uri><name>factory_part</name><static>true</static><pose>-3 2 0.65 0 0 0</pose></include>
+    <!-- Separate collision-free stripes animate above each fixed conveyor surface. -->
+    <model name="assembly_conveyor"><static>true</static><pose>-3 2 0.603 0 0 0</pose><link name="belt_link">
+      <visual name="stripe"><geometry><box><size>0.7 0.08 0.004</size></box></geometry><material><ambient>1 0.8 0 1</ambient><diffuse>1 0.8 0 1</diffuse></material></visual>
+      <visual name="stripe_rear"><pose>0 -0.2 0 0 0 0</pose><geometry><box><size>0.7 0.08 0.004</size></box></geometry><material><ambient>1 0.8 0 1</ambient><diffuse>1 0.8 0 1</diffuse></material></visual>
+    </link></model>
+    <model name="inspection_conveyor"><static>true</static><pose>3 2 0.603 0 0 0</pose><link name="belt_link">
+      <visual name="stripe"><geometry><box><size>0.7 0.08 0.004</size></box></geometry><material><ambient>1 0.8 0 1</ambient><diffuse>1 0.8 0 1</diffuse></material></visual>
+      <visual name="stripe_rear"><pose>0 -0.2 0 0 0 0</pose><geometry><box><size>0.7 0.08 0.004</size></box></geometry><material><ambient>1 0.8 0 1</ambient><diffuse>1 0.8 0 1</diffuse></material></visual>
+    </link></model>
     <model name="dynamic_obstacle"><static>false</static><pose>4 -2 0.25 0 0 0</pose><link name="obstacle_link"><inertial><mass>5</mass><inertia><ixx>0.170833</ixx><iyy>0.170833</iyy><izz>0.133333</izz></inertia></inertial>
       <collision name="body"><pose>0 0 0 0 0 0</pose><geometry><box><size>0.4 0.4 0.5</size></box></geometry></collision>
       <visual name="body"><pose>0 0 0 0 0 0</pose><geometry><box><size>0.4 0.4 0.5</size></box></geometry><material><ambient>0.8 0.1 0.1 1</ambient><diffuse>0.8 0.1 0.1 1</diffuse></material></visual>
