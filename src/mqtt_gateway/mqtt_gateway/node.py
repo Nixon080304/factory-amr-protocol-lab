@@ -212,6 +212,10 @@ class MqttGatewayNode(Node):
         self.publish_status(mission_id, 'FAILED', detail=str(error), error_code='MISSION_TRANSPORT_ERROR')
 
     def _feedback(self, mission_id, feedback):
+        # The action result owns terminal status and its final error code.
+        # Terminal feedback can precede that authoritative result on DDS.
+        if feedback.state in ('COMPLETED', 'FAILED'):
+            return
         buffered = self.awaiting_acceptance.get(mission_id)
         if buffered is not None:
             # Keep observed feedback ordered after confirmed acceptance; bound memory.

@@ -1,6 +1,7 @@
 #!/bin/bash
 # SPDX-License-Identifier: Apache-2.0
 set -euo pipefail
+export PYTHONNOUSERSITE=1
 
 fail() {
     printf '%s\n' "$2" >&2
@@ -46,6 +47,10 @@ for filename in ("requirements.txt", "requirements-dev.txt"):
             raise RuntimeError(f"{requirement.name}=={version} does not satisfy {requirement.specifier}")
 for module in ("rclpy", "jsonschema", "paho.mqtt.client", "pymodbus", "pytest", "plc_simulator.server"):
     import_module(module)
+opencv = import_module("cv2")
+if not hasattr(opencv, "aruco") or not any(hasattr(opencv.aruco, api) for api in ("detectMarkers", "ArucoDetector")):
+    raise RuntimeError("Install Ubuntu python3-opencv with ArUco support")
+print(f"OpenCV ArUco: {opencv.__version__} ({opencv.__file__})")
 print("Project Python dependencies and ROS imports: ready")
 PY
 printf 'Environment: ready\n'

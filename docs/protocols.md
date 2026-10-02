@@ -277,6 +277,20 @@ is used directly as a path component.
 
 ## Observer event contract
 
+The action result owns the MQTT `COMPLETED` or `FAILED` status and its final
+error code. Terminal action feedback does not publish an additional terminal
+status. An identical duplicate request replays the saved status without another
+action execution.
+
+Sensor delivery can precede its corresponding `/clock` update. The coordinator
+keeps one current-leg AMCL candidate and at most five pending camera
+observations. No candidate or observation permits transfer while its source
+stamp is later than the shared clock. Camera observations undergo the normal
+identity, ordering, freshness, and five-image window checks when consumed.
+Invalid observations clear partial confirmation. Leg and terminal resets clear
+pending observations; far-future evidence remains subject to the perception
+timeout. Five accepted confirmation timestamps are retained separately.
+
 `ProtocolEventRecord` preserves the exact DDS fields `stamp`, `mission_id`,
 `protocol`, `direction`, `event`, `outcome`, `latency_ms`, and `detail`. Its
 timestamp is a timezone-aware UTC `datetime`; producers must share a clock

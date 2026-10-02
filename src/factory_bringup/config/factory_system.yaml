@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+/**:
+  ros__parameters:
+    use_sim_time: true
+mission_coordinator:
+  ros__parameters:
+    perception_timeout_sec: 10.0
+    navigation_timeout_sec: 120.0
+mqtt_gateway:
+  ros__parameters:
+    broker_host: 127.0.0.1
+    broker_port: 1883
+modbus_gateway:
+  ros__parameters:
+    plc_host: 127.0.0.1
+    plc_port: 1502
+    motor_part_code: 1
+protocol_observer:
+  ros__parameters:
+    output_dir: artifacts/traces

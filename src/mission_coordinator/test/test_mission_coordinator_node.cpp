@@ -256,6 +256,104 @@ TEST_F(CoordinatorTest, OldAndFutureImageTimestampsNeverConfirmStation) {
   EXPECT_EQ(finish(send("future")).result->error_code,"STATION_NOT_CONFIRMED");
   EXPECT_TRUE(transfers.empty());
 }
+TEST_F(CoordinatorTest, StationaryLocalizationWaitsForClockThenRemainsUsable) {
+  hold_navigation=true;
+  auto handle=send("clock_pose");
+  pump(10,false,false);
+  const double source_stamp=sim_time+0.08;
+  geometry_msgs::msg::PoseWithCovarianceStamped pose;
+  pose.header.frame_id="map";
+  pose.header.stamp=rclcpp::Time(static_cast<int64_t>(source_stamp*1e9));
+  pose.pose.pose=target.pose;
+  pose_pub->publish(pose);
+  for (int i=0;i<20;++i) {executor.spin_some(); std::this_thread::sleep_for(5ms);}
+  nav_handles.front()->succeed(std::make_shared<Nav::Result>());
+  for (int i=0;i<20;++i) {executor.spin_some(); std::this_thread::sleep_for(5ms);}
+  EXPECT_EQ(std::find(states.begin(),states.end(),"VERIFYING_PICKUP"),states.end());
+  EXPECT_TRUE(transfers.empty());
+  sim_time=source_stamp+0.02;
+  rosgraph_msgs::msg::Clock clock;
+  clock.clock=rclcpp::Time(static_cast<int64_t>(sim_time*1e9));
+  clock_pub->publish(clock);
+  for (int i=0;i<20;++i) {executor.spin_some(); std::this_thread::sleep_for(5ms);}
+  EXPECT_NE(std::find(states.begin(),states.end(),"VERIFYING_PICKUP"),states.end());
+  EXPECT_TRUE(transfers.empty());
+  hold_navigation=false;
+  EXPECT_TRUE(finish(handle).result->success);
+}
+TEST_F(CoordinatorTest, FutureImagesWaitForClockWithoutEarlyTransfer) {
+  hold_transfer_station="assembly";
+  auto handle=send("clock_images");
+  for (int i=0;i<50 && std::find(states.begin(),states.end(),"VERIFYING_PICKUP")==states.end();++i) {pump(1,false);}
+  ASSERT_NE(std::find(states.begin(),states.end(),"VERIFYING_PICKUP"),states.end());
+  for (int i=1;i<=5;++i) {
+    factory_interfaces::msg::StationDetection image;
+    image.header.stamp=rclcpp::Time(static_cast<int64_t>((sim_time+i*0.02)*1e9));
+    image.station_id="assembly"; image.marker_id=10;
+    detection_pub->publish(image);
+    for (int j=0;j<4;++j) {executor.spin_some(); std::this_thread::sleep_for(5ms);}
+  }
+  EXPECT_TRUE(transfers.empty());
+  sim_time+=0.12;
+  rosgraph_msgs::msg::Clock clock;
+  clock.clock=rclcpp::Time(static_cast<int64_t>(sim_time*1e9));
+  clock_pub->publish(clock);
+  for (int i=0;i<30;++i) {executor.spin_some(); std::this_thread::sleep_for(5ms);}
+  ASSERT_EQ(transfers.size(),1u);
+  ASSERT_NE(pending_transfer,nullptr);
+  factory_interfaces::srv::TransferPart::Response response; response.accepted=true;
+  transfer->send_response(*pending_transfer,response);
+  EXPECT_TRUE(finish(handle).result->success);
+}
+TEST_F(CoordinatorTest, FarFutureImagesTimeOutAndDoNotSurviveReset) {
+  auto handle=send("far_future");
+  for (int i=0;i<50 && std::find(states.begin(),states.end(),"VERIFYING_PICKUP")==states.end();++i) {pump(1,false);}
+  ASSERT_NE(std::find(states.begin(),states.end(),"VERIFYING_PICKUP"),states.end());
+  for (int i=0;i<8;++i) {
+    factory_interfaces::msg::StationDetection image;
+    image.header.stamp=rclcpp::Time(static_cast<int64_t>((sim_time+100+i*0.02)*1e9));
+    image.station_id="assembly"; image.marker_id=10;
+    detection_pub->publish(image);
+    for (int j=0;j<4;++j) {executor.spin_some(); std::this_thread::sleep_for(5ms);}
+  }
+  EXPECT_EQ(finish(handle,false).result->error_code,"STATION_NOT_CONFIRMED");
+  EXPECT_TRUE(transfers.empty());
+  EXPECT_TRUE(finish(send("after_future_reset")).result->success);
+  EXPECT_EQ(transfers.size(),2u);
+}
+TEST_F(CoordinatorTest, InvalidQueuedImagesClearPartialConfirmation) {
+  for (const auto & invalid : {"wrong", "repeated", "backward", "negative"}) {
+    const auto count=states.size();
+    auto handle=send(std::string("queued_")+invalid);
+    for (int i=0;i<50 && std::find(states.begin()+count,states.end(),"VERIFYING_PICKUP")==states.end();++i) {pump(1,false);}
+    ASSERT_NE(std::find(states.begin()+count,states.end(),"VERIFYING_PICKUP"),states.end());
+    auto publish=[this](double source,int marker=10) {
+      factory_interfaces::msg::StationDetection image;
+      image.header.stamp=rclcpp::Time(static_cast<int64_t>(source*1e9));
+      image.station_id="assembly"; image.marker_id=marker;
+      detection_pub->publish(image);
+      for (int j=0;j<4;++j) {executor.spin_some(); std::this_thread::sleep_for(5ms);}
+    };
+    for (int i=1;i<=4;++i) {publish(sim_time+i*0.02);}
+    if (std::string(invalid)=="wrong") {publish(sim_time+0.10,20);}
+    else if (std::string(invalid)=="repeated") {publish(sim_time+0.08);}
+    else if (std::string(invalid)=="backward") {publish(sim_time+0.07);}
+    else {
+      factory_interfaces::msg::StationDetection image;
+      image.header.stamp.sec=-1; image.station_id="assembly"; image.marker_id=10;
+      detection_pub->publish(image);
+      for (int j=0;j<4;++j) {executor.spin_some(); std::this_thread::sleep_for(5ms);}
+    }
+    publish(sim_time+0.12);
+    sim_time+=0.14;
+    rosgraph_msgs::msg::Clock clock;
+    clock.clock=rclcpp::Time(static_cast<int64_t>(sim_time*1e9));
+    clock_pub->publish(clock);
+    for (int i=0;i<20;++i) {executor.spin_some(); std::this_thread::sleep_for(5ms);}
+    EXPECT_TRUE(transfers.empty()) << invalid;
+    EXPECT_EQ(finish(handle,false).result->error_code,"STATION_NOT_CONFIRMED") << invalid;
+  }
+}
 TEST_F(CoordinatorTest, NegativeImageTimestampsAreRejectedWithoutException) {
   repeated_stamp=-1;
   auto result=finish(send());

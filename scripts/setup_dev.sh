@@ -1,6 +1,7 @@
 #!/bin/bash
 # SPDX-License-Identifier: Apache-2.0
 set -euo pipefail
+export PYTHONNOUSERSITE=1
 
 project_root=$(cd -- "${BASH_SOURCE[0]%/*}/.." && pwd)
 cd "$project_root"

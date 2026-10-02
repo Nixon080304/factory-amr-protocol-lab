@@ -4,7 +4,7 @@ services:
   mosquitto:
     image: eclipse-mosquitto:2.0.22
     ports:
-      - "127.0.0.1:1883:1883"
+      - "127.0.0.1:${FACTORY_MQTT_PORT:-1883}:1883"
     volumes:
       - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
     healthcheck:
@@ -18,7 +18,7 @@ services:
       context: ..
       dockerfile: docker/plc-simulator.Dockerfile
     ports:
-      - "127.0.0.1:1502:1502"
+      - "127.0.0.1:${FACTORY_PLC_PORT:-1502}:1502"
     healthcheck:
       test:
         - CMD

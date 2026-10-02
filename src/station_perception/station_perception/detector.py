@@ -19,8 +19,18 @@ class ArucoStationDetector:
     def __init__(self, marker_stations: Mapping[int, str] | None = None):
         self.marker_stations = dict({10: "assembly", 20: "inspection"}
                                     if marker_stations is None else marker_stations)
-        dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
-        self._detector = cv2.aruco.ArucoDetector(dictionary)
+        # Ubuntu 22.04 supplies OpenCV 4.5.4's module-level API; newer releases
+        # use ArucoDetector. Neither requires a user-site wheel.
+        self._dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+        parameters = (cv2.aruco.DetectorParameters() if hasattr(cv2.aruco, "DetectorParameters")
+                      else cv2.aruco.DetectorParameters_create())
+        # Keep the black-border candidate separate from the rendered white
+        # quiet-zone contour. The 4.5.4 default 0.05 suppresses the valid one.
+        parameters.minMarkerDistanceRate = 0.03
+        if hasattr(cv2.aruco, "ArucoDetector"):
+            self._detect = cv2.aruco.ArucoDetector(self._dictionary, parameters).detectMarkers
+        else:
+            self._detect = lambda image: cv2.aruco.detectMarkers(image, self._dictionary, parameters=parameters)
 
     def detect(self, image: np.ndarray) -> list[MarkerDetection]:
         """Return configured markers ordered by decreasing normalized image area.
@@ -28,7 +38,7 @@ class ArucoStationDetector:
         Accept grayscale or BGR/RGB uint8 images. Color ordering does not change
         the black-and-white marker identity. The first result is the winner.
         """
-        corners, ids, _ = self._detector.detectMarkers(image)
+        corners, ids, _ = self._detect(image)
         if ids is None:
             return []
         image_area = image.shape[0] * image.shape[1]

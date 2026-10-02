@@ -38,14 +38,24 @@ def rig(request):
     node = MqttGatewayNode(mqtt_client=broker, context=context)
     peer = rclpy.create_node('mqtt_action_peer', context=context)
     peer.declare_parameter('execute_delay_sec', 0.0)
+    peer.declare_parameter('terminal_feedback_state', '')
+    peer.terminal_gate = threading.Event()
+    peer.terminal_gate.set()
     executed = []
     busy = [False]
     def execute(handle):
         executed.append(handle.request)
         handle.publish_feedback(ExecuteFactoryMission.Feedback(state='LOADING', station='assembly', detail='confirmed'))
         time.sleep(peer.get_parameter('execute_delay_sec').value)
+        terminal = peer.get_parameter('terminal_feedback_state').value
+        if terminal:
+            handle.publish_feedback(ExecuteFactoryMission.Feedback(state=terminal, detail='terminal feedback'))
+            assert peer.terminal_gate.wait(timeout=4)
+        if terminal == 'FAILED':
+            handle.abort()
+            return ExecuteFactoryMission.Result(success=False, final_state='FAILED', error_code='PLC_FAULT', message='actual result')
         handle.succeed()
-        return ExecuteFactoryMission.Result(success=True, final_state='COMPLETED')
+        return ExecuteFactoryMission.Result(success=True, final_state='COMPLETED', message='actual result')
     server = None if getattr(request, 'param', True) is False else ActionServer(
         peer, ExecuteFactoryMission, '/factory/execute_mission', execute,
         goal_callback=lambda goal: GoalResponse.REJECT if busy[0] else GoalResponse.ACCEPT)
@@ -87,10 +97,38 @@ def test_real_action_conversion_status_schema_and_duplicate(rig):
     assert executed[0].pickup_station == 'assembly'
     assert executed[0].dropoff_station == 'inspection'
     assert all(set(s) == {'mission_id', 'robot_id', 'state', 'station', 'timestamp', 'sequence', 'detail', 'error_code'} for s in statuses(broker))
-    request(broker)
     count = len(statuses(broker))
+    request(broker)
     wait(lambda: len(statuses(broker)) > count)
     assert len(executed) == 1
+
+
+@pytest.mark.parametrize('terminal', ['COMPLETED', 'FAILED'])
+def test_action_result_owns_single_terminal_status(rig, terminal):
+    broker, node, executed, _, wait, peer = rig
+    observed = []
+    original_feedback = node._feedback
+
+    def record_feedback(mission_id, feedback):
+        observed.append(feedback.state)
+        original_feedback(mission_id, feedback)
+
+    node._feedback = record_feedback
+    peer.set_parameters([rclpy.parameter.Parameter('terminal_feedback_state', value=terminal)])
+    peer.terminal_gate.clear()
+    try:
+        request(broker)
+        wait(lambda: terminal in observed and any(s['state'] == 'RECEIVED' for s in statuses(broker)))
+        assert not [s for s in statuses(broker) if s['state'] in ('COMPLETED', 'FAILED')]
+        peer.terminal_gate.set()
+        wait(lambda: any(s['detail'] == 'actual result' for s in statuses(broker)))
+        final = [s for s in statuses(broker) if s['state'] in ('COMPLETED', 'FAILED')]
+        assert len(final) == 1
+        assert final[0]['state'] == terminal
+        assert final[0]['error_code'] == ('PLC_FAULT' if terminal == 'FAILED' else None)
+        assert len(executed) == 1
+    finally:
+        peer.terminal_gate.set()
 
 
 def test_inflight_duplicate_never_overlaps_acceptance_phase(rig):

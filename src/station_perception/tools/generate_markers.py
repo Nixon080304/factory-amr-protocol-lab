@@ -12,9 +12,11 @@ import numpy as np
 def generate_markers(output_directory: Path):
     output_directory.mkdir(parents=True, exist_ok=True)
     dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+    generate_marker = (cv2.aruco.generateImageMarker if hasattr(cv2.aruco, "generateImageMarker")
+                       else cv2.aruco.drawMarker)
     for station, marker_id in [("assembly", 10), ("inspection", 20)]:
         image = np.full((300, 300), 255, dtype=np.uint8)
-        image[30:270, 30:270] = cv2.aruco.generateImageMarker(dictionary, marker_id, 240)
+        image[30:270, 30:270] = generate_marker(dictionary, marker_id, 240)
         path = output_directory / f"{station}_{marker_id}.png"
         if not cv2.imwrite(str(path), image):
             raise RuntimeError(f"Could not write marker texture {path}")

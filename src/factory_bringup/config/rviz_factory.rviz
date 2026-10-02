@@ -38,6 +38,39 @@ Visualization Manager:
     - Class: rviz_default_plugins/TF
       Name: TF
       Enabled: false
+    - Class: rviz_default_plugins/PoseWithCovariance
+      Name: AMCL localization
+      Enabled: true
+      Topic:
+        Value: /amcl_pose
+        Durability Policy: Transient Local
+    - Class: rviz_default_plugins/Map
+      Name: Global costmap
+      Enabled: true
+      Alpha: 0.4
+      Color Scheme: costmap
+      Topic:
+        Value: /global_costmap/costmap
+        Durability Policy: Transient Local
+    - Class: rviz_default_plugins/Map
+      Name: Local costmap
+      Enabled: true
+      Alpha: 0.5
+      Color Scheme: costmap
+      Topic:
+        Value: /local_costmap/costmap
+        Durability Policy: Transient Local
+    - Class: rviz_default_plugins/Pose
+      Name: Current mission goal
+      Enabled: true
+      Topic:
+        Value: /factory/navigation_goal
+        Durability Policy: Transient Local
+    - Class: rviz_default_plugins/Marker
+      Name: Camera station identities
+      Enabled: true
+      Topic:
+        Value: /factory/station_markers
   Tools:
     - Class: rviz_default_plugins/Interact
     - Class: rviz_default_plugins/MoveCamera

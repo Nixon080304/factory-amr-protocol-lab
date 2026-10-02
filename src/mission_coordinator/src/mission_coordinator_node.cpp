@@ -25,13 +25,16 @@ MissionCoordinatorNode::MissionCoordinatorNode(const rclcpp::NodeOptions & optio
       const auto & p=message->pose.pose;
       if (message->header.stamp.sec<0 || message->header.stamp.nanosec>=1000000000u) {pose_valid_=false; return;}
       const double stamp=rclcpp::Time(message->header.stamp).seconds();
-      pose_valid_=goal_ && stamp>=localization_started_ && stamp<=now().seconds() && message->header.frame_id=="map" && std::isfinite(p.position.x) && std::isfinite(p.position.y) && std::isfinite(p.position.z) &&
+      // A sensor can arrive before the matching /clock update. Keep one
+      // current-leg candidate; localized() still forbids future evidence.
+      pose_valid_=goal_ && stamp>=localization_started_ && message->header.frame_id=="map" && std::isfinite(p.position.x) && std::isfinite(p.position.y) && std::isfinite(p.position.z) &&
         std::isfinite(p.orientation.x) && std::isfinite(p.orientation.y) && std::isfinite(p.orientation.z) && std::isfinite(p.orientation.w) &&
         std::abs(p.orientation.x*p.orientation.x+p.orientation.y*p.orientation.y+p.orientation.z*p.orientation.z+p.orientation.w*p.orientation.w-1.0)<0.01;
       pose_=p;
+      pose_stamp_=stamp;
     });
   detections_=create_subscription<factory_interfaces::msg::StationDetection>("/factory/station_detection", rclcpp::SensorDataQoS(),
-    [this](factory_interfaces::msg::StationDetection::SharedPtr message) {detection(*message);});
+    [this](factory_interfaces::msg::StationDetection::SharedPtr message) {queue_detection(*message);});
   server_=rclcpp_action::create_server<Mission>(this, "/factory/execute_mission",
     [this](auto, auto request) {
       std::string error;
@@ -82,7 +85,7 @@ void MissionCoordinatorNode::transition(const TransitionResult & result) {
 }
 void MissionCoordinatorNode::navigate() {
   navigation_completed_=false;
-  pose_valid_=false; stamps_.clear(); last_stamp_=-1;
+  pose_valid_=false; stamps_.clear(); pending_detections_.clear(); last_stamp_=received_stamp_=-1;
   active_phase_=phase("navigation"); phase_started_=now().seconds(); event(active_phase_+"_started");
   localization_started_=phase_started_;
   auto coordinates=poses_.at(machine_.current_station());
@@ -111,14 +114,42 @@ void MissionCoordinatorNode::navigate() {
 void MissionCoordinatorNode::verify_station() {
   navigation_completed_=false;
   transition(machine_.navigation_succeeded());
-  active_phase_=phase("perception"); phase_started_=now().seconds(); stamps_.clear(); last_stamp_=-1;
+  active_phase_=phase("perception"); phase_started_=now().seconds(); stamps_.clear(); pending_detections_.clear(); last_stamp_=received_stamp_=-1;
   event(active_phase_+"_started");
 }
 bool MissionCoordinatorNode::localized() const {
-  if (!pose_valid_) {return false;}
+  if (!pose_valid_ || pose_stamp_>now().seconds() || pose_stamp_<localization_started_) {return false;}
   auto target=poses_.at(machine_.current_station());
   double yaw=std::atan2(2*(pose_.orientation.w*pose_.orientation.z+pose_.orientation.x*pose_.orientation.y), 1-2*(pose_.orientation.y*pose_.orientation.y+pose_.orientation.z*pose_.orientation.z));
   return std::hypot(pose_.position.x-target[0],pose_.position.y-target[1])<=0.25 && std::abs(std::remainder(yaw-target[2],2*M_PI))<=0.25;
+}
+void MissionCoordinatorNode::queue_detection(const factory_interfaces::msg::StationDetection & message) {
+  if (!goal_ || (machine_.state()!=MissionState::VerifyingPickup && machine_.state()!=MissionState::VerifyingDropoff)) {return;}
+  auto clear=[this] {stamps_.clear(); pending_detections_.clear();};
+  if (message.header.stamp.sec<0 || message.header.stamp.nanosec>=1000000000u) {clear(); return;}
+  const double stamp=rclcpp::Time(message.header.stamp).seconds(), current=now().seconds();
+  if (stamp<phase_started_ || current-stamp>1.5 || stamp<=received_stamp_) {clear(); return;}
+  received_stamp_=stamp;
+  const int marker=machine_.current_station()=="assembly" ? 10 : 20;
+  if (message.station_id!=machine_.current_station() || message.marker_id!=marker) {
+    last_stamp_=stamp; clear(); return;
+  }
+  // Bound unconsumed observations, including a paused or delayed shared clock.
+  // Overflow invalidates the partial window rather than silently dropping a
+  // disruptive observation and retaining an old confirmation sequence.
+  if (pending_detections_.size()>=5) {clear();}
+  pending_detections_.push_back(message);
+  consume_detections();
+}
+void MissionCoordinatorNode::consume_detections() {
+  while (!pending_detections_.empty()) {
+    if (!goal_ || (machine_.state()!=MissionState::VerifyingPickup && machine_.state()!=MissionState::VerifyingDropoff)) {pending_detections_.clear(); return;}
+    const double current=now().seconds();
+    if (current<phase_started_ || current-phase_started_>=timeout_) {return;}
+    if (rclcpp::Time(pending_detections_.front().header.stamp).seconds()>current) {return;}
+    auto message=pending_detections_.front(); pending_detections_.pop_front();
+    detection(message);
+  }
 }
 void MissionCoordinatorNode::detection(const factory_interfaces::msg::StationDetection & message) {
   if (!goal_ || (machine_.state()!=MissionState::VerifyingPickup && machine_.state()!=MissionState::VerifyingDropoff)) {return;}
@@ -156,6 +187,7 @@ void MissionCoordinatorNode::transfer() {
 void MissionCoordinatorNode::tick() {
   if (!goal_) {return;}
   if (!deferred_error_.empty()) {auto error=deferred_error_; deferred_error_.clear(); transition({true, machine_.state(),error}); finish(error); return;}
+  consume_detections();
   const double elapsed=now().seconds()-phase_started_;
   if (navigation_completed_) {
     if (localized()) {verify_station();}
@@ -177,7 +209,7 @@ void MissionCoordinatorNode::finish(const std::string & error) {
   auto result=std::make_shared<Mission::Result>(); result->success=error.empty(); result->final_state=error.empty() ? "COMPLETED" : "FAILED"; result->error_code=error; result->message=error.empty() ? "Mission completed" : error;
   event("mission_finished", result->final_state, error);
   if (error.empty()) {goal_->succeed(result);} else if (error=="MISSION_CANCELED" && goal_->is_canceling()) {goal_->canceled(result);} else {goal_->abort(result);}
-  goal_.reset(); reserved_=false; pose_valid_=false; navigation_completed_=false; ++mission_generation_;
+  goal_.reset(); reserved_=false; pose_valid_=false; navigation_completed_=false; stamps_.clear(); pending_detections_.clear(); last_stamp_=received_stamp_=-1; ++mission_generation_;
   machine_.reset();
 }
 }  // namespace mission_coordinator

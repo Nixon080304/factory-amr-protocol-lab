@@ -1,73 +1,100 @@
 # Factory AMR Protocol Lab
 
-A ROS 2 lab for factory material transfer, with MQTT at the dispatcher boundary
-and Modbus TCP at the station boundary.
+A ROS 2 Humble simulation of a mobile robot carrying a motor part from assembly
+to inspection. Nav2 and AMCL navigate on a committed map, a rendered RGB camera
+confirms ArUco markers, MQTT accepts missions, and real Modbus TCP handshakes
+control the simulated PLC. Gazebo animates conveyors and payload. The observer
+writes a JSONL trace and a mission report.
 
-## Milestone status
+## Setup and demo
 
-The protocol core provides shared ROS interfaces, a C++ mission state machine,
-MQTT validation/deduplication/reconnect buffering, a standalone PLC simulator,
-Modbus transfer handshakes, and JSONL traces with mission reports. The core is
-tested without Gazebo. ROS node adapters, navigation, perception, and the full
-simulated mission workflow follow in later milestones.
+Use Ubuntu 22.04, ROS 2 Humble, Python 3.10+, Gazebo Classic, Nav2, TurtleBot3,
+OpenCV with ArUco, Docker Engine, and Docker Compose v2. Install `python3-venv`,
+`python3-colcon-common-extensions`, and `python3-rosdep`. Initialize rosdep once
+with `sudo rosdep init` if needed, run `rosdep update`, and allow your user to
+access Docker. Set up the recorded project dependencies:
 
-## Development setup
-
-Target Ubuntu 22.04, ROS 2 Humble, and Python 3.10+. Install ROS 2 Humble,
-`python3-venv`, `python3-colcon-common-extensions`, `python3-rosdep`, Docker
-Engine, and Docker Compose v2. Initialize rosdep once with `sudo rosdep init`
-if needed, then run `rosdep update`. Your user must be able to access Docker.
-
-The setup script creates `.venv` with access to system ROS Python packages,
-installs the recorded dependencies and editable standalone PLC package, then
-runs rosdep. It also installs a venv-local colcon launcher so Python package
-tests use the pinned dependencies. Its pip commands always use `.venv/bin/python`.
+Ubuntu's `python3-opencv` 4.5.4 provides the required ArUco module. Detection and
+marker generation support its API and newer OpenCV releases. The demo disables
+Python user-site packages and uses the system ROS/OpenCV packages plus the owned
+`.venv` dependencies; no user OpenCV wheel is required.
 
 ```bash
 scripts/setup_dev.sh
+```
+
+Start the demo from the repository root with a working display:
+
+```bash
+DISPLAY=:0 scripts/run_demo.sh
+```
+
+The script verifies the environment, starts healthy Compose services, builds
+incrementally with `--symlink-install`, and launches Gazebo, RViz, navigation,
+perception, and all protocol adapters. Publish in another terminal using the
+command printed by the script:
+
+```bash
+scripts/send_demo_mission.sh
+```
+
+Mission `M-001` loads at assembly marker 10 and unloads at inspection marker 20.
+The complete reliable state stream is `RECEIVED`, `NAVIGATING_TO_PICKUP`,
+`VERIFYING_PICKUP`, `LOADING`, `NAVIGATING_TO_DROPOFF`, `VERIFYING_DROPOFF`,
+`UNLOADING`, `COMPLETED`. Each station requires five fresh detections within
+1.5 seconds, current navigation success, and agreeing AMCL localization before
+transfer. Payload states are `AT_ASSEMBLY`, `IN_TRANSIT`, `AT_INSPECTION`.
+Sending the same mission again replays its final MQTT status without another
+execution or PLC cycle. Humble can omit initial action feedback; reliable state
+and protocol streams retain the complete order.
+
+Press Ctrl+C to stop. Cleanup stops only the script's launch process group and
+its newly created Compose project. A supplied preexisting project is reused
+only when both services are healthy and is preserved on exit. Host ports bind
+to localhost and default to MQTT 1883 and Modbus 1502. For concurrent demos,
+set distinct `FACTORY_MQTT_PORT`, `FACTORY_PLC_PORT`, and
+`FACTORY_COMPOSE_PROJECT`; use the same MQTT port with the mission publisher.
+The script explicitly defaults to isolated ROS domain 80 regardless of the
+caller's `ROS_DOMAIN_ID`. `FACTORY_ROS_DOMAIN_ID` permits an explicit integer
+from 1 to 232. Concurrent robots must use distinct domains. Each run chooses a
+local Gazebo master and a fresh trace directory, printed at startup.
+
+Use `DISPLAY=:0 scripts/run_demo.sh --headless` to omit GUI windows. RGB
+rendering still requires a working display. `FACTORY_OUTPUT_DIR` selects the
+observer directory; give each observer its own directory. The trace is
+`protocol_events.jsonl`; report names use the full SHA256 of the UTF-8 mission
+ID. See [architecture](docs/architecture.md) and [protocol contracts](docs/protocols.md)
+for components, RViz topics, schemas, registers, retries, and limitations.
+
+## Verification
+
+With a working display, run:
+
+```bash
+set -e
 source .venv/bin/activate
 source /opt/ros/humble/setup.bash
-scripts/verify_environment.sh
+export PYTHONNOUSERSITE=1
 colcon build --symlink-install
 source install/setup.bash
-ros2 interface show factory_interfaces/action/ExecuteFactoryMission
-ros2 interface show factory_interfaces/srv/TransferPart
-```
-
-Environment verification checks Humble, Python 3.10+, Docker daemon access,
-Compose, colcon, rosdep, recorded dependency versions, and ROS/PLC imports.
-Its distinct nonzero exit codes identify missing tools or unhealthy dependencies.
-It checks this project's requirements rather than unrelated inherited system
-packages.
-
-## Local services
-
-```bash
-docker compose -f docker/compose.yaml config --quiet
-docker compose -f docker/compose.yaml up -d --build --wait --wait-timeout 60
-docker compose -f docker/compose.yaml ps
-# After finishing, stop only this Compose project.
-docker compose -f docker/compose.yaml down
-```
-
-Mosquitto publishes host `127.0.0.1:1883`; the PLC publishes `127.0.0.1:1502`.
-Startup waits for a broker publish acknowledgment and real PLC reads on both
-station unit IDs. See [protocol contracts](docs/protocols.md) for topics,
-payloads, registers, retry bounds, errors, and observer events.
-
-## Protocol-core tests
-
-With `.venv` activated and ROS Humble sourced:
-
-```bash
-colcon build --symlink-install
-colcon test --event-handlers console_direct+
+DISPLAY=:0 colcon test --event-handlers console_direct+
 colcon test-result --verbose
-python3 -m pytest -q tests src/mqtt_gateway/test src/plc_simulator/test src/modbus_gateway/test src/protocol_observer/test
+DISPLAY=:0 python3 -m pytest -q tests src/*/test
+DISPLAY=:0 timeout 300s python3 -m pytest -q tests/system/test_successful_mission.py -s
 git diff --check
 ```
 
-The integration suite starts and stops its own local PyModbus servers. Compose
-startup above separately verifies the repeatable broker and PLC deployment.
+The system test runs actual Gazebo motion, AMCL/Nav2, rendered camera detection,
+an owned broker and PLC, and MQTT mission delivery. It checks exactly one
+execution, both PLC counters, payload transitions, final independent world and
+localization poses, duplicate suppression, and observer artifacts. Domain 80
+is reserved for this test; package tests use 72–79. Services, ports, Gazebo
+master, and output directory are isolated per run.
+
+The successful simulation baseline is implemented. Reliability scenarios, CI,
+and publication remain later work. Vanished or hung transfer gateways can leave
+a stopped robot with a pending mission and unknown PLC state. No bound on
+every mission or crash recovery is claimed. Restart the simulation to reset
+the single-part lifecycle.
 
 Licensed under Apache-2.0. See [LICENSE](LICENSE).

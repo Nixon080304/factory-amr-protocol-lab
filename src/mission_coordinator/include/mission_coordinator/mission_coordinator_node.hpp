@@ -25,6 +25,8 @@ private:
   void navigate();
   void verify_station();
   void detection(const factory_interfaces::msg::StationDetection & message);
+  void queue_detection(const factory_interfaces::msg::StationDetection & message);
+  void consume_detections();
   bool localized() const;
   void transfer();
   void tick();
@@ -48,7 +50,9 @@ private:
   uint64_t mission_generation_{0};
   double phase_started_{0}, localization_started_{0}, timeout_{10}, navigation_timeout_{120};
   double last_stamp_{-1};
+  double pose_stamp_{0}, received_stamp_{-1};
   std::deque<double> stamps_;
+  std::deque<factory_interfaces::msg::StationDetection> pending_detections_;
   std::string active_phase_, deferred_error_;
 };
 }  // namespace mission_coordinator

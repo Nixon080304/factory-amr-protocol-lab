@@ -15,6 +15,7 @@ __pycache__/
 
 # Generated reports and recorded simulation data
 /reports/
+/artifacts/
 .coverage
 htmlcov/
 *.bag
