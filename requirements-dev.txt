@@ -1,2 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 pytest>=7,<9
+# Avoid the workspace's legacy pip build-isolation behavior.
+pip>=23,<26
+# setuptools supports PEP 621/660; colcon-core requires setuptools<80.
+setuptools>=64,<80
+# Modern setuptools calls canonicalize_version(strip_trailing_zero=False).
+packaging>=24.2
