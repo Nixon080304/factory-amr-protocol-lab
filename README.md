@@ -213,3 +213,6 @@ missing-`model.config` diagnostics. This known browser noise is separate from
 actual mesh-resolution failures and is not a diagnosed Gazebo crash cause.
 
 Licensed under Apache-2.0. See [LICENSE](LICENSE).
+
+Shutdown exception policy is repeated across six entry points. Future policy
+changes must remain synchronized until a narrowly scoped common-module refactor.
