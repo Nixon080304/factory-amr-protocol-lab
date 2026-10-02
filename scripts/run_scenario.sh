@@ -17,11 +17,11 @@ import signal
 import socket
 import subprocess
 import sys
-import tempfile
 import time
 import uuid
 from protocol_observer.report import compare_scenario, scenario_matrix_markdown
 
+DOMAIN_LEASE_ROOT = Path('/tmp')
 root = Path(sys.argv[1])
 expected = json.loads((root / 'tests/scenarios/expected_outcomes.yaml').read_text())
 if len(sys.argv) != 3 or sys.argv[2] not in expected:
@@ -111,7 +111,7 @@ def allocate_domain():
     domains = [domain for domain in range(100, 221) if domain not in used]
     random.shuffle(domains)
     for domain in domains:
-        candidate = open(Path(tempfile.gettempdir()) / f'factory-amr-scenario-domain-{domain}.lock', 'a+')
+        candidate = open(DOMAIN_LEASE_ROOT / f'factory-amr-scenario-domain-{domain}.lock', 'a+')
         try:
             fcntl.flock(candidate, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:

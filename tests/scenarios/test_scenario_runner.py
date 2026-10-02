@@ -6,12 +6,49 @@ from pathlib import Path
 import signal
 import socket
 import subprocess
+import sys
 import time
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNNER = ROOT / 'scripts/run_scenario.sh'
+
+
+@pytest.fixture(autouse=True)
+def private_lease_namespace(tmp_path, monkeypatch):
+    """Redirect only the fixed lease constant in the public Python entrypoint."""
+    leases = tmp_path / 'leases'
+    leases.mkdir()
+    binaries = tmp_path / 'bin'
+    binaries.mkdir()
+    wrapper = binaries / 'python3'
+    wrapper.write_text(f'''#!{sys.executable}
+import ast, os, pathlib, sys
+if len(sys.argv) > 1 and sys.argv[1] == "-":
+    source = sys.stdin.read()
+    tree = ast.parse(source)
+    count = 0
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "DOMAIN_LEASE_ROOT":
+            assert isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name) and node.value.func.id == "Path"
+            assert len(node.value.args) == 1 and isinstance(node.value.args[0], ast.Constant) and node.value.args[0].value == "/tmp"
+            node.value.args[0].value = {str(leases)!r}
+            count += 1
+    # The matrix has no allocator; the case runner has exactly one fixed root.
+    if "def allocate_domain(" in source:
+        assert count == 1
+    else:
+        assert count == 0
+    sys.argv = sys.argv[1:]
+    exec(compile(tree, "<public-runner-private-lease>", "exec"), {{"__name__": "__main__"}})
+else:
+    os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
+''')
+    wrapper.chmod(0o755)
+    monkeypatch.setenv('PATH', str(binaries) + os.pathsep + os.environ['PATH'])
+    monkeypatch.setenv('TMPDIR', str(leases))
+    return leases
 
 
 @pytest.fixture
@@ -302,7 +339,7 @@ exec(compile(ast.Module(body=[entry], type_ignores=[]), str(adapter), "exec"), n
 @pytest.mark.parametrize('hard', [False, True])
 def test_domain_lease_remains_unavailable_until_owned_cleanup_finishes(tmp_path, lease_driver, hard):
     lease_root = tmp_path / 'leases'
-    lease_root.mkdir()
+    lease_root.mkdir(exist_ok=True)
     env = {**environment(tmp_path, lease_driver, 'lease_hard' if hard else 'lease_normal'),
            'TMPDIR': str(lease_root), 'FACTORY_TEST_ROOT': str(ROOT)}
     process = subprocess.Popen([str(RUNNER), 'success'], cwd=ROOT, env=env,
@@ -351,7 +388,7 @@ def test_domain_lease_remains_unavailable_until_owned_cleanup_finishes(tmp_path,
 
 def test_failed_cleanup_quarantines_domain_and_exhaustion_records_failure(tmp_path, lease_driver):
     lease_root = tmp_path / 'leases'
-    lease_root.mkdir()
+    lease_root.mkdir(exist_ok=True)
     with socket.socket() as listener:
         listener.bind(('127.0.0.1', 0))
         listener.listen()
@@ -388,3 +425,72 @@ def test_failed_cleanup_quarantines_domain_and_exhaustion_records_failure(tmp_pa
         assert len(rows) == 3
         assert any(any('No isolated scenario DDS domain available' in failure for failure in row['failures'])
                    for row in rows)
+
+
+def cross_tmpdir_environments(tmp_path, command, lease_root):
+    """Only domain 100 is eligible, in every private RED/GREEN namespace."""
+    directories = [lease_root, tmp_path / 'ambient-one', tmp_path / 'ambient-two']
+    for directory in directories:
+        directory.mkdir(exist_ok=True)
+        for domain in range(101, 221):
+            with (directory / f'factory-amr-scenario-domain-{domain}.lock').open('a+') as handle:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                handle.write(json.dumps(dict(domain_id=domain, quarantined=True)))
+    return [{**environment(tmp_path, command), 'TMPDIR': str(directory),
+             'FACTORY_REPORT_ROOT': str(tmp_path / f'reports-{index}')}
+            for index, directory in enumerate(directories[1:], 1)]
+
+
+def test_different_tmpdir_cannot_reserve_a_live_domain(tmp_path, command, private_lease_namespace):
+    first_env, second_env = cross_tmpdir_environments(tmp_path, command, private_lease_namespace)
+    first_env.update(FAKE_MODE='hang', FACTORY_SCENARIO_TIMEOUT='60')
+    first = subprocess.Popen([str(RUNNER), 'success'], cwd=ROOT, env=first_env,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        end = time.monotonic() + 5
+        while not list((tmp_path / 'reports-1').rglob('child.pid')) and time.monotonic() < end:
+            assert first.poll() is None
+            time.sleep(0.01)
+        child = int(next((tmp_path / 'reports-1').rglob('child.pid')).read_text())
+        assert json.loads(next((tmp_path / 'reports-1').rglob('ownership.json')).read_text())['domain_id'] == 100
+        second = subprocess.run([str(RUNNER), 'success'], cwd=ROOT, env=second_env,
+                                capture_output=True, text=True, timeout=10)
+        assert first.poll() is None
+        assert second.returncode == 1, 'Different TMPDIR bypassed a live domain lease'
+        assert not list((tmp_path / 'reports-2').rglob('ownership.json'))
+        row = json.loads(next((tmp_path / 'reports-2').rglob('outcome.json')).read_text())
+        assert any('No isolated scenario DDS domain available' in failure for failure in row['failures'])
+    finally:
+        if first.poll() is None:
+            first.send_signal(signal.SIGTERM)
+        first.wait(timeout=10)
+        assert first.returncode == 143
+        row = json.loads(next((tmp_path / 'reports-1').rglob('outcome.json')).read_text())
+        assert row['cleanup_verified']
+        if list((tmp_path / 'reports-1').rglob('child.pid')):
+            wait_stopped(int(next((tmp_path / 'reports-1').rglob('child.pid')).read_text()))
+
+
+def test_different_tmpdir_cannot_bypass_domain_quarantine(tmp_path, command, lease_driver, private_lease_namespace):
+    first_env, second_env = cross_tmpdir_environments(tmp_path, command, private_lease_namespace)
+    with socket.socket() as listener:
+        listener.bind(('127.0.0.1', 0))
+        listener.listen()
+        port = listener.getsockname()[1]
+        first_env.update(FACTORY_SCENARIO_COMMAND=str(lease_driver), FAKE_MODE='lease_failure',
+                         FACTORY_TEST_ROOT=str(ROOT), TEST_PORT=str(port))
+        first = subprocess.run([str(RUNNER), 'success'], cwd=ROOT, env=first_env,
+                               capture_output=True, text=True, timeout=10)
+        assert first.returncode == 17
+        row = json.loads(next((tmp_path / 'reports-1').rglob('outcome.json')).read_text())
+        assert not row['cleanup_verified']
+        assert json.loads(next((tmp_path / 'reports-1').rglob('ownership.json')).read_text())['domain_id'] == 100
+        second = subprocess.run([str(RUNNER), 'success'], cwd=ROOT, env=second_env,
+                                capture_output=True, text=True, timeout=10)
+        assert second.returncode == 1, 'Different TMPDIR bypassed persistent domain quarantine'
+        assert not list((tmp_path / 'reports-2').rglob('ownership.json'))
+        row = json.loads(next((tmp_path / 'reports-2').rglob('outcome.json')).read_text())
+        assert any('No isolated scenario DDS domain available' in failure for failure in row['failures'])
+        metadata = json.loads((private_lease_namespace / 'factory-amr-scenario-domain-100.lock').read_text())
+        assert metadata['quarantined'] and metadata['resources']['ports'] == [port]
+        assert f'Owned port {port} remains open' in metadata['cleanup_failures']

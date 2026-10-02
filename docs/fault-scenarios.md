@@ -26,8 +26,8 @@ if any outcome differs or the matrix is interrupted.
 
 The supervisor holds each DDS domain lease until owned descendants and services
 are verified stopped, including hard escalation after a driver timeout. A failed
-cleanup quarantines that domain in its lock file under the host temporary
-directory (normally `/tmp/factory-amr-scenario-domain-<domain>.lock`). The record
+cleanup quarantines that domain in the fixed host lock file
+`/tmp/factory-amr-scenario-domain-<domain>.lock`, independent of `TMPDIR`. The record
 retains the domain, process identities, service identities, and cleanup failures.
 Cooperating runners skip quarantine even when no process holds the lock. Clearing
 quarantine requires explicit manual verification of those recorded resources and
