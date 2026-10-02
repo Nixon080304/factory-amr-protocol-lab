@@ -19,7 +19,11 @@ def generate_launch_description():
         str(package / "urdf/factory_amr.urdf.xacro")
     ).toxml()
     model_path = (
-        str(package / "models") + os.pathsep + os.environ.get("GAZEBO_MODEL_PATH", "")
+        str(package / "models")
+        + os.pathsep
+        + os.environ.get("GAZEBO_MODEL_PATH", "")
+        + os.pathsep
+        + str(Path(get_package_share_directory("turtlebot3_description")).parent)
     )
     return LaunchDescription(
         [

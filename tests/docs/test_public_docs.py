@@ -123,3 +123,26 @@ def test_results_distinguish_clocks_revision_sources_and_unobserved_hosted_ci():
         "RViz",
     ):
         assert term in text
+
+
+def test_architecture_connectors_assign_gateway_events_and_navigation_goals():
+    root = ET.parse(ROOT / "docs/assets/architecture.svg").getroot()
+    ns = {"svg": "http://www.w3.org/2000/svg"}
+    # Independent box boundaries: gateway right edge, payload/observer tops,
+    # coordinator bottom and Nav2 top. A PLC-origin DDS route is incorrect.
+    expected = {
+        "gateway-payload-event": "M1080 150H1100V430H165V450",
+        "gateway-observer-event": "M550 430V450",
+        "coordinator-navigation-goal": "M600 165V185H400V260",
+        "navigation-evidence": "M450 260V225H650V165",
+    }
+    for name, coordinates in expected.items():
+        path = root.find(f".//svg:path[@id='{name}']", ns)
+        assert path is not None, f"Missing ownership connector: {name}"
+        assert path.get("d") == coordinates
+    paths = [path.get("d") for path in root.findall(".//svg:path", ns)]
+    assert "M970 355V410H165V450" not in paths
+    text = " ".join(root.itertext())
+    assert "modbus_gateway confirmed-cycle ProtocolEvent (DDS)" in text
+    assert "NavigateToPose goal" in text
+    assert "result + localization" in text

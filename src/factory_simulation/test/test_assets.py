@@ -2,9 +2,14 @@
 """Catch invalid robot trees, duplicate odometry, and intersecting spawn geometry."""
 
 from itertools import combinations
+import os
 from pathlib import Path
+import runpy
 import xml.etree.ElementTree as ET
 
+from ament_index_python.packages import get_package_share_directory
+from launch import LaunchContext
+from launch.actions import SetEnvironmentVariable
 import pytest
 import xacro
 
@@ -16,6 +21,31 @@ def robot():
     path = PACKAGE / "urdf/factory_amr.urdf.xacro"
     assert path.is_file(), "sensor-equipped AMR asset is missing"
     return ET.fromstring(xacro.process_file(str(path)).toxml())
+
+
+def test_launch_model_path_resolves_every_installed_robot_mesh(monkeypatch):
+    # Gazebo converts package:// mesh references to model://. Its search roots
+    # must resolve the package name, not only the project's local station models.
+    monkeypatch.setenv("GAZEBO_MODEL_PATH", "/task5/ambient-models")
+    description = runpy.run_path(str(PACKAGE / "launch/simulation.launch.py"))[
+        "generate_launch_description"
+    ]()
+    context = LaunchContext()
+    environment = {
+        context.perform_substitution(action.name[0]): context.perform_substitution(
+            action.value[0]
+        )
+        for action in description.entities
+        if isinstance(action, SetEnvironmentVariable)
+    }
+    roots = [Path(path) for path in environment["GAZEBO_MODEL_PATH"].split(os.pathsep)]
+    assert (
+        roots[0] == Path(get_package_share_directory("factory_simulation")) / "models"
+    )
+    assert Path("/task5/ambient-models") in roots
+    for mesh in robot().findall(".//visual/geometry/mesh"):
+        relative = mesh.get("filename").removeprefix("package://")
+        assert any((root / relative).is_file() for root in roots), relative
 
 
 def world():
