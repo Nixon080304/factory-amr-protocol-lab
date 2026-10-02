@@ -21,6 +21,31 @@ using Mission = factory_interfaces::action::ExecuteFactoryMission;
 using Nav = nav2_msgs::action::NavigateToPose;
 using namespace std::chrono_literals;
 
+// Only the transport boundary differs; mission state, guards and admission
+// execute unchanged production code. Normal tests forward to the real client.
+class DispatchBoundaryNode : public mission_coordinator::MissionCoordinatorNode {
+public:
+  using MissionCoordinatorNode::MissionCoordinatorNode;
+  enum class Failure { None, Dispatch, Future };
+  Failure failure{Failure::None};
+
+protected:
+  void dispatch_transfer(std::shared_ptr<Transfer::Request> request,
+                         TransferCallback callback) override {
+    if (failure == Failure::Dispatch) {
+      throw std::runtime_error("ambiguous transfer dispatch");
+    }
+    if (failure == Failure::Future) {
+      std::promise<std::shared_ptr<Transfer::Response>> promise;
+      promise.set_exception(
+          std::make_exception_ptr(std::runtime_error("transfer result lost")));
+      callback(promise.get_future().share());
+      return;
+    }
+    MissionCoordinatorNode::dispatch_transfer(std::move(request), std::move(callback));
+  }
+};
+
 class CoordinatorTest : public testing::Test {
 protected:
   static void SetUpTestSuite() { rclcpp::init(0, nullptr); }
@@ -29,7 +54,7 @@ protected:
     if (!rclcpp::ok()) {
       rclcpp::init(0, nullptr);
     }
-    coordinator = std::make_shared<mission_coordinator::MissionCoordinatorNode>(
+    coordinator = std::make_shared<DispatchBoundaryNode>(
         rclcpp::NodeOptions().parameter_overrides(
             {{"use_sim_time", true}, {"perception_timeout_sec", 2.0}}));
     peer = std::make_shared<rclcpp::Node>("mission_test_peers");
@@ -215,7 +240,7 @@ protected:
     ASSERT_TRUE(acknowledged());
   }
   rclcpp::executors::SingleThreadedExecutor executor;
-  std::shared_ptr<mission_coordinator::MissionCoordinatorNode> coordinator;
+  std::shared_ptr<DispatchBoundaryNode> coordinator;
   rclcpp::Node::SharedPtr peer;
   rclcpp_action::Client<Mission>::SharedPtr client;
   rclcpp_action::Server<Nav>::SharedPtr nav;
@@ -329,6 +354,103 @@ TEST_F(CoordinatorTest, PrePickupTransferFailureAllowsNewMission) {
   transfer_error.clear();
   EXPECT_TRUE(finish(send("retry")).result->success);
   EXPECT_EQ(transfers.size(), 3u);
+}
+TEST_F(CoordinatorTest, CleanupFailureAfterPickupRejectsDistinctMission) {
+  transfer_error = "PLC_TIMEOUT_TRANSFER_COMPLETED";
+  auto first = finish(send("cleanup_failed"));
+  EXPECT_EQ(first.code, rclcpp_action::ResultCode::ABORTED);
+  EXPECT_EQ(first.result->error_code, "PLC_TIMEOUT");
+  transfer_error.clear();
+  auto second = finish(send("after_cleanup"));
+  EXPECT_EQ(second.result->error_code, "RESTART_REQUIRED");
+  EXPECT_EQ(transfers.size(), 1u);
+  EXPECT_EQ(nav_handles.size(), 1u);
+  pump(10);
+  EXPECT_TRUE(std::any_of(events.begin(), events.end(), [](const auto &event) {
+    return event.mission_id == "after_cleanup" && event.event == "mission_rejected" &&
+           event.detail == "RESTART_REQUIRED";
+  }));
+}
+TEST_F(CoordinatorTest, UnknownPickupDuringCancellationRejectsDistinctMission) {
+  hold_transfer_station = "assembly";
+  auto handle = send("unknown_pickup");
+  for (int i = 0; i < 100 && !pending_transfer; ++i) {
+    pump();
+  }
+  ASSERT_NE(pending_transfer, nullptr);
+  auto result = client->async_get_result(handle);
+  client->async_cancel_goal(handle);
+  pump(10);
+  EXPECT_NE(result.wait_for(0s), std::future_status::ready);
+  factory_interfaces::srv::TransferPart::Response response;
+  response.accepted = false;
+  response.error_code = "PLC_TIMEOUT_TRANSFER_UNKNOWN";
+  response.message = "No completion could be established";
+  transfer->send_response(*pending_transfer, response);
+  auto first = finish(handle);
+  EXPECT_EQ(first.code, rclcpp_action::ResultCode::ABORTED);
+  EXPECT_EQ(first.result->error_code, "PLC_TIMEOUT");
+  hold_transfer_station.clear();
+  EXPECT_EQ(finish(send("after_unknown")).result->error_code, "RESTART_REQUIRED");
+  EXPECT_EQ(transfers.size(), 1u);
+  EXPECT_EQ(nav_handles.size(), 1u);
+}
+TEST_F(CoordinatorTest, ExceptionalPickupFutureRejectsDistinctMission) {
+  coordinator->failure = DispatchBoundaryNode::Failure::Future;
+  EXPECT_EQ(finish(send("lost_result")).result->error_code, "PLC_TIMEOUT");
+  coordinator->failure = DispatchBoundaryNode::Failure::None;
+  EXPECT_EQ(finish(send("after_lost_result")).result->error_code, "RESTART_REQUIRED");
+  EXPECT_TRUE(transfers.empty());
+  EXPECT_EQ(nav_handles.size(), 1u);
+}
+TEST_F(CoordinatorTest, CompletedPickupCleanupDuringCancellationRequiresRestart) {
+  hold_transfer_station = "assembly";
+  auto handle = send("completed_cleanup_cancel");
+  for (int i = 0; i < 100 && !pending_transfer; ++i) {
+    pump();
+  }
+  ASSERT_NE(pending_transfer, nullptr);
+  auto result = client->async_get_result(handle);
+  client->async_cancel_goal(handle);
+  pump(10);
+  EXPECT_NE(result.wait_for(0s), std::future_status::ready);
+  factory_interfaces::srv::TransferPart::Response response;
+  response.accepted = false;
+  response.error_code = "PLC_TIMEOUT_TRANSFER_COMPLETED";
+  transfer->send_response(*pending_transfer, response);
+  auto first = finish(handle);
+  EXPECT_EQ(first.code, rclcpp_action::ResultCode::ABORTED);
+  EXPECT_EQ(first.result->error_code, "PLC_TIMEOUT");
+  hold_transfer_station.clear();
+  EXPECT_EQ(finish(send("after_completed_cleanup_cancel")).result->error_code,
+            "RESTART_REQUIRED");
+  EXPECT_EQ(transfers.size(), 1u);
+  EXPECT_EQ(nav_handles.size(), 1u);
+}
+TEST_F(CoordinatorTest, AmbiguousPickupDispatchRejectsDistinctMission) {
+  coordinator->failure = DispatchBoundaryNode::Failure::Dispatch;
+  EXPECT_EQ(finish(send("lost_dispatch")).result->error_code, "PLC_TIMEOUT");
+  coordinator->failure = DispatchBoundaryNode::Failure::None;
+  EXPECT_EQ(finish(send("after_lost_dispatch")).result->error_code, "RESTART_REQUIRED");
+  EXPECT_TRUE(transfers.empty());
+  EXPECT_EQ(nav_handles.size(), 1u);
+}
+TEST_F(CoordinatorTest, UnavailableTransferServiceAllowsSafeRetry) {
+  transfer.reset();
+  pump(30);
+  EXPECT_EQ(finish(send("not_dispatched")).result->error_code, "PLC_TIMEOUT");
+  EXPECT_TRUE(transfers.empty());
+  transfer = peer->create_service<factory_interfaces::srv::TransferPart>(
+      "/factory/transfer_part",
+      [this](
+          std::shared_ptr<factory_interfaces::srv::TransferPart::Request> request,
+          std::shared_ptr<factory_interfaces::srv::TransferPart::Response> response) {
+        transfers.push_back(*request);
+        response->accepted = true;
+      });
+  pump(30);
+  EXPECT_TRUE(finish(send("safe_retry")).result->success);
+  EXPECT_EQ(transfers.size(), 2u);
 }
 TEST_F(CoordinatorTest, CancellationAfterSuccessfulPickupRequiresRestart) {
   hold_navigation = true;

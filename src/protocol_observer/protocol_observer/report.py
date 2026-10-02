@@ -225,4 +225,44 @@ class MissionReport:
                 f"| Final outcome | {_markdown_text(self.final_outcome)} |",
             ]
         )
+        transfers = []
+        for event in self.events:
+            if event.protocol != "MODBUS" or event.event not in (
+                "modbus_pickup_finished",
+                "modbus_dropoff_finished",
+            ):
+                continue
+            try:
+                detail = json.loads(event.detail)
+            except (ValueError, TypeError, RecursionError):
+                continue
+            if not isinstance(detail, dict):
+                continue
+            physical = detail.get(
+                "transfer_outcome",
+                "COMPLETED" if event.outcome == "SUCCEEDED" else "not available",
+            )
+            cells = [
+                detail.get("station_id", "not available"),
+                detail.get("transfer_kind", "not available"),
+                detail.get("cycle_counter", "not available"),
+                physical,
+                event.outcome,
+                detail.get("error_code", ""),
+                detail.get("message", ""),
+            ]
+            transfers.append(
+                "| " + " | ".join(_markdown_text(str(cell)) for cell in cells) + " |"
+            )
+        if transfers:
+            rows.extend(
+                [
+                    "",
+                    "## Transfer evidence",
+                    "",
+                    "| Station | Kind | Counter | Physical outcome | Protocol outcome | Error | Detail |",
+                    "| --- | --- | --- | --- | --- | --- | --- |",
+                    *transfers,
+                ]
+            )
         return "\n".join(rows) + "\n"

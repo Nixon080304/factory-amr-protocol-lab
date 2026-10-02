@@ -9,8 +9,10 @@ import time
 from dataclasses import asdict, dataclass
 
 import rclpy
+from rclpy.impl.implementation_singleton import rclpy_implementation
 from rclpy.action import ActionClient
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
@@ -579,9 +581,23 @@ class MqttGatewayNode(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = MqttGatewayNode()
+    node = None
+    executor = SingleThreadedExecutor()
     try:
-        rclpy.spin(node)
+        node = MqttGatewayNode()
+        executor.add_node(node)
+        executor.spin()
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    except rclpy_implementation.RCLError as error:
+        # Humble can race signal shutdown while creating its next wait set.
+        if rclpy.ok() or not any(
+            message in str(error)
+            for message in ("context is invalid", "context is not valid")
+        ):
+            raise
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        executor.shutdown()
+        if node is not None:
+            node.destroy_node()
+        rclpy.try_shutdown()

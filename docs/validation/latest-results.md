@@ -65,6 +65,15 @@ PID, start time, and process group. Owned resource cleanup passes, but the
 Gazebo client exits with SIGSEGV (signal 11) during this diagnostic's SIGINT
 teardown. This additional lifecycle concern is not suppressed or resolved here.
 
+Two standalone close-up receipts record Gazebo client SIGSEGV during teardown;
+the cause remains unverified. The full public GUI mission instead records a
+clean client exit. A current-candidate public GUI start/mission/stop receipt,
+including every child exit status, remains a release gate. A supported-path
+client SIGSEGV blocks release. The resolved-mesh receipt also contains 407
+model-browser missing-`model.config` errors for unrelated ROS share packages.
+This accepted GUI noise does not mean the AMR meshes are missing and does not
+establish a crash cause. Actual asset-resolution failures remain separate.
+
 ## Earlier complete fault matrix
 
 The earlier local matrix at revision
@@ -100,18 +109,26 @@ The captured RViz view includes the map, AMCL localization, LiDAR scan, global
 and local costmaps, Nav2 plan, current goal, and camera station labels. Labels
 use configured station positions; they are not measured 3D marker poses.
 
-Actual logs include Xacro escape warnings, Nav2's default goal-checker warning,
+The source-bound recording logs include Xacro escape warnings, Nav2's default goal-checker warning,
 and RViz GLSL sampler, covariance, and message-filter diagnostics. Some Python
 adapters also report `rcl_shutdown already called on the given context` during
 SIGINT teardown; six children exit 1, while eighteen exit cleanly. This shutdown
-concern does not alter the measured mission
-result; owned process/service cleanup is checked independently. Rendering on
+concern does not alter the measured mission result. The subsequent reliability
+fix handles expected signal shutdown and drains owned executors before node
+destruction. The system gate now records and requires clean exits for every
+normal child, separately from wrapper interruption and process absence. These
+changes do not rewrite the six historical failures or substitute for the pending
+current-candidate GUI receipt. Rendering on
 every graphics driver is not guaranteed.
 
-Version 1 supports one fixed part and route. A successful pickup consumes the
+Version 1 supports one fixed part and route. A confirmed or uncertain pickup consumes the
 lifecycle; another distinct mission fails with `RESTART_REQUIRED` until the
 full simulation restarts. Same-ID replay remains supported. Registries are
 process-local, and a hung transfer gateway can leave a stopped pending mission
 with unknown PLC state. No general crash recovery or production security model
 is claimed. See [architecture](../architecture.md) and
 [protocol contracts](../protocols.md) for the exact safety boundaries.
+Optional MQTT password-file authentication and obstacle-triggered physical
+replanning/recovery are explicitly deferred and are not delivered. The
+controllable non-static obstacle remains; current recovery evidence uses Nav2
+adapter rejection, real costmap clears, and retry of the same leg.

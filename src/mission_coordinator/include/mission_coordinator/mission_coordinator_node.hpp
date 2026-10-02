@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 #include <deque>
+#include <functional>
 #include <map>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
@@ -21,10 +22,15 @@ public:
   explicit MissionCoordinatorNode(
       const rclcpp::NodeOptions &options = rclcpp::NodeOptions());
 
+protected:
+  using Transfer = factory_interfaces::srv::TransferPart;
+  using TransferCallback = std::function<void(rclcpp::Client<Transfer>::SharedFuture)>;
+  virtual void dispatch_transfer(std::shared_ptr<Transfer::Request> request,
+                                 TransferCallback callback);
+
 private:
   using Mission = factory_interfaces::action::ExecuteFactoryMission;
   using Handle = rclcpp_action::ServerGoalHandle<Mission>;
-  using Transfer = factory_interfaces::srv::TransferPart;
   void transition(const TransitionResult &result);
   void navigate();
   void verify_station();

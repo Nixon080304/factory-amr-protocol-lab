@@ -1,7 +1,7 @@
 """Bounded Modbus handshakes without replaying ambiguous cycle requests."""
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 
 from pymodbus.client import AsyncModbusTcpClient
@@ -16,6 +16,8 @@ class TransferResult:
     error_code: str
     message: str
     cycle_counter: int
+    # Physical outcome is independent of protocol cleanup success.
+    outcome: str = "NOT_REQUESTED"
 
 
 class NetworkFailure(Exception):
@@ -118,13 +120,20 @@ class StationClient:
         stale = False
         connected_once = False
         last_state = None
+        outcome = "NOT_REQUESTED"
+        completed_counter = None
         result = TransferResult(False, "PLC_TIMEOUT", "PLC did not respond", counter)
 
-        async def request(method, *args, retry=True, deadline=None, **kwargs):
+        async def request(
+            method, *args, retry=True, deadline=None, physical_request=False, **kwargs
+        ):
             async def operation():
+                nonlocal outcome
                 if not client.connected:
                     if not await client.connect():
                         raise NetworkFailure("PLC connection failed")
+                if physical_request:
+                    outcome = "UNKNOWN"
                 return await method(*args, device_id=unit_id, **kwargs)
 
             return await self._network(operation, retry=retry, deadline=deadline)
@@ -177,12 +186,16 @@ class StationClient:
                         True,
                         retry=False,
                         deadline=deadline,
+                        physical_request=True,
                     )
                 except NetworkFailure:
                     pass
                 while asyncio.get_running_loop().time() < deadline:
                     coils, registers = await state(deadline)
                     observed = registers[address.CYCLE_COUNTER]
+                    if observed != counter:
+                        outcome = "COMPLETED"
+                        completed_counter = observed
                     if coils[address.STATION_FAULT]:
                         result = fault(registers)
                         break
@@ -208,7 +221,7 @@ class StationClient:
                         else "PLC transfer completion timed out",
                         counter,
                     )
-        except NetworkFailure as error:
+        except Exception as error:
             result = TransferResult(
                 False,
                 "STALE_PLC_STATE" if stale else "PLC_TIMEOUT",
@@ -228,7 +241,7 @@ class StationClient:
                         deadline=asyncio.get_running_loop().time()
                         + self.response_timeout,
                     )
-                except NetworkFailure as error:
+                except Exception as error:
                     message = f"{result.message}; robot coil cleanup failed: {error}"
                     result = TransferResult(
                         False,
@@ -237,4 +250,10 @@ class StationClient:
                         result.cycle_counter,
                     )
             client.close()
-        return result
+        return replace(
+            result,
+            outcome=outcome,
+            cycle_counter=completed_counter
+            if completed_counter is not None
+            else result.cycle_counter,
+        )

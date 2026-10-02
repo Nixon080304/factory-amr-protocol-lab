@@ -109,6 +109,7 @@ def test_connection_timeout_uses_real_closed_localhost_port():
         started = asyncio.get_running_loop().time()
         result = await StationClient(port=port, response_timeout=0.1).transfer(1, 42)
         assert not result.success and result.error_code == "PLC_TIMEOUT"
+        assert result.outcome == "NOT_REQUESTED"
         elapsed = asyncio.get_running_loop().time() - started
         assert 3.4 <= elapsed < 5
 
@@ -195,5 +196,65 @@ def test_nonresponsive_server_returns_bounded_response_timeout():
             # The initial state read never succeeded; no request reached the PLC.
             assert server.stations[1].registers[2] == 0
             assert server.stations[1].coils[1:3] == [False, False]
+
+    asyncio.run(scenario())
+
+
+def test_completed_cycle_survives_lost_cleanup_acknowledgement(monkeypatch):
+    class LostCleanupAck(AsyncModbusTcpClient):
+        async def write_coils(self, *args, **kwargs):
+            response = await super().write_coils(*args, **kwargs)
+            assert not response.isError()
+            raise OSError("cleanup applied but acknowledgment lost")
+
+    monkeypatch.setattr(
+        "modbus_gateway.station_client.AsyncModbusTcpClient", LostCleanupAck
+    )
+
+    async def scenario():
+        async with station_server(cycle_delay=0.01) as server:
+            result = await StationClient(port=server.port).transfer(1, 42)
+            assert not result.success and result.error_code == "PLC_TIMEOUT"
+            assert result.cycle_counter == 1
+            assert result.outcome == "COMPLETED"
+            coils, registers = await read_station(server.port, 1)
+            assert registers[2] == 1
+            assert coils[1:3] == [False, False]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("observation_error", [False, True])
+def test_post_request_timeout_is_unknown_and_never_replays(
+    monkeypatch, observation_error
+):
+    requests = []
+
+    class CountRequests(AsyncModbusTcpClient):
+        async def write_coil(self, address, value, **kwargs):
+            if address == 2 and value:
+                requests.append((address, value))
+            return await super().write_coil(address, value, **kwargs)
+
+        async def read_coils(self, *args, **kwargs):
+            if observation_error and requests:
+                raise RuntimeError("unexpected post-request observation failure")
+            return await super().read_coils(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "modbus_gateway.station_client.AsyncModbusTcpClient", CountRequests
+    )
+
+    async def scenario():
+        async with station_server(timeout=True) as server:
+            result = await StationClient(
+                port=server.port, transfer_timeout=0.25
+            ).transfer(1, 42)
+            assert not result.success and result.error_code == "PLC_TIMEOUT"
+            assert result.outcome == "UNKNOWN"
+            assert requests == [(2, True)]
+            coils, registers = await read_station(server.port, 1)
+            assert coils[1:3] == [False, False]
+            assert registers[2] == 0
 
     asyncio.run(scenario())

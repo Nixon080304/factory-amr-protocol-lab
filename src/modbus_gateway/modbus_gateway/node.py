@@ -7,8 +7,9 @@ import socket
 import struct
 
 import rclpy
+from rclpy.impl.implementation_singleton import rclpy_implementation
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
-from rclpy.executors import MultiThreadedExecutor
+from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.qos import QoSProfile, ReliabilityPolicy
@@ -120,6 +121,8 @@ class ModbusGatewayNode(Node):
         )
         self._event(phase + "_started")
         active = []
+        outcome = "NOT_REQUESTED"
+        result = None
         try:
             for name in (
                 "modbus_delay",
@@ -133,9 +136,13 @@ class ModbusGatewayNode(Node):
                 if fault is not None:
                     active.append(fault)
                     self._plc_control(1 if pickup else 2, fault)
+            # If the transfer boundary itself raises, pickup cannot be excluded.
+            # A returned result supplies the precise pre/post-request outcome.
+            outcome = "UNKNOWN"
             result = asyncio.run(
                 self.station.transfer(1 if pickup else 2, self.motor_code)
             )
+            outcome = result.outcome
             response.accepted, response.error_code, response.message = (
                 result.success,
                 result.error_code,
@@ -173,6 +180,18 @@ class ModbusGatewayNode(Node):
                     detail = response.message
                 for fault in active:
                     self.faults.finish(fault)
+        if not response.accepted and outcome != "NOT_REQUESTED":
+            response.error_code += "_TRANSFER_" + outcome
+            detail = json.dumps(
+                dict(
+                    station_id=request.station_id,
+                    transfer_kind="LOADING" if pickup else "UNLOADING",
+                    cycle_counter=result.cycle_counter if result is not None else None,
+                    transfer_outcome=outcome,
+                    error_code=response.error_code,
+                    message=response.message,
+                )
+            )
         self._event(
             phase + "_finished", "SUCCEEDED" if response.accepted else "FAILED", detail
         )
@@ -184,13 +203,32 @@ class ModbusGatewayNode(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = ModbusGatewayNode()
+    node = None
     # The service owns its group. The default group remains free for /clock.
     executor = MultiThreadedExecutor(num_threads=2)
-    executor.add_node(node)
     try:
+        node = ModbusGatewayNode()
+        executor.add_node(node)
         executor.spin()
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    except rclpy_implementation.RCLError as error:
+        # Humble can race signal shutdown while creating its next wait set.
+        if rclpy.ok() or not any(
+            message in str(error)
+            for message in ("context is invalid", "context is not valid")
+        ):
+            raise
     finally:
-        executor.shutdown()
-        node.destroy_node()
-        rclpy.shutdown()
+        # Humble's base shutdown does not join queued pool callbacks. Keep
+        # node entities alive until our owned pool has drained.
+        try:
+            executor._executor.shutdown(wait=True)
+            for future in executor._futures:
+                if future.done() and not future.cancelled():
+                    future.result()
+        finally:
+            executor.shutdown()
+            if node is not None:
+                node.destroy_node()
+            rclpy.try_shutdown()

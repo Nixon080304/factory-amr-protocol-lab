@@ -20,6 +20,34 @@ from pymodbus.client import ModbusTcpClient
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def launch_child_receipt(log, wrapper_exit_code):
+    """Record every launched child; an interrupted wrapper is a separate fact."""
+    children = [
+        dict(name=name, pid=int(pid), exit_code=None)
+        for name, pid in re.findall(
+            r"\[([^\]]+)\]: process started with pid \[(\d+)\]", log
+        )
+    ]
+    clean = set(
+        re.findall(r"\[([^\]]+)\]: process has finished cleanly \[pid (\d+)\]", log)
+    )
+    failed = {
+        (name, pid): int(code)
+        for name, pid, code in re.findall(
+            r"\[([^\]]+)\]: process has died \[pid (\d+), exit code (-?\d+),", log
+        )
+    }
+    for child in children:
+        key = child["name"], str(child["pid"])
+        child["exit_code"] = failed.get(key, 0 if key in clean else None)
+    return dict(
+        wrapper_exit_code=wrapper_exit_code,
+        children=children,
+        all_children_clean=bool(children)
+        and all(child["exit_code"] == 0 for child in children),
+    )
+
+
 def free_port():
     with socket.socket() as connection:
         connection.bind(("127.0.0.1", 0))
@@ -706,6 +734,10 @@ def test_successful_factory_mission():
         node.destroy_node()
         rclpy.shutdown()
         log.close()
+        receipt = launch_child_receipt(
+            (output / "demo.log").read_text(), process.returncode
+        )
+        (output / "child-exits.json").write_text(json.dumps(receipt, indent=2) + "\n")
         signal.signal(signal.SIGTERM, previous_termination)
     owned = subprocess.check_output(
         [
@@ -725,18 +757,14 @@ def test_successful_factory_mission():
     assert not owned.strip(), "owned Compose containers survived cleanup"
     remaining = set(subprocess.check_output(["docker", "ps", "-aq"], text=True).split())
     assert preexisting_containers <= remaining, "a preexisting container was removed"
-    launched_pids = [
-        int(pid)
-        for pid in re.findall(
-            r"process started with pid \[(\d+)\]", (output / "demo.log").read_text()
-        )
-    ]
+    launched_pids = [child["pid"] for child in receipt["children"]]
     assert launched_pids
     assert not any(Path(f"/proc/{pid}").exists() for pid in launched_pids), (
         "owned launch child survived cleanup"
     )
+    assert receipt["all_children_clean"], f"abnormal or missing child exit: {receipt}"
     print(
-        f"Owned cleanup verified: {len(launched_pids)} launch children exited; Compose project removed; "
+        f"Owned cleanup verified: {len(launched_pids)} launch children exited cleanly; wrapper exit={process.returncode}; Compose project removed; "
         f"{len(preexisting_containers)} preexisting containers preserved"
     )
     if "FACTORY_SCENARIO_OUTPUT" in os.environ:

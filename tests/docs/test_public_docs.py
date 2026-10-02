@@ -152,3 +152,10 @@ def test_architecture_connectors_assign_gateway_events_and_navigation_goals():
     assert "modbus_gateway confirmed-cycle ProtocolEvent (DDS)" in text
     assert "NavigateToPose goal" in text
     assert "result + localization" in text
+
+
+def test_telemetry_description_matches_periodic_producer_and_schema_limit():
+    text = (ROOT / "docs/protocols.md").read_text()
+    assert "no periodic telemetry producer" not in text
+    assert "every 0.5 seconds" in text
+    assert "no formal telemetry JSON schema" in text

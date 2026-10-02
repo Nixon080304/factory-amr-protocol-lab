@@ -460,6 +460,10 @@ void MissionCoordinatorNode::detection(
     transfer();
   }
 }
+void MissionCoordinatorNode::dispatch_transfer(
+    std::shared_ptr<Transfer::Request> request, TransferCallback callback) {
+  transfer_client_->async_send_request(request, std::move(callback));
+}
 void MissionCoordinatorNode::transfer() {
   if (!transfer_client_->service_is_ready()) {
     transition(machine_.transfer_failed("PLC_TIMEOUT"));
@@ -473,42 +477,60 @@ void MissionCoordinatorNode::transfer() {
   const auto generation = mission_generation_;
   phase_started_ = now().seconds();
   try {
-    transfer_client_->async_send_request(
-        request, [this, generation](rclcpp::Client<Transfer>::SharedFuture future) {
-          if (!goal_ || generation != mission_generation_) {
-            return;
+    dispatch_transfer(request, [this, generation](
+                                   rclcpp::Client<Transfer>::SharedFuture future) {
+      if (!goal_ || generation != mission_generation_) {
+        return;
+      }
+      TransitionResult result;
+      try {
+        auto response = future.get();
+        auto error_code = response->error_code;
+        bool unsafe_outcome = false;
+        for (const std::string suffix : {"_TRANSFER_COMPLETED", "_TRANSFER_UNKNOWN"}) {
+          if (error_code.size() >= suffix.size() &&
+              error_code.compare(error_code.size() - suffix.size(), suffix.size(),
+                                 suffix) == 0) {
+            unsafe_outcome = true;
+            error_code.resize(error_code.size() - suffix.size());
+            break;
           }
-          TransitionResult result;
-          try {
-            auto response = future.get();
-            // Successful pickup consumes the only part, even when cancellation is
-            // pending and transfer_succeeded() immediately ends the mission.
-            if (response->accepted && machine_.state() == MissionState::Loading) {
-              restart_required_ = true;
-            }
-            event("transfer_result", response->accepted ? "SUCCEEDED" : "FAILED",
-                  response->error_code);
-            result = response->accepted
-                         ? machine_.transfer_succeeded()
-                         : machine_.transfer_failed(response->error_code.empty()
-                                                        ? "PLC_TIMEOUT"
-                                                        : response->error_code);
-          } catch (const std::exception &error) {
-            RCLCPP_ERROR(get_logger(), "Mission %s: %s",
-                         machine_.mission().mission_id.c_str(), error.what());
-            result = machine_.transfer_failed("PLC_TIMEOUT");
-          }
-          transition(result);
-          if (result.state == MissionState::Completed ||
-              result.state == MissionState::Failed) {
-            finish(result.error_code);
-          } else {
-            navigate();
-          }
-        });
+        }
+        // Latch before publishing a result or completing pending cancellation.
+        // Cleanup failure never proves that the sole part remains available.
+        if ((response->accepted || unsafe_outcome) &&
+            machine_.state() == MissionState::Loading) {
+          restart_required_ = true;
+        }
+        event("transfer_result", response->accepted ? "SUCCEEDED" : "FAILED",
+              response->error_code);
+        result = response->accepted
+                     ? machine_.transfer_succeeded()
+                     : machine_.transfer_failed(error_code.empty() ? "PLC_TIMEOUT"
+                                                                   : error_code);
+      } catch (const std::exception &error) {
+        RCLCPP_ERROR(get_logger(), "Mission %s: %s",
+                     machine_.mission().mission_id.c_str(), error.what());
+        if (machine_.state() == MissionState::Loading) {
+          restart_required_ = true;
+        }
+        result = machine_.transfer_failed("PLC_TIMEOUT");
+      }
+      transition(result);
+      if (result.state == MissionState::Completed ||
+          result.state == MissionState::Failed) {
+        finish(result.error_code);
+      } else {
+        navigate();
+      }
+    });
   } catch (const std::exception &error) {
     RCLCPP_ERROR(get_logger(), "Mission %s: transfer dispatch failed: %s",
                  request->mission_id.c_str(), error.what());
+    // A dispatch exception cannot establish that the request stayed local.
+    if (machine_.state() == MissionState::Loading) {
+      restart_required_ = true;
+    }
     transition(machine_.transfer_failed("PLC_TIMEOUT"));
     finish("PLC_TIMEOUT");
   }

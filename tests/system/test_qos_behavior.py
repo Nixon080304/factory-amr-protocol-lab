@@ -305,6 +305,14 @@ def test_wrong_marker_records_failed_application_when_pose_service_disappears():
         assert future.result().message == "Fault acknowledgement timed out: simulation"
         assert 0.15 <= time.monotonic() - started < 0.6
         assert control.simulation.active is None
+        assert control.simulation.restoration is not None
+        wait(
+            lambda: any(
+                event.event == "wrong_marker_pose_restored"
+                and event.outcome == "FAILED"
+                for event in events
+            )
+        )
         print(
             "unavailable Gazebo activation: fault_activated, fault_consumed, wrong_marker_pose_applied/FAILED; no success; bounded failed reset"
         )

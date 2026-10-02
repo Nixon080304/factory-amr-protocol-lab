@@ -5,6 +5,7 @@ import json
 import time
 from types import SimpleNamespace
 
+import pytest
 import rclpy
 from rclpy.context import Context
 from rclpy.executors import MultiThreadedExecutor
@@ -12,7 +13,63 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 from rosgraph_msgs.msg import Clock
 from factory_interfaces.srv import TransferPart
 from factory_interfaces.msg import ProtocolEvent
+from payload_simulator.state_machine import PayloadStateMachine
 from modbus_gateway.node import ModbusGatewayNode
+from fault_injector.models import FaultRequest
+
+
+@pytest.mark.parametrize(
+    "failure, expected",
+    [
+        ("cleanup", "PLC_TIMEOUT_TRANSFER_COMPLETED"),
+        ("configure", "PLC_TIMEOUT"),
+    ],
+)
+def test_fault_side_channel_failure_preserves_transfer_outcome(
+    monkeypatch, failure, expected
+):
+    monkeypatch.setattr("modbus_gateway.station_client.AsyncModbusTcpClient", Socket)
+    Socket.fault = Socket.unexpected_error = False
+    Socket.connect_failures = 0
+    context = Context()
+    rclpy.init(context=context, domain_id=78)
+    node = ModbusGatewayNode(context=context)
+    node.faults.enable(FaultRequest("modbus_delay", "cleanup_test"))
+
+    def control(unit, fault=None):
+        if (fault is None) == (failure == "cleanup"):
+            raise OSError("fault control acknowledgment lost")
+
+    monkeypatch.setattr(node, "_plc_control", control)
+    events = []
+    monkeypatch.setattr(node, "_event", lambda *args: events.append(args))
+    try:
+        response = node._transfer(
+            TransferPart.Request(
+                mission_id="cleanup_test", station_id="assembly", part="motor"
+            ),
+            TransferPart.Response(),
+        )
+        assert not response.accepted
+        assert response.error_code == expected
+        if failure == "cleanup":
+            name, outcome, detail = events[-1]
+            fields = json.loads(detail)
+            assert fields["station_id"] == "assembly"
+            assert fields["transfer_kind"] == "LOADING"
+            assert fields["cycle_counter"] == 11
+            assert fields["transfer_outcome"] == "COMPLETED"
+            assert fields["error_code"] == "PLC_TIMEOUT_TRANSFER_COMPLETED"
+            assert "fault cleanup failed" in fields["message"]
+            assert outcome == "FAILED"
+            payload = PayloadStateMachine()
+            assert payload.apply_protocol_event(
+                "cleanup_test", "MODBUS", name, outcome, detail
+            ).applied
+            assert payload.state == "IN_TRANSIT"
+    finally:
+        node.destroy_node()
+        context.shutdown()
 
 
 class Socket:

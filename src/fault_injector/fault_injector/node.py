@@ -7,7 +7,9 @@ import threading
 import time
 
 import rclpy
+from rclpy.impl.implementation_singleton import rclpy_implementation
 from rclpy.node import Node
+from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.clock import Clock
 from rclpy.task import Future
@@ -263,13 +265,20 @@ class SimulationFaults:
         self.active = None
         self.generation = 0
         self.pending = None
+        self.restoration = None
         self.controller, self.commands = attach_controls(
             node, owner="simulation", callback_group=node.ack_group, on_reset=self.reset
         )
         self.subscription = node.create_subscription(
-            ProtocolEvent, "/factory/protocol_events", self.observe, 100
+            ProtocolEvent,
+            "/factory/protocol_events",
+            self.observe,
+            100,
+            callback_group=node.ack_group,
         )
-        self.timer = node.create_timer(0.02, self.expire, clock=Clock())
+        self.timer = node.create_timer(
+            0.02, self.expire, clock=Clock(), callback_group=node.ack_group
+        )
 
     def move(self, x, y, z, done):
         self.generation += 1
@@ -291,6 +300,7 @@ class SimulationFaults:
         def complete(future):
             if generation != self.generation:
                 return
+            self.pending = None
             try:
                 success = future.result().success
             except Exception as error:
@@ -310,7 +320,6 @@ class SimulationFaults:
             "wrong_marker", event.mission_id, "assembly", "navigation_start"
         )
         if control is not None:
-            self.active = (control, time.monotonic() + control.duration)
 
             def applied(success):
                 self.node.events.publish(
@@ -327,24 +336,65 @@ class SimulationFaults:
                     )
                 )
 
-            self.move(-3.0, 1.57, 0.35, applied)
+            # Do not overlap physical moves or forget an older restoration.
+            # The new control gets explicit failed-application evidence.
+            if self.restoration is not None or self.pending is not None:
+                applied(False)
+                return
+            self.active = (control, time.monotonic() + control.duration)
+            if not self.move(-3.0, 1.57, 0.35, applied):
+                # No pose operation was dispatched. There is no physical effect
+                # to retain; explicit reset obligations are tracked separately.
+                self.active = None
 
     def expire(self):
-        if self.active is not None and time.monotonic() >= self.active[1]:
+        if self.restoration is not None:
+            if time.monotonic() >= self.restoration["retry_at"]:
+                self._restore(self.restoration)
+        elif self.active is not None and time.monotonic() >= self.active[1]:
             self.reset()
 
     def reset(self):
-        finished = []
-        active, self.active = self.active, None
+        if self.restoration is None:
+            self.restoration = dict(active=self.active, done=False, retry_at=0.0)
+            self._restore(self.restoration)
+        restoration = self.restoration
+        # A synchronously successful boundary may already have cleared the owner.
+        return lambda: restoration is None or restoration["done"]
+
+    def _restore(self, restoration):
+        if self.pending is not None:
+            return
+        active = restoration["active"]
 
         def done(success):
+            if self.restoration is not restoration:
+                return
+            self.node.events.publish(
+                ProtocolEvent(
+                    stamp=self.node.get_clock().now().to_msg(),
+                    mission_id=active[0].mission_id if active is not None else "",
+                    protocol="SIMULATION",
+                    direction="INTERNAL",
+                    event="wrong_marker_pose_restored",
+                    outcome="SUCCEEDED" if success else "FAILED",
+                    detail=json.dumps(
+                        dict(entity="wrong_marker_station", pose=[0.0, 0.0, -10.0])
+                    ),
+                )
+            )
             if success:
                 if active is not None:
                     self.controller.finish(active[0])
-                finished.append(True)
+                self.active = None
+                restoration["done"] = True
+                self.restoration = None
+            else:
+                # A failed reset remains owned. Retry at a bounded wall-clock
+                # cadence; an in-flight call is never overlapped or replayed.
+                restoration["retry_at"] = time.monotonic() + 0.5
 
         self.move(0.0, 0.0, -10.0, done)
-        return lambda: bool(finished)
 
 
 class QosExperiment:
@@ -503,9 +553,23 @@ class QosExperiment:
 
 def main(args=None):
     rclpy.init(args=args)
-    node = FaultInjectorNode()
+    node = None
+    executor = SingleThreadedExecutor()
     try:
-        rclpy.spin(node)
+        node = FaultInjectorNode()
+        executor.add_node(node)
+        executor.spin()
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    except rclpy_implementation.RCLError as error:
+        # Humble can race signal shutdown while creating its next wait set.
+        if rclpy.ok() or not any(
+            message in str(error)
+            for message in ("context is invalid", "context is not valid")
+        ):
+            raise
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        executor.shutdown()
+        if node is not None:
+            node.destroy_node()
+        rclpy.try_shutdown()

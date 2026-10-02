@@ -78,8 +78,8 @@ Mission status payload:
 
 The MQTT adapter publishes this status from the authoritative mission action
 and buffers ordered states during disconnects. The gateway also exposes a
-latest-value telemetry buffer, but version 1 has no periodic telemetry producer
-or telemetry JSON schema.
+latest-value telemetry buffer and publishes telemetry every 0.5 seconds.
+Version 1 has no formal telemetry JSON schema.
 
 Duplicate IDs with the same canonical payload return the current or final state
 without another execution. JSON key order does not change mission identity.
@@ -139,11 +139,13 @@ The handshake follows this order:
 The gateway owns all production knowledge of raw addresses. The PLC rejects
 writes to PLC-owned values. `StationClient(host="127.0.0.1", port=1502)` exposes
 `await transfer(unit_id, part_code)` and returns `TransferResult(success,
-error_code, message, cycle_counter)`. It serializes transfers per client. A
+error_code, message, cycle_counter, outcome)`. `outcome` is `NOT_REQUESTED`,
+`UNKNOWN`, or `COMPLETED`, independently of overall success. It serializes transfers per client. A
 lost transfer-request acknowledgment must not trigger another cycle: the
 gateway sends that request once and observes the same cycle. Idempotent
 network operations may retry; cleanup is separately bounded. A cleanup failure
 makes the result unsuccessful and appears in its message.
+Observed changed counters survive a later station fault or cleanup exception.
 
 ### Timeouts and retry bounds
 
@@ -205,7 +207,7 @@ outcome. A terminal core requires explicit `reset()` before another mission.
 | Duplicate mission, same payload | Return current or final state; no second execution |
 | Duplicate mission, changed payload | Reject with `MISSION_ID_CONFLICT` |
 | Another valid mission while busy | Reject with `ROBOT_BUSY` |
-| Another valid idle mission after successful pickup | Acknowledge transport, then abort with `RESTART_REQUIRED`; restart the full simulation |
+| Another valid idle mission after confirmed or uncertain pickup | Acknowledge transport, then abort with `RESTART_REQUIRED`; restart the full simulation |
 | ROS mission transport exception | Publish `MISSION_TRANSPORT_ERROR`; do not resend the goal automatically |
 | MQTT disconnect | Continue the local mission, queue state transitions, reconnect with backoff |
 | Nav2 goal rejected or aborted | Clear costmaps, retry once, then `NAVIGATION_FAILED` |
@@ -247,17 +249,38 @@ exactly one finish event. A result subscription or result transport failure
 after acceptance publishes `FAILED` with `MISSION_TRANSPORT_ERROR` without
 reopening or changing the successful acceptance phase.
 
-After the first successful pickup, the process-local single-part lifecycle
+After confirmed pickup or a request whose outcome cannot safely exclude pickup, the process-local single-part lifecycle
 requires restarting the full simulation. Another valid idle goal is accepted
 only to return an immediate aborted action result: `success=false`,
 `final_state=FAILED`, `error_code=RESTART_REQUIRED`. Its `mission_rejected`
 protocol event carries that code; no `mission_started`, navigation, or PLC
 transfer occurs. The MQTT gateway publishes `RECEIVED` followed by
 `FAILED/RESTART_REQUIRED`. Action acceptance acknowledges transport, not physical
-execution. Completion or cancellation/failure after successful pickup preserves
-this guard; failures before successful pickup permit new requests. Identical-ID
+execution. Cleanup failure and pending cancellation preserve this guard.
+Only proven pre-request failures permit new requests. Identical-ID
 MQTT replay remains unchanged. Invalid and busy goals retain their existing
 rejection precedence. Restarting only the coordinator does not reset the part.
+
+`TransferPart` retains its original fields and types. A failed transfer uses the
+existing `error_code` string to carry stable physical outcome semantics:
+`<base>_TRANSFER_COMPLETED` means the counter confirmed a physical cycle but
+cleanup or another boundary failed; `<base>_TRANSFER_UNKNOWN` means the request
+was issued and pickup cannot safely be excluded. For example,
+`PLC_TIMEOUT_TRANSFER_COMPLETED` is not overall success. Bare errors describe
+proven pre-request failures. The coordinator latches the pickup guard before
+publishing the terminal result, including pending cancellation, and returns the
+original base error (`PLC_TIMEOUT`, `PLC_FAULT`, or `STALE_PLC_STATE`) to mission
+clients. Transfer dispatch/result exceptions also latch the guard; an unavailable
+service before dispatch remains retryable. An ambiguous physical request is never
+resent.
+
+Failed post-request finish events remain `FAILED`. Their existing `detail` string
+contains JSON with `station_id`, `transfer_kind`, `cycle_counter`,
+`transfer_outcome`, `error_code`, and `message`. A counter is null if unavailable.
+Successful finish details retain their original three fields. Payload state and
+conveyor animation consume a validated `COMPLETED` cycle even when cleanup fails;
+an `UNKNOWN` outcome never moves the part. Observer reports retain physical and
+protocol outcomes separately, including late correlated finish events.
 
 The MQTT adapter samples `/amcl_pose` and `/odom` with best-effort delivery.
 Telemetry publishes every 0.5 seconds at MQTT QoS 0 with fields `robot_id`,
@@ -271,7 +294,8 @@ The broker parameters default to `broker_host=127.0.0.1`, `broker_port=1883`.
 The Modbus adapter defaults to `plc_host=127.0.0.1`, `plc_port=1502`, and
 `motor_part_code=1`. It owns both Modbus phase boundaries, emits `retry` for
 network retries and `station_state_changed` for changed PLC snapshots, and
-includes the exact successful cycle counter in the transfer finish detail.
+includes the exact confirmed cycle counter in the transfer finish detail,
+including completed cycles whose cleanup failed.
 The service runs in a separate mutually exclusive callback group so its bounded
 socket work does not prevent ROS clock updates.
 

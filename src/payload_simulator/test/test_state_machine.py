@@ -128,3 +128,26 @@ def test_success_event_validates_inspection_unload():
     detail = '{"station_id":"inspection","transfer_kind":"UNLOADING","cycle_counter":8}'
     assert complete(machine, event="modbus_dropoff_finished", detail=detail).applied
     assert machine.state == PayloadState.AT_INSPECTION
+
+
+@pytest.mark.parametrize(
+    "physical_outcome, moves", [("COMPLETED", True), ("UNKNOWN", False)]
+)
+def test_cleanup_failure_moves_only_confirmed_physical_cycle(physical_outcome, moves):
+    machine = PayloadStateMachine()
+    detail = json.dumps(
+        {
+            "station_id": "assembly",
+            "transfer_kind": "LOADING",
+            "cycle_counter": 1,
+            "transfer_outcome": physical_outcome,
+            "error_code": "PLC_TIMEOUT_TRANSFER_" + physical_outcome,
+            "message": "cleanup acknowledgment lost",
+        }
+    )
+    transition = complete(machine, outcome="FAILED", detail=detail)
+    assert transition.applied == moves
+    assert machine.state == (
+        PayloadState.IN_TRANSIT if moves else PayloadState.AT_ASSEMBLY
+    )
+    assert not complete(machine, outcome="FAILED", detail=detail).applied

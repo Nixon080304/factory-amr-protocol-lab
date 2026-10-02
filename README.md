@@ -187,16 +187,29 @@ Version 1 has one robot, one motor part, and one fixed route. Conveyor motion is
 a bounded visual animation after a confirmed PLC cycle; there is no manipulator
 or physical grasp simulation. Payload is hidden during transport and placed on
 the inspection belt for unloading. Registries are process-local. MQTT and
-Modbus bind to localhost without production authentication. Hosted CI remains
+Modbus bind to localhost without production authentication. Optional MQTT
+authentication through an ignored password file is deferred and is not delivered;
+the supported broker default is anonymous and loopback-only. Hosted CI remains
 unobserved until the repository is published and its workflow runs.
 
 Vanished or hung transfer gateways can leave
 a stopped robot with a pending mission and unknown PLC state. No bound on
 every mission or crash recovery is claimed. Restart the simulation to reset
-the single-part lifecycle. After successful pickup, another valid mission
+the single-part lifecycle. After confirmed pickup, or a request whose outcome
+cannot safely exclude pickup, another valid mission
 returns `FAILED/RESTART_REQUIRED` without moving or transferring, even if the
-first mission later fails or is canceled. Failures before successful pickup
-permit a new mission; identical MQTT IDs still replay their recorded status.
+first mission later fails, is canceled, or loses cleanup acknowledgement.
+Only proven pre-request failures permit a new mission; identical MQTT IDs still replay their recorded status.
 The guard is process-local: restart the full demo rather than only the coordinator.
+
+The world retains a controllable non-static obstacle. Obstacle-triggered physical
+replanning/recovery coverage is deferred and is not delivered. Navigation recovery
+evidence instead uses explicit Nav2 adapter rejection, real costmap clears, and
+retry of the same leg.
+
+The tested Gazebo model path resolves the AMR meshes but exposes unrelated ROS
+share packages to the model browser. A retained GUI receipt contains 407
+missing-`model.config` diagnostics. This known browser noise is separate from
+actual mesh-resolution failures and is not a diagnosed Gazebo crash cause.
 
 Licensed under Apache-2.0. See [LICENSE](LICENSE).

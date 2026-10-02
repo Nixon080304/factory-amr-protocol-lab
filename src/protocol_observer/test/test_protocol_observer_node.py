@@ -23,9 +23,13 @@ def test_dds_trace_report_late_phase_and_write_failure(tmp_path):
     executor.add_node(node)
     executor.add_node(peer)
 
-    def publish(name, seconds, outcome="", nanoseconds=0):
+    def publish(name, seconds, outcome="", nanoseconds=0, protocol="ROS", detail=""):
         message = ProtocolEvent(
-            mission_id="M-001", protocol="ROS", event=name, outcome=outcome
+            mission_id="M-001",
+            protocol=protocol,
+            event=name,
+            outcome=outcome,
+            detail=detail,
         )
         message.stamp.sec = seconds
         message.stamp.nanosec = nanoseconds
@@ -60,6 +64,35 @@ def test_dds_trace_report_late_phase_and_write_failure(tmp_path):
         node.writer.path = tmp_path
         publish("retry", 14)
         assert node.failure_count == 2
+        node.writer.path = tmp_path / "protocol_events.jsonl"
+        publish("mission_finished", 15, "FAILED")
+        physical = {
+            "station_id": "assembly",
+            "transfer_kind": "LOADING",
+            "cycle_counter": 1,
+            "transfer_outcome": "COMPLETED",
+            "error_code": "PLC_TIMEOUT_TRANSFER_COMPLETED",
+            "message": "robot coil cleanup acknowledgment lost",
+        }
+        publish(
+            "modbus_pickup_finished",
+            14,
+            "FAILED",
+            protocol="MODBUS",
+            detail=json.dumps(physical),
+        )
+        latest = json.loads(
+            (tmp_path / "protocol_events.jsonl").read_text().splitlines()[-1]
+        )
+        assert latest["outcome"] == "FAILED"
+        assert json.loads(latest["detail"]) == physical
+        rendered = report.read_text()
+        assert "| Final outcome | FAILED |" in rendered
+        assert (
+            "| assembly | LOADING | 1 | COMPLETED | FAILED | PLC_TIMEOUT_TRANSFER_COMPLETED |"
+            in rendered
+        )
+        assert "robot coil cleanup acknowledgment lost" in rendered
     finally:
         executor.shutdown()
         node.destroy_node()

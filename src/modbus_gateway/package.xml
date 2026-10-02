@@ -11,6 +11,7 @@
   <exec_depend>factory_interfaces</exec_depend>
   <exec_depend>fault_injector</exec_depend>
   <test_depend>rosgraph_msgs</test_depend>
+  <test_depend>payload_simulator</test_depend>
   <test_depend>python3-pytest</test_depend>
   <export><build_type>ament_python</build_type></export>
 </package>

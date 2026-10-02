@@ -286,7 +286,11 @@ def rig():
                 result = ExecuteFactoryMission.Result(
                     success=False,
                     final_state="FAILED",
-                    error_code=response.error_code,
+                    # The navigation driver preserves the coordinator's public
+                    # error meaning; service suffixes describe physical outcome.
+                    error_code=response.error_code.removesuffix(
+                        "_TRANSFER_COMPLETED"
+                    ).removesuffix("_TRANSFER_UNKNOWN"),
                     message=response.message,
                 )
             local_done.set()

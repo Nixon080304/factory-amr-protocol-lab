@@ -120,3 +120,15 @@ the inherited Xacro warnings `invalid escape sequence '\$'` and
 gateway can leave a stopped pending mission with unknown PLC state. The runner's
 deadline bounds its test process; it does not establish crash recovery or a
 deadline for every production mission.
+
+Wrong-marker expiry keeps the applied effect owned until Gazebo acknowledges
+restoration. Failed restoration emits `wrong_marker_pose_restored/FAILED` and
+retains a reset obligation; available-service retries use a 0.5-second wall-clock
+cadence. A delayed in-flight pose request is never overlapped. Explicit reset
+acknowledgement requires actual restoration, and a timed-out reset stays failed
+even if a later reset recovers. New application attempts during unresolved
+restoration emit failed-application evidence instead of racing the old move.
+
+Obstacle-triggered physical replanning/recovery is deferred and is not delivered.
+The controllable non-static obstacle asset remains. The measured Nav2 cases above
+are adapter-rejection/costmap/same-leg evidence, not obstacle-triggered scenarios.

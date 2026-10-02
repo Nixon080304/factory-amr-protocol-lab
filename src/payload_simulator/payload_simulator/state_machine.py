@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Pure one-part lifecycle driven only by validated successful PLC completions."""
+"""Pure one-part lifecycle driven only by validated confirmed PLC completions."""
 
 from dataclasses import dataclass
 from enum import Enum
@@ -68,7 +68,7 @@ class PayloadStateMachine:
     def apply_protocol_event(
         self, mission_id, protocol, event, outcome, detail
     ) -> PayloadTransition:
-        if protocol != "MODBUS" or outcome != "SUCCEEDED":
+        if protocol != "MODBUS" or outcome not in ("SUCCEEDED", "FAILED"):
             return self._rejected("not_successful_modbus")
         expected = {
             "modbus_pickup_finished": ("assembly", "LOADING"),
@@ -85,6 +85,8 @@ class PayloadStateMachine:
             or (fields.get("station_id"), fields.get("transfer_kind")) != expected
         ):
             return self._rejected("invalid_detail")
+        if outcome == "FAILED" and fields.get("transfer_outcome") != "COMPLETED":
+            return self._rejected("not_confirmed_modbus")
         return self.apply_transfer(
             mission_id, fields["transfer_kind"], fields.get("cycle_counter")
         )

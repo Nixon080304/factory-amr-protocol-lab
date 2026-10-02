@@ -9,7 +9,9 @@ from factory_interfaces.msg import ProtocolEvent
 from gazebo_msgs.srv import SetEntityState
 from geometry_msgs.msg import Pose
 import rclpy
+from rclpy.impl.implementation_singleton import rclpy_implementation
 from rclpy.clock import Clock, ClockType
+from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
@@ -167,13 +169,22 @@ class PayloadSimulatorNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = None
+    executor = SingleThreadedExecutor()
     try:
         node = PayloadSimulatorNode()
-        rclpy.spin(node)
-    except KeyboardInterrupt:
+        executor.add_node(node)
+        executor.spin()
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
+    except rclpy_implementation.RCLError as error:
+        # Humble can race signal shutdown while creating its next wait set.
+        if rclpy.ok() or not any(
+            message in str(error)
+            for message in ("context is invalid", "context is not valid")
+        ):
+            raise
     finally:
+        executor.shutdown()
         if node is not None:
             node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+        rclpy.try_shutdown()
