@@ -123,12 +123,19 @@ class TestGazeboPayload(unittest.TestCase):
 
     def observe_animation(self, conveyor, expected_part):
         offsets = []
+        visible_positions = []
         deadline = min(self.deadline, time.monotonic() + 5)
         while time.monotonic() < deadline:
             belt = self.pose(conveyor)
             offsets.append(belt.position.y - 2.0)
             part = self.pose("factory_part")
             xyz = (part.position.x, part.position.y, part.position.z)
+            station_x = -3.0 if conveyor == "assembly_conveyor" else 3.0
+            if (
+                abs(part.position.x - station_x) < 0.005
+                and abs(part.position.z - 0.65) < 0.005
+            ):
+                visible_positions.append(part.position.y)
             if conveyor == "inspection_conveyor" and abs(offsets[-1]) >= 0.05:
                 self.assertAlmostEqual(part.position.x, 3.0, delta=0.005)
                 self.assertAlmostEqual(part.position.z, 0.65, delta=0.005)
@@ -144,11 +151,20 @@ class TestGazeboPayload(unittest.TestCase):
             ):
                 break
         self.assertGreaterEqual(max(offsets), 0.05, "actual conveyor must visibly move")
+        self.assertGreaterEqual(
+            max(visible_positions) - min(visible_positions),
+            0.14,
+            "actual part must travel visibly on conveyor before final placement",
+        )
+        self.assertTrue(any(1.84 < value < 1.96 for value in visible_positions))
         self.assertAlmostEqual(offsets[-1], 0, delta=0.005)
         self.assert_pose("factory_part", expected_part)
         print(
             f"Actual {conveyor} offsets: min={min(offsets):.3f}, max={max(offsets):.3f}, "
             f"final={offsets[-1]:.3f}; factory_part={xyz}"
+        )
+        print(
+            f"Visible part travel: {min(visible_positions):.3f}..{max(visible_positions):.3f}"
         )
 
     def assert_no_replay(self, publisher, messages, conveyor, part_xyz):

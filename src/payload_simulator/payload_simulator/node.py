@@ -32,15 +32,17 @@ def pose(x, y, z):
 def animation_steps(transfer_kind):
     """Return bounded model poses; station bodies and markers never move.
 
-    The part is placed on inspection before the unload conveyor starts. A static
-    world include prevents gravity from changing its below-world storage pose.
+    The visible part travels 0.2 m along each belt before storage or placement.
+    A static world include keeps every commanded pose stable between steps.
     """
     loading = transfer_kind == "LOADING"
     x = -3.0 if loading else 3.0
     conveyor = "assembly_conveyor" if loading else "inspection_conveyor"
     steps = [("factory_part", pose(x, 2.0 if loading else 1.8, 0.65))]
-    for offset in (0.06, 0.12, 0.06, 0.0):
+    for index, offset in enumerate((0.06, 0.12, 0.06, 0.0), start=1):
         steps.append((conveyor, pose(x, 2.0 + offset, 0.603)))
+        part_y = 2.0 - index * 0.05 if loading else 1.8 + index * 0.05
+        steps.append(("factory_part", pose(x, part_y, 0.65)))
     steps.append(("factory_part", pose(0, 0, -2) if loading else pose(3, 2, 0.65)))
     return deque(steps)
 
