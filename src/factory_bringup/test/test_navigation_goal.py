@@ -10,7 +10,7 @@ import unittest
 
 from action_msgs.msg import GoalStatus
 from ament_index_python.packages import get_package_share_directory
-from gazebo_msgs.srv import GetEntityState
+from factory_simulation.entity_probe import get_entity_pose
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from launch import LaunchDescription
 from launch.actions import IncludeLaunchDescription
@@ -78,14 +78,9 @@ class TestNavigation(unittest.TestCase):
             rclpy.spin_once(self.node, timeout_sec=0.05)
         self.assertTrue(predicate(), message)
 
-    def entity_pose(self, client):
-        request = GetEntityState.Request()
-        request.name = "factory_amr"
-        request.reference_frame = "world"
-        future = client.call_async(request)
-        self.spin_until(future.done, 5, "Gazebo world pose did not arrive")
-        self.assertTrue(future.result().success)
-        return future.result().state.pose
+    def entity_pose(self):
+        return get_entity_pose(self.node, "factory_amr",
+                               timeout_sec=min(5.0, self.deadline - time.monotonic()))
 
     def test_navigate_to_pose_moves_real_robot_and_meets_tolerances(self):
         started = time.monotonic()
@@ -101,7 +96,6 @@ class TestNavigation(unittest.TestCase):
         ]
         initial = self.node.create_publisher(PoseWithCovarianceStamped, "/initialpose", 10)
         action = ActionClient(self.node, NavigateToPose, "/navigate_to_pose")
-        entity = self.node.create_client(GetEntityState, "/gazebo/get_entity_state")
         clients, handle = [], None
         try:
             for name in ("map_server", "amcl", "controller_server", "planner_server", "smoother_server",
@@ -117,8 +111,7 @@ class TestNavigation(unittest.TestCase):
             self.spin_until(lambda: maps and self.node.get_clock().now().nanoseconds > 0,
                             10, "map or simulation clock missing")
             self.assertEqual((maps[-1].info.width, maps[-1].info.height), (248, 168))
-            self.spin_until(entity.service_is_ready, 5, "Gazebo pose service missing")
-            before = self.entity_pose(entity)
+            before = self.entity_pose()
             self.assertLess(math.hypot(before.position.x, before.position.y + 3), 0.03)
             pose = PoseWithCovarianceStamped()
             pose.header.frame_id = "map"
@@ -161,7 +154,7 @@ class TestNavigation(unittest.TestCase):
             settle = min(self.deadline, time.monotonic() + 1)
             while time.monotonic() < settle:
                 rclpy.spin_once(self.node, timeout_sec=0.05)
-            after = self.entity_pose(entity)
+            after = self.entity_pose()
             transform = buffer.lookup_transform("map", "base_footprint", Time()).transform
             for name, x, y, heading in [("Gazebo", after.position.x, after.position.y, yaw(after.orientation)),
                                        ("AMCL/TF", transform.translation.x, transform.translation.y,
@@ -185,7 +178,6 @@ class TestNavigation(unittest.TestCase):
             action.destroy()
             listener.unregister()
             self.node.destroy_publisher(initial)
-            self.node.destroy_client(entity)
             for client in clients:
                 self.node.destroy_client(client)
             for subscription in subscriptions:
