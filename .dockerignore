@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# Send only the standalone PLC package, never workspace metadata or artifacts.
+**
+!src/
+!src/plc_simulator/
+!src/plc_simulator/pyproject.toml
+!src/plc_simulator/plc_simulator/
+!src/plc_simulator/plc_simulator/*.py

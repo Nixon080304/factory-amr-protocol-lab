@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: Apache-2.0
+name: factory-amr-protocol-lab
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2.0.22
+    ports:
+      - "127.0.0.1:1883:1883"
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    healthcheck:
+      test: ["CMD", "mosquitto_pub", "-h", "127.0.0.1", "-p", "1883", "-q", "1", "-t", "factory/health", "-m", "ready"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+      start_period: 2s
+  plc-simulator:
+    build:
+      context: ..
+      dockerfile: docker/plc-simulator.Dockerfile
+    ports:
+      - "127.0.0.1:1502:1502"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          from pymodbus.client import ModbusTcpClient
+          with ModbusTcpClient('127.0.0.1', port=1502, timeout=2) as client:
+              for unit in (1, 2):
+                  result = client.read_holding_registers(0, count=4, device_id=unit)
+                  assert not result.isError() and result.registers[0] == unit
+      interval: 2s
+      timeout: 5s
+      retries: 10
+      start_period: 2s

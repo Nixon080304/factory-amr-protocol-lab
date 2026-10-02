@@ -11,6 +11,7 @@ setup(
         ("share/protocol_observer", ["package.xml", "README.md"]),
     ],
     install_requires=["setuptools"],
+    extras_require={"test": ["pytest"]},
     zip_safe=False,
     maintainer="Nixon Edward Winata",
     maintainer_email="nixonedwardwinata2004@gmail.com",

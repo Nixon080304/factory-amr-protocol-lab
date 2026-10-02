@@ -12,6 +12,7 @@ setup(
         ("share/mqtt_gateway", ["package.xml"]),
     ],
     install_requires=["setuptools", "jsonschema==4.26.0"],
+    extras_require={"test": ["pytest"]},
     zip_safe=False,
     maintainer="Nixon Edward Winata",
     maintainer_email="nixonedwardwinata2004@gmail.com",

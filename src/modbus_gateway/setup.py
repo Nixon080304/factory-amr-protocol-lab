@@ -10,6 +10,7 @@ setup(
         ("share/modbus_gateway", ["package.xml"]),
     ],
     install_requires=["setuptools", "pymodbus==3.15.0"],
+    extras_require={"test": ["pytest"]},
     zip_safe=False,
     maintainer="Nixon Edward Winata",
     maintainer_email="nixonedwardwinata2004@gmail.com",
