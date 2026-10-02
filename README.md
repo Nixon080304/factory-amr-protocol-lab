@@ -68,13 +68,47 @@ for components, RViz topics, schemas, registers, retries, and limitations.
 
 ## Verification
 
-With a working display, run:
+Run the same non-Gazebo gates locally and in GitHub Actions:
+
+```bash
+scripts/run_ci_checks.sh
+```
+
+Run `scripts/setup_dev.sh` once to install the pinned Ruff 0.15.7 and
+clang-format 14.0.6 tools in `.venv`. Install Ubuntu 22.04's `cppcheck` package
+(2.7), and provide a working Docker daemon. The runner sources ROS 2 Humble and
+the project environment, requires `.venv` colcon 0.20.1 and the recorded runtime
+pins, and explicitly sets `ROS_LOCALHOST_ONLY=1` and `PYTHONNOUSERSITE=1`.
+Each stage prints RUN/PASS/FAIL. The first failed stage stops the runner and
+preserves its exit code; the success line appears only after every stage passes.
+
+The gates check Python formatting and lint, C++ formatting and correctness/
+portability lint, a symlink build of all 10 ROS packages, package tests and fresh
+colcon results, pure Python tests, ROS interface contracts, MQTT JSON schemas,
+and real Mosquitto/Modbus integration fixtures. C++ performance suggestions are
+advisory and are not part of the blocking lint categories. Colcon restricts
+Python discovery to each package's `test` directory and excludes the rendered
+camera and Gazebo payload tests; CTest excludes the simulation-topic and
+navigation-goal launch tests. A unique result directory under `build/` retains
+only this run's colcon results for inspection. Existing local result files are
+preserved. The protocol fixtures own ephemeral loopback services and verify
+cleanup. Their bounded navigation driver is not physical autonomy coverage.
+The additional QoS/reset tests use actual DDS and ROS service endpoints, without
+starting Gazebo.
+
+The workflow uses Ubuntu 22.04, provisions ROS/platform dependencies, and then
+calls `scripts/setup_dev.sh` and this exact runner. These provisioning steps are
+CI-only setup; they do not add another test selection. GitHub success requires
+an observed workflow run on the pushed commit and is not implied by local PASS.
+
+Full Gazebo, physical success/autonomy tests, and the complete scenario matrix
+remain **local-only**. With a working display, run:
 
 ```bash
 set -e
 source .venv/bin/activate
 source /opt/ros/humble/setup.bash
-export PYTHONNOUSERSITE=1
+export PYTHONNOUSERSITE=1 ROS_LOCALHOST_ONLY=1
 colcon build --symlink-install
 source install/setup.bash
 DISPLAY=:0 colcon test --event-handlers console_direct+

@@ -22,7 +22,9 @@ class TraceWriter:
             with self.path.open(encoding="utf-8") as trace:
                 for line in trace:
                     if not line.endswith("\n"):
-                        raise ValueError("existing trace record must end with a newline")
+                        raise ValueError(
+                            "existing trace record must end with a newline"
+                        )
                     record = ProtocolEventRecord.from_dict(json.loads(line))
                     self._sequence = max(self._sequence, record.sequence or 0)
 

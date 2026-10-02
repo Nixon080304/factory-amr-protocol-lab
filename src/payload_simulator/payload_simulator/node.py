@@ -20,7 +20,11 @@ from payload_simulator.state_machine import PayloadStateMachine
 
 def pose(x, y, z):
     result = Pose()
-    result.position.x, result.position.y, result.position.z = float(x), float(y), float(z)
+    result.position.x, result.position.y, result.position.z = (
+        float(x),
+        float(y),
+        float(z),
+    )
     result.orientation.w = 1.0
     return result
 
@@ -51,12 +55,18 @@ class PayloadSimulatorNode(Node):
         elif not self.get_parameter("use_sim_time").value:
             self.set_parameters([Parameter("use_sim_time", value=True)])
         self._machine = PayloadStateMachine()
-        qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
-                         durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
         self._publisher = self.create_publisher(String, "/factory/payload_state", qos)
         self._subscription = self.create_subscription(
-            ProtocolEvent, "/factory/protocol_events", self._on_event,
-            QoSProfile(depth=100, reliability=ReliabilityPolicy.RELIABLE))
+            ProtocolEvent,
+            "/factory/protocol_events",
+            self._on_event,
+            QoSProfile(depth=100, reliability=ReliabilityPolicy.RELIABLE),
+        )
         self._client = self.create_client(SetEntityState, "/gazebo/set_entity_state")
         self._animations = deque()
         self._steps = deque()
@@ -66,21 +76,36 @@ class PayloadSimulatorNode(Node):
         self._next_step_sim_ns = 0
         # A steady timer still detects visual timeouts when simulation is paused.
         # Actual motion pacing uses the same simulation clock as protocol events.
-        self._timer = self.create_timer(0.02, self._tick, clock=Clock(clock_type=ClockType.STEADY_TIME))
+        self._timer = self.create_timer(
+            0.02, self._tick, clock=Clock(clock_type=ClockType.STEADY_TIME)
+        )
         self._publish_state("", "", None)
 
     def _publish_state(self, mission_id, transfer_kind, cycle_counter):
         message = String()
-        message.data = json.dumps({"state": self._machine.state.value, "mission_id": mission_id,
-                                   "transfer_kind": transfer_kind, "cycle_counter": cycle_counter})
+        message.data = json.dumps(
+            {
+                "state": self._machine.state.value,
+                "mission_id": mission_id,
+                "transfer_kind": transfer_kind,
+                "cycle_counter": cycle_counter,
+            }
+        )
         self._publisher.publish(message)
 
     def _on_event(self, message):
         transition = self._machine.apply_protocol_event(
-            message.mission_id, message.protocol, message.event, message.outcome, message.detail)
+            message.mission_id,
+            message.protocol,
+            message.event,
+            message.outcome,
+            message.detail,
+        )
         if not transition.applied:
             return
-        self._publish_state(transition.mission_id, transition.transfer_kind, transition.cycle_counter)
+        self._publish_state(
+            transition.mission_id, transition.transfer_kind, transition.cycle_counter
+        )
         self._animations.append(transition.transfer_kind)
 
     def _visual_failed(self, reason):
@@ -89,7 +114,9 @@ class PayloadSimulatorNode(Node):
             self._future.cancel()
         self._future = None
         self._steps.clear()
-        self.get_logger().warning(f"Payload visual update failed: {reason}; logical state remains authoritative")
+        self.get_logger().warning(
+            f"Payload visual update failed: {reason}; logical state remains authoritative"
+        )
 
     def _tick(self):
         wall_now = time.monotonic()
@@ -113,11 +140,16 @@ class PayloadSimulatorNode(Node):
                 if not success:
                     self._visual_failed("Gazebo rejected entity pose")
                     return
-                self._next_step_sim_ns = self.get_clock().now().nanoseconds + 150_000_000
+                self._next_step_sim_ns = (
+                    self.get_clock().now().nanoseconds + 150_000_000
+                )
             elif wall_now >= self._service_deadline:
                 self._visual_failed("1 s service deadline")
             return
-        if not self._steps or self.get_clock().now().nanoseconds < self._next_step_sim_ns:
+        if (
+            not self._steps
+            or self.get_clock().now().nanoseconds < self._next_step_sim_ns
+        ):
             return
         if not self._client.service_is_ready():
             return

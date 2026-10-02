@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: Apache-2.0
+name: Non-Gazebo quality gates
+"on":
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  quality:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      ROS_LOCALHOST_ONLY: "1"
+      PYTHONNOUSERSITE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      # CI-only provisioning; local users run setup_dev.sh once.
+      - uses: ros-tooling/setup-ros@v0.7
+        with:
+          required-ros-distributions: humble
+      - name: Install platform tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-venv python3-opencv cppcheck
+          if [ ! -f /etc/ros/rosdep/sources.list.d/20-default.list ]; then sudo rosdep init; fi
+          rosdep update --rosdistro humble
+      - name: Set up project dependencies
+        run: scripts/setup_dev.sh
+      - name: Run matching local gates
+        run: scripts/run_ci_checks.sh

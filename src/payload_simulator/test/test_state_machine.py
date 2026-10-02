@@ -12,10 +12,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from payload_simulator.state_machine import PayloadState, PayloadStateMachine
 
 
-def complete(machine, *, mission_id="mission_1", protocol="MODBUS",
-             event="modbus_pickup_finished", outcome="SUCCEEDED", detail=None):
+def complete(
+    machine,
+    *,
+    mission_id="mission_1",
+    protocol="MODBUS",
+    event="modbus_pickup_finished",
+    outcome="SUCCEEDED",
+    detail=None,
+):
     if detail is None:
-        detail = json.dumps({"station_id": "assembly", "transfer_kind": "LOADING", "cycle_counter": 1})
+        detail = json.dumps(
+            {"station_id": "assembly", "transfer_kind": "LOADING", "cycle_counter": 1}
+        )
     return machine.apply_protocol_event(mission_id, protocol, event, outcome, detail)
 
 
@@ -70,16 +79,30 @@ def test_single_part_does_not_reset_for_next_mission():
     assert machine.state == PayloadState.AT_INSPECTION
 
 
-@pytest.mark.parametrize("overrides", [
-    {"outcome": "FAILED"}, {"outcome": "COMPLETED"}, {"protocol": "MQTT"},
-    {"event": "modbus_pickup_started"}, {"event": "modbus_dropoff_finished"},
-    {"mission_id": ""}, {"mission_id": "bad/id"}, {"mission_id": "x" * 65},
-    {"detail": "not JSON"}, {"detail": "[]"}, {"detail": "null"},
-    {"detail": "[" * 1100 + "0" + "]" * 1100},
-    {"detail": '{"station_id":"inspection","transfer_kind":"LOADING","cycle_counter":1}'},
-    {"detail": '{"station_id":"assembly","transfer_kind":"UNLOADING","cycle_counter":1}'},
-    {"detail": '{"station_id":"assembly","transfer_kind":"LOADING"}'},
-])
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"outcome": "FAILED"},
+        {"outcome": "COMPLETED"},
+        {"protocol": "MQTT"},
+        {"event": "modbus_pickup_started"},
+        {"event": "modbus_dropoff_finished"},
+        {"mission_id": ""},
+        {"mission_id": "bad/id"},
+        {"mission_id": "x" * 65},
+        {"detail": "not JSON"},
+        {"detail": "[]"},
+        {"detail": "null"},
+        {"detail": "[" * 1100 + "0" + "]" * 1100},
+        {
+            "detail": '{"station_id":"inspection","transfer_kind":"LOADING","cycle_counter":1}'
+        },
+        {
+            "detail": '{"station_id":"assembly","transfer_kind":"UNLOADING","cycle_counter":1}'
+        },
+        {"detail": '{"station_id":"assembly","transfer_kind":"LOADING"}'},
+    ],
+)
 def test_failed_or_malformed_event_leaves_state_unchanged(overrides):
     machine = PayloadStateMachine()
     assert not complete(machine, **overrides).applied
@@ -91,7 +114,9 @@ def test_failed_or_malformed_event_leaves_state_unchanged(overrides):
 @pytest.mark.parametrize("counter", [True, False, -1, 65536, 1.5, "1", None])
 def test_cycle_counter_requires_uint16_integer(counter):
     machine = PayloadStateMachine()
-    detail = json.dumps({"station_id": "assembly", "transfer_kind": "LOADING", "cycle_counter": counter})
+    detail = json.dumps(
+        {"station_id": "assembly", "transfer_kind": "LOADING", "cycle_counter": counter}
+    )
     assert not complete(machine, detail=detail).applied
     assert not machine.apply_transfer("mission_1", "LOADING", counter).applied
     assert machine.state == PayloadState.AT_ASSEMBLY

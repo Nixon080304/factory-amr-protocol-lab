@@ -1,4 +1,5 @@
 """Zero-based wire addresses shared by the two station unit IDs."""
+
 from typing import Final
 
 ASSEMBLY_UNIT: Final = 1

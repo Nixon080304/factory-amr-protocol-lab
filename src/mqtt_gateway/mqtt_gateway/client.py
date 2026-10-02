@@ -1,15 +1,20 @@
 """Paho boundary. Its network thread only forwards immutable input to ROS."""
+
 import paho.mqtt.client as mqtt
 import threading
 
-FAULT_REQUEST_TOPIC = 'factory/faults/injected_request'
+FAULT_REQUEST_TOPIC = "factory/faults/injected_request"
 
 
 class MqttClient:
-    def __init__(self, host='127.0.0.1', port=1883):
+    def __init__(self, host="127.0.0.1", port=1883):
         self.host, self.port = host, port
-        self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id='factory_amr_01')
-        self.client.will_set('factory/robots/amr_01/availability', 'offline', qos=1, retain=True)
+        self.client = mqtt.Client(
+            mqtt.CallbackAPIVersion.VERSION2, client_id="factory_amr_01"
+        )
+        self.client.will_set(
+            "factory/robots/amr_01/availability", "offline", qos=1, retain=True
+        )
         self.client.reconnect_delay_set(min_delay=1, max_delay=30)
         self._request_subscription = None
         self._fault_subscription = None
@@ -23,14 +28,18 @@ class MqttClient:
         def received(client, userdata, msg):
             if msg.topic == FAULT_REQUEST_TOPIC:
                 self._fault_message(bytes(msg.payload))
-            elif msg.topic == 'factory/missions/request':
+            elif msg.topic == "factory/missions/request":
                 message(bytes(msg.payload))
+
         self.client.on_message = received
+
         def connected(client, userdata, flags, reason, properties):
             with self._subscription_lock:
                 self._request_subscription = None
                 if reason == 0:
-                    result, identifier = client.subscribe('factory/missions/request', qos=1)
+                    result, identifier = client.subscribe(
+                        "factory/missions/request", qos=1
+                    )
                     if result == mqtt.MQTT_ERR_SUCCESS:
                         self._request_subscription = identifier
                     else:
@@ -39,6 +48,7 @@ class MqttClient:
                         self._subscribe_fault_requests()
                 else:
                     connection(False)
+
         def subscribed(client, userdata, identifier, reasons, properties):
             with self._subscription_lock:
                 ready = len(reasons) == 1 and not reasons[0].is_failure
@@ -48,11 +58,13 @@ class MqttClient:
                 elif identifier == self._fault_subscription:
                     self._fault_subscription = None
                     self._fault_connection((self._fault_generation, ready))
+
         def disconnected(client, userdata, flags, reason, properties):
             with self._subscription_lock:
                 self._request_subscription = self._fault_subscription = None
                 connection(False)
                 self._fault_connection((self._fault_generation, False))
+
         self.client.on_connect = connected
         self.client.on_subscribe = subscribed
         self.client.on_disconnect = disconnected
@@ -63,7 +75,9 @@ class MqttClient:
     def _subscribe_fault_requests(self):
         self._fault_connection((self._fault_generation, False))
         result, identifier = self.client.subscribe(FAULT_REQUEST_TOPIC, qos=1)
-        self._fault_subscription = identifier if result == mqtt.MQTT_ERR_SUCCESS else None
+        self._fault_subscription = (
+            identifier if result == mqtt.MQTT_ERR_SUCCESS else None
+        )
 
     def enable_fault_requests(self, generation):
         with self._subscription_lock:
@@ -87,7 +101,10 @@ class MqttClient:
         self.client.loop_start()
 
     def publish(self, topic, payload, qos=0, retain=False):
-        return self.client.publish(topic, payload, qos=qos, retain=retain).rc == mqtt.MQTT_ERR_SUCCESS
+        return (
+            self.client.publish(topic, payload, qos=qos, retain=retain).rc
+            == mqtt.MQTT_ERR_SUCCESS
+        )
 
     def pause(self):
         """Explicit fault control; normal transport never calls this hook."""
@@ -98,6 +115,8 @@ class MqttClient:
         self.start()
 
     def close(self):
-        self.client.publish('factory/robots/amr_01/availability', 'offline', qos=1, retain=True)
+        self.client.publish(
+            "factory/robots/amr_01/availability", "offline", qos=1, retain=True
+        )
         self.client.disconnect()
         self.client.loop_stop()

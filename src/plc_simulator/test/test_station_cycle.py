@@ -1,4 +1,5 @@
 """Exercise the cycle contract independently of the TCP transport."""
+
 import pytest
 
 from plc_simulator.station_cycle import StationCycle

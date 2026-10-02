@@ -14,34 +14,39 @@ VALID = b'{"mission_id":"M-001","robot_id":"amr_01","pickup":"assembly","dropoff
 
 def test_accepts_mission_as_immutable_payload():
     mission = MissionValidator().validate(VALID)
-    assert mission == MissionPayload("M-001", "amr_01", "assembly", "inspection", "motor")
+    assert mission == MissionPayload(
+        "M-001", "amr_01", "assembly", "inspection", "motor"
+    )
     with pytest.raises(FrozenInstanceError):
         mission.mission_id = "changed"
 
 
-@pytest.mark.parametrize("raw", [
-    b'{',
-    b'\xff',
-    b'null',
-    b'[]',
-    b'{"mission_id":"M-001"}',
-    b'{"mission_id":"M-001","robot_id":"amr_01","pickup":"assembly","dropoff":"inspection","part":"motor","extra":1}',
-    b'{"mission_id":1,"robot_id":"amr_01","pickup":"assembly","dropoff":"inspection","part":"motor"}',
-    b'{"mission_id":"M-001","robot_id":"amr_02","pickup":"assembly","dropoff":"inspection","part":"motor"}',
-    b'{"mission_id":"M-001","robot_id":"amr_01","pickup":"unknown","dropoff":"inspection","part":"motor"}',
-    b'{"mission_id":"M-001","robot_id":"amr_01","pickup":"assembly","dropoff":"unknown","part":"motor"}',
-    b'{"mission_id":"M-001","robot_id":"amr_01","pickup":"inspection","dropoff":"assembly","part":"motor"}',
-    b'{"mission_id":"M-001","robot_id":"amr_01","pickup":"assembly","dropoff":"assembly","part":"motor"}',
-    b'{"mission_id":"M-001","robot_id":"amr_01","pickup":"inspection","dropoff":"inspection","part":"motor"}',
-    b'{"mission_id":"M-001","robot_id":"amr_01","pickup":"assembly","dropoff":"inspection","part":"gear"}',
-    b'{"mission_id":"","robot_id":"amr_01","pickup":"assembly","dropoff":"inspection","part":"motor"}',
-    b'{"mission_id":"M/001","robot_id":"amr_01","pickup":"assembly","dropoff":"inspection","part":"motor"}',
-    b'{"mission_id":"M+001","robot_id":"amr_01","pickup":"assembly","dropoff":"inspection","part":"motor"}',
-    b'{"mission_id":"M#001","robot_id":"amr_01","pickup":"assembly","dropoff":"inspection","part":"motor"}',
-    b'{"mission_id":"M\\n001","robot_id":"amr_01","pickup":"assembly","dropoff":"inspection","part":"motor"}',
-    b'{"mission_id":"M-001\\n","robot_id":"amr_01","pickup":"assembly","dropoff":"inspection","part":"motor"}',
-    b'{"mission_id":"M\\u00e9","robot_id":"amr_01","pickup":"assembly","dropoff":"inspection","part":"motor"}',
-])
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"{",
+        b"\xff",
+        b"null",
+        b"[]",
+        b'{"mission_id":"M-001"}',
+        b'{"mission_id":"M-001","robot_id":"amr_01","pickup":"assembly","dropoff":"inspection","part":"motor","extra":1}',
+        b'{"mission_id":1,"robot_id":"amr_01","pickup":"assembly","dropoff":"inspection","part":"motor"}',
+        b'{"mission_id":"M-001","robot_id":"amr_02","pickup":"assembly","dropoff":"inspection","part":"motor"}',
+        b'{"mission_id":"M-001","robot_id":"amr_01","pickup":"unknown","dropoff":"inspection","part":"motor"}',
+        b'{"mission_id":"M-001","robot_id":"amr_01","pickup":"assembly","dropoff":"unknown","part":"motor"}',
+        b'{"mission_id":"M-001","robot_id":"amr_01","pickup":"inspection","dropoff":"assembly","part":"motor"}',
+        b'{"mission_id":"M-001","robot_id":"amr_01","pickup":"assembly","dropoff":"assembly","part":"motor"}',
+        b'{"mission_id":"M-001","robot_id":"amr_01","pickup":"inspection","dropoff":"inspection","part":"motor"}',
+        b'{"mission_id":"M-001","robot_id":"amr_01","pickup":"assembly","dropoff":"inspection","part":"gear"}',
+        b'{"mission_id":"","robot_id":"amr_01","pickup":"assembly","dropoff":"inspection","part":"motor"}',
+        b'{"mission_id":"M/001","robot_id":"amr_01","pickup":"assembly","dropoff":"inspection","part":"motor"}',
+        b'{"mission_id":"M+001","robot_id":"amr_01","pickup":"assembly","dropoff":"inspection","part":"motor"}',
+        b'{"mission_id":"M#001","robot_id":"amr_01","pickup":"assembly","dropoff":"inspection","part":"motor"}',
+        b'{"mission_id":"M\\n001","robot_id":"amr_01","pickup":"assembly","dropoff":"inspection","part":"motor"}',
+        b'{"mission_id":"M-001\\n","robot_id":"amr_01","pickup":"assembly","dropoff":"inspection","part":"motor"}',
+        b'{"mission_id":"M\\u00e9","robot_id":"amr_01","pickup":"assembly","dropoff":"inspection","part":"motor"}',
+    ],
+)
 def test_rejects_invalid_requests_with_boundary_error(raw):
     with pytest.raises(MissionValidationError) as error:
         MissionValidator().validate(raw)
@@ -49,7 +54,9 @@ def test_rejects_invalid_requests_with_boundary_error(raw):
     assert error.value.reason
 
 
-@pytest.mark.parametrize("field", ["mission_id", "robot_id", "pickup", "dropoff", "part"])
+@pytest.mark.parametrize(
+    "field", ["mission_id", "robot_id", "pickup", "dropoff", "part"]
+)
 def test_rejects_strings_above_64_characters(field):
     import json
 
@@ -75,8 +82,8 @@ def test_enforces_raw_byte_limit_before_decode():
 def test_structural_parse_keeps_configuration_validation_explicit():
     validator = MissionValidator()
     parsed = validator.parse_structure(VALID.replace(b'"motor"', b'"gear"'))
-    assert parsed.part == 'gear'
+    assert parsed.part == "gear"
     with pytest.raises(MissionValidationError):
         validator.validate_configuration(parsed)
     with pytest.raises(MissionValidationError):
-        validator.parse_structure(VALID.replace(b'"motor"', b'123'))
+        validator.parse_structure(VALID.replace(b'"motor"', b"123"))

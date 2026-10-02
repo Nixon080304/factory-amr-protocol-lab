@@ -11,7 +11,9 @@ from station_perception.confirmation_window import ConfirmationWindow
 
 def test_five_matching_images_within_inclusive_window_confirm():
     window = ConfirmationWindow("assembly")
-    assert [window.observe("assembly", t) for t in [1, 1.3, 1.6, 1.9, 2.5]] == [False] * 4 + [True]
+    assert [window.observe("assembly", t) for t in [1, 1.3, 1.6, 1.9, 2.5]] == [
+        False
+    ] * 4 + [True]
 
 
 def test_old_observations_expire():
@@ -31,8 +33,10 @@ def test_wrong_station_breaks_sequence():
 
 def test_alternating_stations_never_confirm():
     window = ConfirmationWindow("assembly")
-    assert not any(window.observe(station, i * 0.1)
-                   for i, station in enumerate(["assembly", "inspection"] * 8))
+    assert not any(
+        window.observe(station, i * 0.1)
+        for i, station in enumerate(["assembly", "inspection"] * 8)
+    )
 
 
 def test_reset_discards_confirmation():

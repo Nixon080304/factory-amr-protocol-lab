@@ -16,5 +16,7 @@ setup(
     maintainer_email="nixonedwardwinata2004@gmail.com",
     description="Deduplicated logical payload state and bounded Gazebo conveyor visuals.",
     license="Apache-2.0",
-    entry_points={"console_scripts": ["payload_simulator = payload_simulator.node:main"]},
+    entry_points={
+        "console_scripts": ["payload_simulator = payload_simulator.node:main"]
+    },
 )

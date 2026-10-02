@@ -21,10 +21,15 @@ def test_registers_new_ids_and_deduplicates_canonical_fields():
     assert registry.register(replace(MISSION, mission_id="M-002")) == "new"
 
 
-@pytest.mark.parametrize(("field", "value"), [
-    ("robot_id", "amr_02"), ("pickup", "inspection"),
-    ("dropoff", "assembly"), ("part", "gear"),
-])
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("robot_id", "amr_02"),
+        ("pickup", "inspection"),
+        ("dropoff", "assembly"),
+        ("part", "gear"),
+    ],
+)
 def test_rejects_changed_fields_without_replacing_identity(field, value):
     registry = MissionRegistry()
     registry.register(MISSION)
@@ -64,6 +69,6 @@ def test_rejects_state_update_for_unregistered_mission():
 
 def test_payload_lookup_returns_only_registered_immutable_identity():
     registry = MissionRegistry()
-    assert registry.payload_for('M-001') is None
+    assert registry.payload_for("M-001") is None
     registry.register(MISSION)
-    assert registry.payload_for('M-001') == MISSION
+    assert registry.payload_for("M-001") == MISSION

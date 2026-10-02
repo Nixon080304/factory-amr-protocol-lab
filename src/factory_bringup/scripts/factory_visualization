@@ -18,22 +18,43 @@ import yaml
 class FactoryVisualization(Node):
     def __init__(self):
         super().__init__("factory_visualization")
-        self.stations = yaml.safe_load(Path(self.declare_parameter("stations_file", "").value).read_text())["stations"]
-        self.goals = self.create_publisher(PoseStamped, "/factory/navigation_goal",
-                                           QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self.stations = yaml.safe_load(
+            Path(self.declare_parameter("stations_file", "").value).read_text()
+        )["stations"]
+        self.goals = self.create_publisher(
+            PoseStamped,
+            "/factory/navigation_goal",
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+        )
         self.markers = self.create_publisher(Marker, "/factory/station_markers", 10)
-        self.create_subscription(ProtocolEvent, "/factory/protocol_events", self.event, 100)
-        self.create_subscription(StationDetection, "/factory/station_detection", self.detection, qos_profile_sensor_data)
+        self.create_subscription(
+            ProtocolEvent, "/factory/protocol_events", self.event, 100
+        )
+        self.create_subscription(
+            StationDetection,
+            "/factory/station_detection",
+            self.detection,
+            qos_profile_sensor_data,
+        )
 
     def event(self, event):
-        station = {"navigation_pickup_started": "assembly", "navigation_dropoff_started": "inspection"}.get(event.event)
+        station = {
+            "navigation_pickup_started": "assembly",
+            "navigation_dropoff_started": "inspection",
+        }.get(event.event)
         if station is None:
             return
         values = self.stations[station]
         pose = PoseStamped()
         pose.header.frame_id, pose.header.stamp = "map", event.stamp
-        pose.pose.position.x, pose.pose.position.y = float(values["x"]), float(values["y"])
-        pose.pose.orientation.z, pose.pose.orientation.w = math.sin(values["yaw"] / 2), math.cos(values["yaw"] / 2)
+        pose.pose.position.x, pose.pose.position.y = (
+            float(values["x"]),
+            float(values["y"]),
+        )
+        pose.pose.orientation.z, pose.pose.orientation.w = (
+            math.sin(values["yaw"] / 2),
+            math.cos(values["yaw"] / 2),
+        )
         self.goals.publish(pose)
 
     def detection(self, detection):
@@ -44,7 +65,11 @@ class FactoryVisualization(Node):
         marker.header.frame_id, marker.header.stamp = "map", detection.header.stamp
         marker.ns, marker.id = "camera_identity", detection.marker_id
         marker.type, marker.action = Marker.TEXT_VIEW_FACING, Marker.ADD
-        marker.pose.position.x, marker.pose.position.y, marker.pose.position.z = float(values["x"]), float(values["y"]), 0.8
+        marker.pose.position.x, marker.pose.position.y, marker.pose.position.z = (
+            float(values["x"]),
+            float(values["y"]),
+            0.8,
+        )
         marker.pose.orientation.w = 1.0
         marker.scale.z, marker.color.g, marker.color.a = 0.3, 1.0, 1.0
         marker.text = f"{detection.station_id}: camera marker {detection.marker_id}"

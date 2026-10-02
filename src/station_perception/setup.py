@@ -19,5 +19,7 @@ setup(
     maintainer_email="nixonedwardwinata2004@gmail.com",
     description="ArUco station identity detection and pure confirmation window.",
     license="Apache-2.0",
-    entry_points={"console_scripts": ["station_detector = station_perception.node:main"]},
+    entry_points={
+        "console_scripts": ["station_detector = station_perception.node:main"]
+    },
 )

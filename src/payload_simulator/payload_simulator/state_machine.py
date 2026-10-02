@@ -35,11 +35,16 @@ class PayloadStateMachine:
     def _rejected(self, reason):
         return PayloadTransition(self.state, self.state, False, reason, self.mission_id)
 
-    def apply_transfer(self, mission_id, transfer_kind, cycle_counter) -> PayloadTransition:
-        if (not isinstance(mission_id, str)
-                or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", mission_id) is None
-                or transfer_kind not in ("LOADING", "UNLOADING")
-                or type(cycle_counter) is not int or not 0 <= cycle_counter <= 65535):
+    def apply_transfer(
+        self, mission_id, transfer_kind, cycle_counter
+    ) -> PayloadTransition:
+        if (
+            not isinstance(mission_id, str)
+            or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", mission_id) is None
+            or transfer_kind not in ("LOADING", "UNLOADING")
+            or type(cycle_counter) is not int
+            or not 0 <= cycle_counter <= 65535
+        ):
             return self._rejected("invalid_transfer")
         key = (mission_id, transfer_kind, cycle_counter)
         if key in self._completed:
@@ -56,9 +61,13 @@ class PayloadStateMachine:
         self.state = target
         self.mission_id = mission_id
         self._completed.add(key)
-        return PayloadTransition(previous, target, True, "applied", mission_id, transfer_kind, cycle_counter)
+        return PayloadTransition(
+            previous, target, True, "applied", mission_id, transfer_kind, cycle_counter
+        )
 
-    def apply_protocol_event(self, mission_id, protocol, event, outcome, detail) -> PayloadTransition:
+    def apply_protocol_event(
+        self, mission_id, protocol, event, outcome, detail
+    ) -> PayloadTransition:
         if protocol != "MODBUS" or outcome != "SUCCEEDED":
             return self._rejected("not_successful_modbus")
         expected = {
@@ -71,7 +80,11 @@ class PayloadStateMachine:
             fields = json.loads(detail)
         except (ValueError, TypeError, RecursionError):
             return self._rejected("invalid_detail")
-        if (not isinstance(fields, dict)
-                or (fields.get("station_id"), fields.get("transfer_kind")) != expected):
+        if (
+            not isinstance(fields, dict)
+            or (fields.get("station_id"), fields.get("transfer_kind")) != expected
+        ):
             return self._rejected("invalid_detail")
-        return self.apply_transfer(mission_id, fields["transfer_kind"], fields.get("cycle_counter"))
+        return self.apply_transfer(
+            mission_id, fields["transfer_kind"], fields.get("cycle_counter")
+        )

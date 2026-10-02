@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Exercise environment checks against controlled executable boundaries."""
+
 import os
 from pathlib import Path
 import subprocess
@@ -31,15 +32,24 @@ def commands(tmp_path):
 def run_script(path, **environment):
     env = {**os.environ, "PATH": str(path), "ROS_DISTRO": "humble", **environment}
     return subprocess.run(
-        ["/bin/bash", str(SCRIPT)], env=env, capture_output=True, text=True,
+        ["/bin/bash", str(SCRIPT)],
+        env=env,
+        capture_output=True,
+        text=True,
         timeout=20,
     )
 
 
-@pytest.mark.parametrize("command,code", [
-    ("ros2", 10), ("python3", 12), ("docker", 14),
-    ("colcon", 17), ("rosdep", 18),
-])
+@pytest.mark.parametrize(
+    "command,code",
+    [
+        ("ros2", 10),
+        ("python3", 12),
+        ("docker", 14),
+        ("colcon", 17),
+        ("rosdep", 18),
+    ],
+)
 def test_missing_commands_have_distinct_exit_codes(commands, command, code):
     path, _ = commands
     (path / command).unlink()
@@ -53,10 +63,13 @@ def test_requires_sourced_humble(commands, distro):
     assert run_script(path, ROS_DISTRO=distro).returncode == 11
 
 
-@pytest.mark.parametrize("body,code", [
-    ('[[ "$*" == "compose version" ]]', 15),
-    ('[[ "$*" == "info" ]]', 16),
-])
+@pytest.mark.parametrize(
+    "body,code",
+    [
+        ('[[ "$*" == "compose version" ]]', 15),
+        ('[[ "$*" == "info" ]]', 16),
+    ],
+)
 def test_daemon_and_compose_failures_are_distinct(commands, body, code):
     path, write = commands
     write("docker", body)
@@ -85,6 +98,9 @@ def test_complete_environment_is_ready(commands):
 
 def test_real_target_environment_is_ready():
     result = subprocess.run(
-        ["/bin/bash", str(SCRIPT)], capture_output=True, text=True, timeout=30,
+        ["/bin/bash", str(SCRIPT)],
+        capture_output=True,
+        text=True,
+        timeout=30,
     )
     assert result.returncode == 0, result.stderr + result.stdout

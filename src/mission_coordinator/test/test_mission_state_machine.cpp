@@ -10,15 +10,13 @@ namespace {
 
 const MissionRequest kRequest{"M-001", "amr_01", "assembly", "inspection", "motor"};
 
-void expect_transition(const TransitionResult & result, MissionState state)
-{
+void expect_transition(const TransitionResult &result, MissionState state) {
   EXPECT_TRUE(result.accepted);
   EXPECT_EQ(result.state, state);
   EXPECT_TRUE(result.error_code.empty());
 }
 
-TEST(MissionStateMachine, HappyPathVisitsEachStateAndStation)
-{
+TEST(MissionStateMachine, HappyPathVisitsEachStateAndStation) {
   MissionStateMachine machine;
   EXPECT_EQ(machine.state(), MissionState::Idle);
   expect_transition(machine.start(kRequest), MissionState::Received);
@@ -38,8 +36,7 @@ TEST(MissionStateMachine, HappyPathVisitsEachStateAndStation)
   expect_transition(machine.transfer_succeeded(), MissionState::Completed);
 }
 
-TEST(MissionStateMachine, TransferSuccessCannotSkipNavigation)
-{
+TEST(MissionStateMachine, TransferSuccessCannotSkipNavigation) {
   MissionStateMachine machine;
   ASSERT_TRUE(machine.start(kRequest).accepted);
   ASSERT_TRUE(machine.begin_navigation().accepted);
@@ -50,8 +47,7 @@ TEST(MissionStateMachine, TransferSuccessCannotSkipNavigation)
   EXPECT_EQ(result.error_code, "INVALID_TRANSITION");
 }
 
-MissionStateMachine machine_at(MissionState target)
-{
+MissionStateMachine machine_at(MissionState target) {
   MissionStateMachine machine;
   if (target == MissionState::Idle) {
     return machine;
@@ -99,11 +95,12 @@ MissionStateMachine machine_at(MissionState target)
   return machine;
 }
 
-TEST(MissionStateMachine, EachNavigationLegRecoversOnceAtItsCurrentStation)
-{
-  for (const auto state : {MissionState::NavigatingToPickup, MissionState::NavigatingToDropoff}) {
+TEST(MissionStateMachine, EachNavigationLegRecoversOnceAtItsCurrentStation) {
+  for (const auto state :
+       {MissionState::NavigatingToPickup, MissionState::NavigatingToDropoff}) {
     auto machine = machine_at(state);
-    const std::string station = state == MissionState::NavigatingToPickup ? "assembly" : "inspection";
+    const std::string station =
+        state == MissionState::NavigatingToPickup ? "assembly" : "inspection";
     EXPECT_EQ(machine.navigation_retry_count(), 0U);
     expect_transition(machine.navigation_failed(), MissionState::Recovering);
     EXPECT_EQ(machine.current_station(), station);
@@ -114,9 +111,9 @@ TEST(MissionStateMachine, EachNavigationLegRecoversOnceAtItsCurrentStation)
   }
 }
 
-TEST(MissionStateMachine, SecondFailureOnEitherNavigationLegIsTerminal)
-{
-  for (const auto state : {MissionState::NavigatingToPickup, MissionState::NavigatingToDropoff}) {
+TEST(MissionStateMachine, SecondFailureOnEitherNavigationLegIsTerminal) {
+  for (const auto state :
+       {MissionState::NavigatingToPickup, MissionState::NavigatingToDropoff}) {
     auto machine = machine_at(state);
     ASSERT_TRUE(machine.navigation_failed().accepted);
     ASSERT_TRUE(machine.recovery_ready().accepted);
@@ -128,8 +125,7 @@ TEST(MissionStateMachine, SecondFailureOnEitherNavigationLegIsTerminal)
   }
 }
 
-TEST(MissionStateMachine, PickupRetryDoesNotConsumeDropoffRetry)
-{
+TEST(MissionStateMachine, PickupRetryDoesNotConsumeDropoffRetry) {
   auto machine = machine_at(MissionState::NavigatingToPickup);
   expect_transition(machine.navigation_failed(), MissionState::Recovering);
   expect_transition(machine.recovery_ready(), MissionState::NavigatingToPickup);
@@ -144,9 +140,9 @@ TEST(MissionStateMachine, PickupRetryDoesNotConsumeDropoffRetry)
   expect_transition(machine.transfer_succeeded(), MissionState::Completed);
 }
 
-TEST(MissionStateMachine, PerceptionTimeoutFailsEitherStationVerification)
-{
-  for (const auto state : {MissionState::VerifyingPickup, MissionState::VerifyingDropoff}) {
+TEST(MissionStateMachine, PerceptionTimeoutFailsEitherStationVerification) {
+  for (const auto state :
+       {MissionState::VerifyingPickup, MissionState::VerifyingDropoff}) {
     auto machine = machine_at(state);
     const auto result = machine.perception_timed_out();
     EXPECT_TRUE(result.accepted);
@@ -156,10 +152,9 @@ TEST(MissionStateMachine, PerceptionTimeoutFailsEitherStationVerification)
   }
 }
 
-TEST(MissionStateMachine, TransferFailurePreservesStableCodeAtEitherStation)
-{
+TEST(MissionStateMachine, TransferFailurePreservesStableCodeAtEitherStation) {
   for (const auto state : {MissionState::Loading, MissionState::Unloading}) {
-    for (const auto * code : {"PLC_TIMEOUT", "STATION_FAULT", "HANDSHAKE_INVALID"}) {
+    for (const auto *code : {"PLC_TIMEOUT", "STATION_FAULT", "HANDSHAKE_INVALID"}) {
       auto machine = machine_at(state);
       const auto result = machine.transfer_failed(code);
       EXPECT_TRUE(result.accepted);
@@ -170,12 +165,11 @@ TEST(MissionStateMachine, TransferFailurePreservesStableCodeAtEitherStation)
   }
 }
 
-TEST(MissionStateMachine, CancellationBeforeTransferEndsImmediately)
-{
-  for (const auto state : {MissionState::Received, MissionState::NavigatingToPickup,
-    MissionState::VerifyingPickup, MissionState::NavigatingToDropoff,
-    MissionState::VerifyingDropoff, MissionState::Recovering})
-  {
+TEST(MissionStateMachine, CancellationBeforeTransferEndsImmediately) {
+  for (const auto state :
+       {MissionState::Received, MissionState::NavigatingToPickup,
+        MissionState::VerifyingPickup, MissionState::NavigatingToDropoff,
+        MissionState::VerifyingDropoff, MissionState::Recovering}) {
     auto machine = machine_at(state);
     const auto station = machine.current_station();
     const auto result = machine.cancel();
@@ -187,8 +181,7 @@ TEST(MissionStateMachine, CancellationBeforeTransferEndsImmediately)
   }
 }
 
-TEST(MissionStateMachine, CancellationWaitsForTransferSuccessAtEitherStation)
-{
+TEST(MissionStateMachine, CancellationWaitsForTransferSuccessAtEitherStation) {
   for (const auto state : {MissionState::Loading, MissionState::Unloading}) {
     auto machine = machine_at(state);
     const auto station = machine.current_station();
@@ -204,8 +197,7 @@ TEST(MissionStateMachine, CancellationWaitsForTransferSuccessAtEitherStation)
   }
 }
 
-TEST(MissionStateMachine, CancellationWaitsForTransferFailureAndPreservesError)
-{
+TEST(MissionStateMachine, CancellationWaitsForTransferFailureAndPreservesError) {
   for (const auto state : {MissionState::Loading, MissionState::Unloading}) {
     auto machine = machine_at(state);
     expect_transition(machine.cancel(), state);
@@ -217,13 +209,13 @@ TEST(MissionStateMachine, CancellationWaitsForTransferFailureAndPreservesError)
   }
 }
 
-TEST(MissionStateMachine, ActiveMissionRejectsStartWithoutReplacingRequest)
-{
+TEST(MissionStateMachine, ActiveMissionRejectsStartWithoutReplacingRequest) {
   const MissionRequest other{"M-002", "amr_02", "inspection", "assembly", "wheel"};
-  for (const auto state : {MissionState::Received, MissionState::NavigatingToPickup,
-    MissionState::VerifyingPickup, MissionState::Loading, MissionState::NavigatingToDropoff,
-    MissionState::VerifyingDropoff, MissionState::Unloading, MissionState::Recovering})
-  {
+  for (const auto state :
+       {MissionState::Received, MissionState::NavigatingToPickup,
+        MissionState::VerifyingPickup, MissionState::Loading,
+        MissionState::NavigatingToDropoff, MissionState::VerifyingDropoff,
+        MissionState::Unloading, MissionState::Recovering}) {
     auto machine = machine_at(state);
     const auto station = machine.current_station();
     const auto result = machine.start(other);
@@ -242,27 +234,31 @@ struct GuardCase {
   std::array<MissionState, 2> allowed;
 };
 
-TEST(MissionStateMachine, EventsRejectEveryUnrelatedStateWithoutMutation)
-{
-  const std::array<MissionState, 11> states{{MissionState::Idle, MissionState::Received,
-    MissionState::NavigatingToPickup, MissionState::VerifyingPickup, MissionState::Loading,
-    MissionState::NavigatingToDropoff, MissionState::VerifyingDropoff, MissionState::Unloading,
-    MissionState::Recovering, MissionState::Completed, MissionState::Failed}};
+TEST(MissionStateMachine, EventsRejectEveryUnrelatedStateWithoutMutation) {
+  const std::array<MissionState, 11> states{
+      {MissionState::Idle, MissionState::Received, MissionState::NavigatingToPickup,
+       MissionState::VerifyingPickup, MissionState::Loading,
+       MissionState::NavigatingToDropoff, MissionState::VerifyingDropoff,
+       MissionState::Unloading, MissionState::Recovering, MissionState::Completed,
+       MissionState::Failed}};
   const std::array<GuardCase, 7> guards{{
-    {&MissionStateMachine::begin_navigation, {MissionState::Received, MissionState::Received}},
-    {&MissionStateMachine::navigation_succeeded,
-      {MissionState::NavigatingToPickup, MissionState::NavigatingToDropoff}},
-    {&MissionStateMachine::station_confirmed,
-      {MissionState::VerifyingPickup, MissionState::VerifyingDropoff}},
-    {&MissionStateMachine::transfer_succeeded, {MissionState::Loading, MissionState::Unloading}},
-    {&MissionStateMachine::navigation_failed,
-      {MissionState::NavigatingToPickup, MissionState::NavigatingToDropoff}},
-    {&MissionStateMachine::recovery_ready, {MissionState::Recovering, MissionState::Recovering}},
-    {&MissionStateMachine::perception_timed_out,
-      {MissionState::VerifyingPickup, MissionState::VerifyingDropoff}},
+      {&MissionStateMachine::begin_navigation,
+       {MissionState::Received, MissionState::Received}},
+      {&MissionStateMachine::navigation_succeeded,
+       {MissionState::NavigatingToPickup, MissionState::NavigatingToDropoff}},
+      {&MissionStateMachine::station_confirmed,
+       {MissionState::VerifyingPickup, MissionState::VerifyingDropoff}},
+      {&MissionStateMachine::transfer_succeeded,
+       {MissionState::Loading, MissionState::Unloading}},
+      {&MissionStateMachine::navigation_failed,
+       {MissionState::NavigatingToPickup, MissionState::NavigatingToDropoff}},
+      {&MissionStateMachine::recovery_ready,
+       {MissionState::Recovering, MissionState::Recovering}},
+      {&MissionStateMachine::perception_timed_out,
+       {MissionState::VerifyingPickup, MissionState::VerifyingDropoff}},
   }};
   for (const auto state : states) {
-    for (const auto & guard : guards) {
+    for (const auto &guard : guards) {
       if (state == guard.allowed[0] || state == guard.allowed[1]) {
         continue;
       }
@@ -287,9 +283,9 @@ TEST(MissionStateMachine, EventsRejectEveryUnrelatedStateWithoutMutation)
   }
 }
 
-TEST(MissionStateMachine, TerminalAndIdleStatesRejectCancel)
-{
-  for (const auto state : {MissionState::Idle, MissionState::Completed, MissionState::Failed}) {
+TEST(MissionStateMachine, TerminalAndIdleStatesRejectCancel) {
+  for (const auto state :
+       {MissionState::Idle, MissionState::Completed, MissionState::Failed}) {
     auto machine = machine_at(state);
     const auto result = machine.cancel();
     EXPECT_FALSE(result.accepted);
@@ -298,8 +294,7 @@ TEST(MissionStateMachine, TerminalAndIdleStatesRejectCancel)
   }
 }
 
-TEST(MissionStateMachine, TerminalStatesRejectStartUntilExplicitReset)
-{
+TEST(MissionStateMachine, TerminalStatesRejectStartUntilExplicitReset) {
   for (const auto state : {MissionState::Completed, MissionState::Failed}) {
     auto machine = machine_at(state);
     const auto result = machine.start(kRequest);
@@ -317,8 +312,7 @@ TEST(MissionStateMachine, TerminalStatesRejectStartUntilExplicitReset)
   }
 }
 
-TEST(MissionStateMachine, ResetClearsPendingCancelAndBothNavigationRetries)
-{
+TEST(MissionStateMachine, ResetClearsPendingCancelAndBothNavigationRetries) {
   auto machine = machine_at(MissionState::NavigatingToPickup);
   ASSERT_TRUE(machine.navigation_failed().accepted);
   ASSERT_TRUE(machine.recovery_ready().accepted);
@@ -348,13 +342,12 @@ TEST(MissionStateMachine, ResetClearsPendingCancelAndBothNavigationRetries)
   expect_transition(machine.transfer_succeeded(), MissionState::Completed);
 }
 
-TEST(MissionStateMachine, ResetCannotDiscardAnActiveMission)
-{
-  for (const auto state : {MissionState::Idle, MissionState::Received,
-    MissionState::NavigatingToPickup, MissionState::VerifyingPickup, MissionState::Loading,
-    MissionState::NavigatingToDropoff, MissionState::VerifyingDropoff, MissionState::Unloading,
-    MissionState::Recovering})
-  {
+TEST(MissionStateMachine, ResetCannotDiscardAnActiveMission) {
+  for (const auto state :
+       {MissionState::Idle, MissionState::Received, MissionState::NavigatingToPickup,
+        MissionState::VerifyingPickup, MissionState::Loading,
+        MissionState::NavigatingToDropoff, MissionState::VerifyingDropoff,
+        MissionState::Unloading, MissionState::Recovering}) {
     auto machine = machine_at(state);
     const auto result = machine.reset();
     EXPECT_FALSE(result.accepted);
@@ -364,5 +357,5 @@ TEST(MissionStateMachine, ResetCannotDiscardAnActiveMission)
   }
 }
 
-}  // namespace
-}  // namespace mission_coordinator
+} // namespace
+} // namespace mission_coordinator

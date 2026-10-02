@@ -22,7 +22,9 @@ class MissionValidationError(ValueError):
 class MissionValidator:
     def __init__(self):
         schema = json.loads(
-            files("mqtt_gateway").joinpath("schemas/mission.schema.json").read_text(encoding="utf-8")
+            files("mqtt_gateway")
+            .joinpath("schemas/mission.schema.json")
+            .read_text(encoding="utf-8")
         )
         self._validator = Draft202012Validator(schema)
         structure = deepcopy(schema)

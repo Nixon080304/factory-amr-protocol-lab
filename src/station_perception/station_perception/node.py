@@ -34,18 +34,29 @@ class StationDetectorNode(Node):
             mapping = {}
             for station_id, values in stations.items():
                 marker_id = values["marker_id"]
-                if type(marker_id) is not int or not 0 <= marker_id < 50 or marker_id in mapping:
-                    raise ValueError("Station marker IDs must be unique DICT_4X4_50 integers")
+                if (
+                    type(marker_id) is not int
+                    or not 0 <= marker_id < 50
+                    or marker_id in mapping
+                ):
+                    raise ValueError(
+                        "Station marker IDs must be unique DICT_4X4_50 integers"
+                    )
                 mapping[marker_id] = station_id
         self._detector = ArucoStationDetector(mapping)
         self._bridge = CvBridge()
-        self._publisher = self.create_publisher(StationDetection, "/factory/station_detection", 10)
+        self._publisher = self.create_publisher(
+            StationDetection, "/factory/station_detection", 10
+        )
         self._subscription = self.create_subscription(
-            Image, "/camera/image_raw", self._on_image, qos_profile_sensor_data)
+            Image, "/camera/image_raw", self._on_image, qos_profile_sensor_data
+        )
 
     def _on_image(self, image: Image):
         try:
-            detections = self._detector.detect(self._bridge.imgmsg_to_cv2(image, desired_encoding="bgr8"))
+            detections = self._detector.detect(
+                self._bridge.imgmsg_to_cv2(image, desired_encoding="bgr8")
+            )
         except (CvBridgeError, cv2.error) as error:
             self.get_logger().warning(f"Cannot decode station camera image: {error}")
             return
@@ -58,8 +69,10 @@ class StationDetectorNode(Node):
         message.marker_id = winner.marker_id
         message.confidence = winner.confidence
         self._publisher.publish(message)
-        self.get_logger().info(f"station={winner.station_id} marker={winner.marker_id} "
-                               f"normalized_area={winner.confidence:.6f}")
+        self.get_logger().info(
+            f"station={winner.station_id} marker={winner.marker_id} "
+            f"normalized_area={winner.confidence:.6f}"
+        )
 
 
 def main(args=None):

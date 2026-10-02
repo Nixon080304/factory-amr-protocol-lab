@@ -25,13 +25,19 @@ def get_entity_pose(node, name, *, timeout_sec=5.0) -> Pose:
         request.reference_frame = "world"
         future = client.call_async(request)
         while not future.done() and time.monotonic() < deadline:
-            rclpy.spin_once(node, timeout_sec=min(0.05, max(0.0, deadline - time.monotonic())))
+            rclpy.spin_once(
+                node, timeout_sec=min(0.05, max(0.0, deadline - time.monotonic()))
+            )
         if not future.done():
             future.cancel()
-            raise TimeoutError("Gazebo world pose did not arrive within bounded timeout")
+            raise TimeoutError(
+                "Gazebo world pose did not arrive within bounded timeout"
+            )
         response = future.result()
         if not response.success:
-            raise RuntimeError(f"Gazebo could not retrieve world pose for entity {name!r}")
+            raise RuntimeError(
+                f"Gazebo could not retrieve world pose for entity {name!r}"
+            )
         return response.state.pose
     finally:
         node.destroy_client(client)
@@ -48,17 +54,23 @@ def set_entity_pose(node, name, pose: Pose, *, timeout_sec=5.0) -> None:
     try:
         remaining = deadline - time.monotonic()
         if remaining <= 0 or not client.wait_for_service(timeout_sec=remaining):
-            raise TimeoutError("Gazebo reposition service unavailable within bounded timeout")
+            raise TimeoutError(
+                "Gazebo reposition service unavailable within bounded timeout"
+            )
         request = SetEntityState.Request()
         request.state.name = name
         request.state.reference_frame = "world"
         request.state.pose = pose
         future = client.call_async(request)
         while not future.done() and time.monotonic() < deadline:
-            rclpy.spin_once(node, timeout_sec=min(0.05, max(0.0, deadline - time.monotonic())))
+            rclpy.spin_once(
+                node, timeout_sec=min(0.05, max(0.0, deadline - time.monotonic()))
+            )
         if not future.done():
             future.cancel()
-            raise TimeoutError("Gazebo reposition did not finish within bounded timeout")
+            raise TimeoutError(
+                "Gazebo reposition did not finish within bounded timeout"
+            )
         if not future.result().success:
             raise RuntimeError(f"Gazebo could not reposition entity {name!r}")
     finally:
