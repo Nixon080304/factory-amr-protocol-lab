@@ -32,6 +32,7 @@ from test_protocol_faults import (
     record_owned_resource,
 )
 from fault_injector.models import FaultRequest
+from trace_assertions import assert_successful_transfer_phases
 
 
 def stamp(value):
@@ -340,6 +341,7 @@ def autonomy_fault_outcome_recovery_and_trace(name, error):
                     < names.index("mission_finished")
                 )
             if not error:
+                assert_successful_transfer_phases(mission)
                 for leg, station, marker in [
                     ("pickup", "assembly", 10),
                     ("dropoff", "inspection", 20),
@@ -369,11 +371,6 @@ def autonomy_fault_outcome_recovery_and_trace(name, error):
                     assert any(
                         value in frames and marker in frames[value][0]
                         for value in sources[:5]
-                    )
-                    assert (
-                        names.index(f"perception_{leg}_finished")
-                        < names.index(f"modbus_{leg}_started")
-                        < names.index(f"modbus_{leg}_finished")
                     )
             with ModbusTcpClient("127.0.0.1", port=plc.port, timeout=1) as connection:
                 counters = [
