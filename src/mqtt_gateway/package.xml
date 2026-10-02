@@ -10,6 +10,7 @@
   <exec_depend>python3-paho-mqtt</exec_depend>
   <exec_depend>rclpy</exec_depend>
   <exec_depend>factory_interfaces</exec_depend>
+  <exec_depend>fault_injector</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>nav_msgs</exec_depend>
   <test_depend>rosgraph_msgs</test_depend>

@@ -27,6 +27,14 @@ class MqttClient:
     def publish(self, topic, payload, qos=0, retain=False):
         return self.client.publish(topic, payload, qos=qos, retain=retain).rc == mqtt.MQTT_ERR_SUCCESS
 
+    def pause(self):
+        """Explicit fault control; normal transport never calls this hook."""
+        self.client.disconnect()
+        self.client.loop_stop()
+
+    def resume(self):
+        self.start()
+
     def close(self):
         self.client.publish('factory/robots/amr_01/availability', 'offline', qos=1, retain=True)
         self.client.disconnect()

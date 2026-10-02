@@ -1,16 +1,13 @@
 <?xml version="1.0"?>
-<!-- SPDX-License-Identifier: Apache-2.0 -->
 <package format="3">
-  <name>modbus_gateway</name>
+  <name>fault_injector</name>
   <version>0.1.0</version>
-  <description>Bounded Modbus transfer handshakes for factory stations.</description>
+  <description>Explicit deterministic mission-targeted protocol fault controls.</description>
   <maintainer email="nixonedwardwinata2004@gmail.com">Nixon Edward Winata</maintainer>
   <license>Apache-2.0</license>
-  <exec_depend>python3-pymodbus</exec_depend>
   <exec_depend>rclpy</exec_depend>
   <exec_depend>factory_interfaces</exec_depend>
-  <exec_depend>fault_injector</exec_depend>
-  <test_depend>rosgraph_msgs</test_depend>
+  <exec_depend>std_srvs</exec_depend>
   <test_depend>python3-pytest</test_depend>
   <export><build_type>ament_python</build_type></export>
 </package>

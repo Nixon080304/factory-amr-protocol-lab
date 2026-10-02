@@ -15,6 +15,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/StationDetection.msg"
   "msg/ProtocolEvent.msg"
   "srv/TransferPart.srv"
+  "srv/SetFault.srv"
+  "msg/FaultCommand.msg"
   DEPENDENCIES builtin_interfaces std_msgs
 )
 

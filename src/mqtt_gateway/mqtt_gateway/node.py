@@ -4,6 +4,8 @@ from collections import deque
 import json
 import math
 import queue
+import time
+from dataclasses import asdict
 
 import rclpy
 from rclpy.action import ActionClient
@@ -19,6 +21,7 @@ from .client import MqttClient
 from .validator import MissionValidator, MissionValidationError
 from .mission_registry import MissionRegistry, MissionConflictError
 from .reconnect_queue import ReconnectQueue
+from fault_injector.node import attach_controls
 
 
 class MqttGatewayNode(Node):
@@ -46,6 +49,11 @@ class MqttGatewayNode(Node):
         self.pending = {}
         self.awaiting_acceptance = {}
         self.client = mqtt_client or MqttClient(host, port)
+        self._fault_disconnected = False
+        self._disconnect_fault = None
+        self._reconnect_at = 0.0
+        self.faults, self.fault_subscription = attach_controls(self, owner='mqtt_gateway', callback_group=self.protocol_group,
+                                                              on_reset=self._reset_fault_effects)
         self.client.set_handlers(lambda raw: self._enqueue('request', raw[:4097]),
                                  lambda connected: self._enqueue('connection', connected))
         self.timer = self.create_timer(0.02, self._drain, callback_group=self.protocol_group,
@@ -130,6 +138,8 @@ class MqttGatewayNode(Node):
             **pose, linear_velocity=self.velocity[0], angular_velocity=self.velocity[1], timestamp=self._timestamp()))
 
     def _drain(self):
+        if self._fault_disconnected and time.monotonic() >= self._reconnect_at:
+            self._reset_fault_effects()
         # rclpy future callbacks are executor tasks, outside callback groups.
         # Consume their results here so composition with multiple threads is safe.
         for _ in range(100):
@@ -193,6 +203,21 @@ class MqttGatewayNode(Node):
             return
         self._event(mission_id, 'mqtt_acceptance_started')
         self.pending[mission_id] = mission
+        for name in ('mqtt_duplicate', 'mqtt_conflict'):
+            fault = self.faults.consume(name, mission_id, mission.pickup, 'request')
+            if fault is not None:
+                duplicate = asdict(mission)
+                if name == 'mqtt_conflict':
+                    duplicate['part'] = 'gear'
+                self.client.publish('factory/missions/request', json.dumps(duplicate), qos=1)
+                self.faults.finish(fault)
+
+    def _reset_fault_effects(self):
+        if self._fault_disconnected:
+            self._fault_disconnected = False
+            self.client.resume()
+            self.faults.finish(self._disconnect_fault)
+            self._disconnect_fault = None
 
     def _dispatch(self, mission):
         request = ExecuteFactoryMission.Goal(mission_id=mission.mission_id, robot_id=mission.robot_id,
@@ -236,6 +261,13 @@ class MqttGatewayNode(Node):
             return
         self._event(mission.mission_id, 'mqtt_acceptance_finished', 'SUCCEEDED')
         self.current_mission_id = mission.mission_id
+        fault = self.faults.consume('mqtt_disconnect', mission.mission_id, mission.pickup, 'accepted')
+        if fault is not None:
+            self.client.pause()
+            self.connected = False
+            self._fault_disconnected = True
+            self._disconnect_fault = fault
+            self._reconnect_at = time.monotonic() + fault.duration
         self.publish_status(mission.mission_id, 'RECEIVED', mission.pickup, 'Mission accepted')
         for feedback in self.awaiting_acceptance.pop(mission.mission_id, ()):
             self._feedback(mission.mission_id, feedback)
