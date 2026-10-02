@@ -103,6 +103,15 @@ def test_failed_stage_stops_later_stages_and_preserves_exit_code(runner, index, 
         assert f"[RUN] {later}" not in result.stdout
 
 
+def test_pure_stage_runs_public_document_acceptance_checks(runner):
+    result, calls = runner()
+    assert result.returncode == 0
+    pure = calls[7]
+    assert pure["command"] == "python3"
+    assert pure["args"][:3] == ["-m", "pytest", "-q"]
+    assert "tests/docs" in pure["args"]
+
+
 def test_success_requires_every_stage_and_forces_ros_and_python_isolation(runner):
     result, calls = runner()
     assert result.returncode == 0, result.stdout + result.stderr

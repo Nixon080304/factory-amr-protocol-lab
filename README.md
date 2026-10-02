@@ -6,6 +6,26 @@ confirms ArUco markers, MQTT accepts missions, and real Modbus TCP handshakes
 control the simulated PLC. Gazebo animates conveyors and payload. The observer
 writes a JSONL trace and a mission report.
 
+![Actual Gazebo and RViz mission recording](docs/assets/mission-demo.gif)
+
+The RViz mission plays at 4× wall speed, followed by zoomed Gazebo loading and
+unloading clips at captured wall speed. All frames come from application windows.
+
+![Factory overview captured from Gazebo](docs/assets/factory-overview.png)
+
+MQTT connects the dispatcher to the robot with validated JSON and replayable
+status. ROS 2 DDS carries typed actions, services, fresh sensor observations,
+and correlated events inside the robot. Modbus TCP connects the transfer adapter
+to deterministic PLC station registers. Each protocol has a separate owner and
+a different completion guarantee.
+
+![Implemented architecture](docs/assets/architecture.svg)
+
+![Successful transfer sequence](docs/assets/protocol-sequence.svg)
+
+See [measured validation results](docs/validation/latest-results.md) for capture
+provenance, mission timing, revision boundaries, and the earlier fault matrix.
+
 ## Setup and demo
 
 Use Ubuntu 22.04, ROS 2 Humble, Python 3.10+, Gazebo Classic, Nav2, TurtleBot3,
@@ -154,6 +174,15 @@ action driver. QoS mismatch is a separate DDS experiment. Every case starts
 fresh resources and resets its controls. See [measured fault scenarios](docs/fault-scenarios.md)
 for names, evidence, and transport lessons. Full Gazebo verification requires
 a local rendering display; it is not claimed as CI coverage.
+
+## Version 1 limitations
+
+Version 1 has one robot, one motor part, and one fixed route. Conveyor motion is
+a bounded visual animation after a confirmed PLC cycle; there is no manipulator
+or physical grasp simulation. Payload is hidden during transport and placed on
+the inspection belt for unloading. Registries are process-local. MQTT and
+Modbus bind to localhost without production authentication. Hosted CI remains
+unobserved until the repository is published and its workflow runs.
 
 Vanished or hung transfer gateways can leave
 a stopped robot with a pending mission and unknown PLC state. No bound on

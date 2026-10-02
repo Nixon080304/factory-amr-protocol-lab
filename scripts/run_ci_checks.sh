@@ -48,7 +48,7 @@ run_stage 'ROS tests' colcon test --return-code-on-test-failure \
     --pytest-args test " --ignore=$project_root/src/station_perception/test/test_camera_integration.py" \
     " --ignore=$project_root/src/payload_simulator/test/test_gazebo_payload.py"
 run_stage 'ROS test results' colcon test-result --verbose --test-result-base "$result_base"
-run_stage 'Pure tests' python3 -m pytest -q tests/scripts tests/scenarios src/plc_simulator/test
+run_stage 'Pure tests' python3 -m pytest -q tests/scripts tests/scenarios tests/docs src/plc_simulator/test
 run_stage 'Contracts and schemas' python3 -m pytest -q tests/contracts src/mqtt_gateway/test/test_validator.py
 # Existing reviewed fixtures own ephemeral loopback Mosquitto/Modbus peers and
 # verify their cleanup. The protocol driver replaces navigation, not services.

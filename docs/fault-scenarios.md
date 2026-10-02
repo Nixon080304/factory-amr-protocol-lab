@@ -39,13 +39,19 @@ If a case supplies no outcome, the matrix preserves a failed row with cleanup
 marked unverified, continues ordinary failures, and still saves both summaries.
 An interruption instead saves the partial matrix and preserves its signal exit.
 
-## Measured matrix
+## Earlier measured matrix
 
-Fresh local run `20261003T040407-44f8e160e765` completed all 12 cases with zero
+Local run `20261003T040407-44f8e160e765`, at revision
+`b91c36ded7fcf5c71519e698e0a52c68f6e9359d`, completed all 12 cases with zero
 unexpected outcomes. The table is derived from its actual outcome files.
 Elapsed time includes setup, assertions, and cleanup; it is not protocol
 latency. Trace counts are runner predicates, in addition to the underlying
 system assertions.
+
+This earlier matrix predates later supervisor/domain changes and the payload
+travel correction. It is historical evidence, not a final candidate matrix.
+See [validation results](validation/latest-results.md) for the fresh recording
+and separate local CI receipt.
 
 | Scenario | Actual and expected result | Evidence source | Elapsed seconds | Trace checks |
 | --- | --- | --- | --- | --- |

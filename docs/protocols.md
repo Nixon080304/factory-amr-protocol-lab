@@ -1,9 +1,11 @@
 # Protocol contracts
 
 The protocol core provides transport-independent mission, MQTT, Modbus, and
-trace logic. ROS node adapters, Nav2, perception, and Gazebo integration belong
-to later milestones. The contracts below are the boundaries those adapters
-must preserve.
+trace logic. Implemented ROS node adapters connect Nav2, perception, and Gazebo
+to those contracts. MQTT handles external mission ingress, DDS handles typed
+robot communication, and Modbus TCP handles station handshakes.
+
+![Implemented successful transfer sequence](assets/protocol-sequence.svg)
 
 ## MQTT
 
@@ -16,7 +18,7 @@ The local broker listens on host `127.0.0.1:1883`.
 | `factory/robots/amr_01/telemetry` | Robot to dispatcher | 0 | No |
 | `factory/robots/amr_01/availability` | Robot to dispatcher | 1 | Yes |
 
-The future gateway adapter configures a retained last-will message of `offline`
+The gateway adapter configures a retained last-will message of `offline`
 and publishes retained `online` on connection. Mission status events queue in
 order during a disconnect, up to 100 entries. When full, the queue drops the
 oldest event. Telemetry keeps only the latest sample and does not replay history.
@@ -74,9 +76,10 @@ Mission status payload:
 | `detail` | String | Human-readable transition detail |
 | `error_code` | String or null | Stable failure code, or no error |
 
-The status object is an adapter contract; only the request schema and core
-validation/registry/queue behavior are implemented in this milestone. Telemetry
-JSON fields will be defined with the robot adapter.
+The MQTT adapter publishes this status from the authoritative mission action
+and buffers ordered states during disconnects. The gateway also exposes a
+latest-value telemetry buffer, but version 1 has no periodic telemetry producer
+or telemetry JSON schema.
 
 Duplicate IDs with the same canonical payload return the current or final state
 without another execution. JSON key order does not change mission identity.
@@ -181,12 +184,12 @@ inside its network namespace; Compose publishes only the host loopback port.
 | Mission-state and protocol-event topics | Reliable | Depth 100 |
 | Factory-state topics | Reliable | Transient-local for late subscribers |
 | Camera and LiDAR topics | Best effort | Sensor-data QoS |
-| Telemetry sampling | Best effort | Latest sample replaces a lost sample |
 
-The future QoS mismatch scenario intentionally pairs a reliable subscriber with
-an incompatible publisher, verifies the discovery warning, and restores
-compatible QoS. This milestone generates typed interfaces and tests cores;
-it does not yet provide those DDS publishers or the mismatch launch scenario.
+The implemented `qos_mismatch` experiment pairs a RELIABLE/VOLATILE subscriber
+with a BEST_EFFORT/VOLATILE publisher. Both endpoints report actual reliability
+incompatibility; at least two wall-clock seconds yield no samples or matches.
+A compatible best-effort subscriber then receives data. This isolated DDS
+experiment does not run a physical mission or change the camera or LiDAR QoS.
 
 Mission states are `RECEIVED`, `NAVIGATING_TO_PICKUP`, `VERIFYING_PICKUP`,
 `LOADING`, `NAVIGATING_TO_DROPOFF`, `VERIFYING_DROPOFF`, `UNLOADING`,

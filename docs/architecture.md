@@ -4,6 +4,8 @@ The lab separates mission decisions from communication transports and Gazebo
 APIs. All robot nodes share simulation time. The committed map and station
 poses share world coordinates.
 
+![Implemented architecture](assets/architecture.svg)
+
 ```mermaid
 flowchart LR
     Dispatcher[Mission publisher] -->|MQTT QoS 1| Broker[Mosquitto]
@@ -42,8 +44,11 @@ access stays in simulation packages.
 | `protocol_observer` | Passive JSONL trace and terminal duration report |
 | `factory_simulation` | World, Burger-compatible drive, LiDAR, RGB camera, IMU, odometry, entity probes |
 | `factory_bringup` | Map, station configuration, AMCL/Nav2, full composition, RViz visualization |
+| `fault_injector` | Explicit deterministic controls, bounded owner acknowledgements and reset |
 
 ## Mission sequence
+
+![Protocol and transfer sequence](assets/protocol-sequence.svg)
 
 ```mermaid
 sequenceDiagram
@@ -142,8 +147,17 @@ request; duplicates replay that status. The printed output directory contains
 
 Version 1 supports one robot, one motor part, and one fixed route. Resetting the
 single-part lifecycle requires restarting the simulation. Registries and active
-aggregation are process-local. Restart recovery, reliability scenarios, CI,
-and publication remain later work.
+aggregation are process-local. Deterministic reliability
+scenarios and local CI gates are implemented; restart recovery is unsupported,
+and hosted workflow success remains unobserved. See [validation results](validation/latest-results.md).
+
+Confirmed transfers drive bounded, best-effort visuals. The part travels 0.2 m
+along each station belt in four intermediate poses. Loading then hides the part
+below the world; unloading places it at `(3, 2, 0.65)`. Its kinematic link has
+gravity disabled so commanded poses stay stable and Gazebo publishes motion.
+This is an animation,
+not a physical grasp or conveyor dynamics model. Logical payload state and PLC
+cycle counters remain authoritative even if the visual service fails.
 
 The first successful pickup commits the process-local lifecycle, including a
 pickup that finishes during cancellation. Completion, later failure, and later
