@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<package format="3">
+  <name>station_perception</name>
+  <version>0.1.0</version>
+  <description>ArUco station identity detection and pure confirmation window.</description>
+  <maintainer email="nixonedwardwinata2004@gmail.com">Nixon Edward Winata</maintainer>
+  <license>Apache-2.0</license>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>cv_bridge</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>factory_interfaces</exec_depend>
+  <test_depend>python3-pytest</test_depend>
+  <test_depend>ament_index_python</test_depend>
+  <test_depend>launch_testing</test_depend>
+  <test_depend>launch_testing_ros</test_depend>
+  <test_depend>launch_ros</test_depend>
+  <test_depend>factory_simulation</test_depend>
+  <test_depend>geometry_msgs</test_depend>
+  <export><build_type>ament_python</build_type></export>
+</package>

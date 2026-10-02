@@ -1,0 +1,17 @@
+material Factory/AssemblyMarker
+{
+  technique
+  {
+    pass
+    {
+      lighting off
+      cull_hardware none
+      cull_software none
+      texture_unit
+      {
+        texture assembly_10.png
+        filtering none
+      }
+    }
+  }
+}

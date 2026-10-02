@@ -5,6 +5,6 @@
       <visual name="body"><pose>0 0 0.25 0 0 0</pose><geometry><box><size>0.8 0.8 0.5</size></box></geometry><material><ambient>0.15 0.6 0.3 1</ambient><diffuse>0.15 0.6 0.3 1</diffuse></material></visual>
       <collision name="conveyor"><pose>0 0 0.55 0 0 0</pose><geometry><box><size>0.8 0.6 0.1</size></box></geometry></collision>
       <visual name="conveyor"><pose>0 0 0.55 0 0 0</pose><geometry><box><size>0.8 0.6 0.1</size></box></geometry><material><ambient>0.15 0.15 0.15 1</ambient><diffuse>0.15 0.15 0.15 1</diffuse></material></visual>
-      <!-- Front plane faces -Y. Task 3 can attach a rendered ArUco material. -->
-      <visual name="marker_plane"><pose>0 -0.405 0.35 0 0 0</pose><geometry><plane><normal>0 -1 0</normal><size>0.22 0.22</size></plane></geometry><material><ambient>1 1 1 1</ambient><diffuse>1 1 1 1</diffuse></material></visual>
+      <!-- Gazebo renders the unit plane in XY; rotate its +Z normal toward -Y. -->
+      <visual name="marker_plane"><pose>0 -0.405 0.35 1.5707963267948966 0 0</pose><geometry><plane><normal>0 0 1</normal><size>0.22 0.22</size></plane></geometry><material><script><uri>model://inspection_station/materials/scripts</uri><uri>model://inspection_station/materials/textures</uri><name>Factory/InspectionMarker</name></script></material></visual>
 </link></model></sdf>
