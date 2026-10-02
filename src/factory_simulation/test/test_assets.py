@@ -24,6 +24,15 @@ def world():
     return ET.parse(path).getroot().find("world")
 
 
+def test_commanded_part_can_publish_motion_without_gravity_drift():
+    include = world().find("include[name='factory_part']")
+    assert include.findtext("static") == "false"
+    part = ET.parse(PACKAGE / "models/factory_part/model.sdf").getroot().find("model")
+    link = part.find("link[@name='part_link']")
+    assert link.findtext("gravity") == "false"
+    assert link.findtext("kinematic") == "true"
+
+
 def test_robot_has_connected_unique_links_and_joints():
     root = robot()
     links = [node.get("name") for node in root.findall("link")]

@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <!-- SPDX-License-Identifier: Apache-2.0 -->
-<sdf version="1.6"><model name="factory_part"><static>false</static><link name="part_link"><inertial><mass>0.1</mass><inertia><ixx>0.000166667</ixx><iyy>0.000166667</iyy><izz>0.000166667</izz></inertia></inertial>
+<sdf version="1.6"><model name="factory_part"><static>false</static><link name="part_link"><gravity>false</gravity><kinematic>true</kinematic><inertial><mass>0.1</mass><inertia><ixx>0.000166667</ixx><iyy>0.000166667</iyy><izz>0.000166667</izz></inertia></inertial>
       <collision name="part"><pose>0 0 0 0 0 0</pose><geometry><box><size>0.1 0.1 0.1</size></box></geometry></collision>
       <visual name="part"><pose>0 0 0 0 0 0</pose><geometry><box><size>0.1 0.1 0.1</size></box></geometry><material><ambient>0.9 0.4 0.1 1</ambient><diffuse>0.9 0.4 0.1 1</diffuse></material></visual>
 </link></model></sdf>

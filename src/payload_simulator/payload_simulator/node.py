@@ -33,7 +33,7 @@ def animation_steps(transfer_kind):
     """Return bounded model poses; station bodies and markers never move.
 
     The visible part travels 0.2 m along each belt before storage or placement.
-    A static world include keeps every commanded pose stable between steps.
+    A kinematic, gravity-disabled link keeps commanded poses stable between steps.
     """
     loading = transfer_kind == "LOADING"
     x = -3.0 if loading else 3.0
