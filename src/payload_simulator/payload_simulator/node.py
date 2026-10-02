@@ -55,7 +55,8 @@ class PayloadSimulatorNode(Node):
                          durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self._publisher = self.create_publisher(String, "/factory/payload_state", qos)
         self._subscription = self.create_subscription(
-            ProtocolEvent, "/factory/protocol_events", self._on_event, 10)
+            ProtocolEvent, "/factory/protocol_events", self._on_event,
+            QoSProfile(depth=100, reliability=ReliabilityPolicy.RELIABLE))
         self._client = self.create_client(SetEntityState, "/gazebo/set_entity_state")
         self._animations = deque()
         self._steps = deque()

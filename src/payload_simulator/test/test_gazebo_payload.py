@@ -147,7 +147,9 @@ class TestGazeboPayload(unittest.TestCase):
         states = []
         subscription = self.node.create_subscription(
             String, "/factory/payload_state", lambda message: states.append(json.loads(message.data)), STATE_QOS)
-        publisher = self.node.create_publisher(ProtocolEvent, "/factory/protocol_events", 10)
+        publisher = self.node.create_publisher(
+            ProtocolEvent, "/factory/protocol_events",
+            QoSProfile(depth=100, reliability=ReliabilityPolicy.RELIABLE))
         self.spin_until(lambda: bool(states) and publisher.get_subscription_count() == 1, 30)
         self.assertEqual(states[-1]["state"], "AT_ASSEMBLY")
         self.assert_pose("factory_part", (-3, 2, 0.65))
