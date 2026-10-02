@@ -21,6 +21,12 @@ class ProtocolEventRecord:
     def __post_init__(self) -> None:
         if self.stamp.tzinfo is None or self.stamp.utcoffset() is None:
             raise ValueError("stamp must have a timezone")
+        if self.sequence is not None and (
+            isinstance(self.sequence, bool)
+            or not isinstance(self.sequence, int)
+            or self.sequence < 0
+        ):
+            raise ValueError("sequence must be a non-negative integer or None")
         object.__setattr__(self, "stamp", self.stamp.astimezone(timezone.utc))
 
     def to_dict(self) -> dict[str, Any]:
