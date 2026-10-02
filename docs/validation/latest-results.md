@@ -46,6 +46,25 @@ wall seconds. One RViz frame reports an X11 `BadMatch` and is omitted. Actual
 timestamps preserve that gap; the GIF holds captured frames rather than
 inventing motion. Both conveyor clips contain real intermediate part positions.
 
+## Supplemental AMR visibility
+
+The [native robot close-up](../assets/amr-closeup.png) uses source revision
+`a33a31f36a1c1e014b07d9c45eddb4d39bd57719`, captured on 3 October 2026. It
+shows the stacked base, wheels, and cylindrical LiDAR body. Earlier wide views
+did not establish a recognizable robot: Gazebo could not resolve the installed
+description meshes and rendered only the camera box. The simulation now appends
+the installed description's share parent to its existing model search path.
+Robot geometry, mesh scale, collisions, sensors, and protocol behavior are
+unchanged. The camera remains at its configured elevated mount.
+
+This capture launches only Gazebo and the robot's description/spawn. It is not
+a mission rerun or new navigation, sensor-gate, or protocol evidence. Both Gazebo
+processes receive the corrected search path, and their logs no longer report
+the missing body, wheel, or LiDAR meshes. Capture validates the owned drawable's
+PID, start time, and process group. Owned resource cleanup passes, but the
+Gazebo client exits with SIGSEGV (signal 11) during this diagnostic's SIGINT
+teardown. This additional lifecycle concern is not suppressed or resolved here.
+
 ## Earlier complete fault matrix
 
 The earlier local matrix at revision
@@ -84,7 +103,8 @@ use configured station positions; they are not measured 3D marker poses.
 Actual logs include Xacro escape warnings, Nav2's default goal-checker warning,
 and RViz GLSL sampler, covariance, and message-filter diagnostics. Some Python
 adapters also report `rcl_shutdown already called on the given context` during
-SIGINT teardown. This shutdown concern does not alter the measured mission
+SIGINT teardown; six children exit 1, while eighteen exit cleanly. This shutdown
+concern does not alter the measured mission
 result; owned process/service cleanup is checked independently. Rendering on
 every graphics driver is not guaranteed.
 

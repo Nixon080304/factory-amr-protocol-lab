@@ -39,6 +39,7 @@ def test_readme_explains_task_protocols_setup_evidence_and_limits():
         "local-only",
         "mission-demo.gif",
         "factory-overview.png",
+        "amr-closeup.png",
         "architecture.svg",
         "protocol-sequence.svg",
         "docs/validation/latest-results.md",
@@ -77,9 +78,10 @@ def test_public_prose_has_no_private_or_unfinished_content():
         assert not re.search(r"\+65[ -]?\d{4}[ -]?\d{4}", text)
 
 
-def test_visual_evidence_is_decodable_and_diagrams_describe_real_components():
+@pytest.mark.parametrize("name", ["factory-overview.png", "amr-closeup.png"])
+def test_native_png_evidence_is_decodable(name):
     assets = ROOT / "docs/assets"
-    png = (assets / "factory-overview.png").read_bytes()
+    png = (assets / name).read_bytes()
     assert png[:8] == b"\x89PNG\r\n\x1a\n"
     width, height = struct.unpack(">II", png[16:24])
     assert width >= 640 and height >= 480
@@ -97,6 +99,10 @@ def test_visual_evidence_is_decodable_and_diagrams_describe_real_components():
             image_data += data
         offset += size + 12
     assert len(zlib.decompress(image_data)) == height * (1 + width * channels)
+
+
+def test_recording_is_present_and_diagrams_describe_real_components():
+    assets = ROOT / "docs/assets"
     gif = (assets / "mission-demo.gif").read_bytes()
     assert gif[:6] in (b"GIF87a", b"GIF89a")
     assert len(gif) > 100_000

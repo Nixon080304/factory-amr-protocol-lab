@@ -13,6 +13,12 @@ unloading clips at captured wall speed. All frames come from application windows
 
 ![Factory overview captured from Gazebo](docs/assets/factory-overview.png)
 
+![AMR base, wheels, and LiDAR captured from Gazebo](docs/assets/amr-closeup.png)
+
+This separate close-up verifies installed robot mesh resolution after its search
+path correction. The mission GIF and overview retain their earlier source
+revision; this close-up does not claim another completed mission.
+
 MQTT connects the dispatcher to the robot with validated JSON and replayable
 status. ROS 2 DDS carries typed actions, services, fresh sensor observations,
 and correlated events inside the robot. Modbus TCP connects the transfer adapter
