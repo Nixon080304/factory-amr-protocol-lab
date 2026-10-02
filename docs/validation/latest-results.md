@@ -99,8 +99,13 @@ skips. Separate stage receipts are 92 pure checks, 36 contract/schema checks,
 and 38 real protocol/DDS integration checks. These categories overlap and must
 not be summed as distinct tests. This earlier receipt predates the added public
 document checks and payload animation tests. Run `scripts/run_ci_checks.sh`
-for the same current selection used by the hosted workflow. Hosted workflow
-success remains unobserved until publication and an actual workflow run.
+for the same current selection used by the hosted workflow. At that earlier
+revision, no hosted workflow run had been observed.
+
+## Current hosted CI
+
+Status: pending. Hosted success is unobserved before publication and an actual
+workflow run. Local checks do not establish a hosted result.
 
 ## Limits and diagnostics
 

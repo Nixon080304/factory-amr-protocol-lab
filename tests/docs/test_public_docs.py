@@ -113,7 +113,7 @@ def test_recording_is_present_and_diagrams_describe_real_components():
             assert term in text
 
 
-def test_results_distinguish_clocks_revision_sources_and_unobserved_hosted_ci():
+def test_results_distinguish_clocks_revision_sources_and_current_hosted_ci():
     text = (ROOT / "docs/validation/latest-results.md").read_text()
     for term in (
         "simulated seconds",
@@ -123,12 +123,22 @@ def test_results_distinguish_clocks_revision_sources_and_unobserved_hosted_ci():
         "Gazebo",
         "DDS",
         "navigation driver",
-        "Hosted",
-        "unobserved",
         "Xacro",
         "RViz",
     ):
         assert term in text
+    assert "## Current hosted CI" in text
+    hosted = text.split("## Current hosted CI", 1)[1].split("\n## ", 1)[0]
+    statuses = re.findall(r"^Status: (pending|success)\.", hosted, re.MULTILINE)
+    assert len(statuses) == 1
+    if statuses[0] == "pending":
+        assert "unobserved" in hosted
+    else:
+        assert re.search(
+            r"https://github\.com/Nixon080304/factory-amr-protocol-lab/actions/runs/\d+",
+            hosted,
+        )
+        assert re.search(r"`[0-9a-f]{40}`", hosted)
 
 
 def test_architecture_connectors_assign_gateway_events_and_navigation_goals():

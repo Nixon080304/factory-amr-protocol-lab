@@ -5,21 +5,6 @@ import pytest
 from modbus_gateway.station_client import StationClient, NetworkFailure
 
 
-@pytest.fixture(autouse=True)
-def preserve_launch_event_loop():
-    # asyncio.run clears the policy's current loop. Humble launch_testing
-    # retains that shared loop between launch tests in a combined collection.
-    policy = asyncio.get_event_loop_policy()
-    try:
-        previous = policy.get_event_loop()
-    except RuntimeError:
-        previous = None
-    try:
-        yield
-    finally:
-        policy.set_event_loop(previous)
-
-
 def test_network_retries_initial_attempt_plus_three_with_exact_delays(monkeypatch):
     delays = []
     attempts = []
