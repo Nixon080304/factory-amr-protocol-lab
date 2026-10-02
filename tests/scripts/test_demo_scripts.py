@@ -4,6 +4,8 @@
 import os
 from pathlib import Path
 import subprocess
+import signal
+import time
 
 import pytest
 
@@ -46,3 +48,41 @@ def test_mission_publisher_rejects_invalid_port():
                             capture_output=True, text=True, timeout=15)
     assert result.returncode != 0
     assert "FACTORY_MQTT_PORT" in result.stderr
+
+
+@pytest.mark.parametrize("leader_exits", [False, True])
+def test_cleanup_escalates_owned_group_even_after_leader_exits(leader_exits):
+    script = (ROOT / "scripts/run_demo.sh").read_text()
+    cleanup = "cleanup() {" + script.split("cleanup() {", 1)[1].split("\ntrap cleanup EXIT", 1)[0]
+    leader = subprocess.Popen(["bash", "-c", "trap '' INT TERM; sleep 300 & echo $!; "
+                               + ("exit" if leader_exits else "wait")],
+                              stdout=subprocess.PIPE, text=True, start_new_session=True)
+    child = int(leader.stdout.readline())
+    try:
+        if leader_exits:
+            leader.wait(timeout=3)
+        assert subprocess.run(["bash", "-c", f"kill -0 -- -{leader.pid}"], capture_output=True).returncode == 0
+        started = time.monotonic()
+        result = subprocess.run(["bash", "-c", f"launch_pid={leader.pid}; readiness_pid=''; owns_project=false; "
+                                 + cleanup + "\ncleanup"], capture_output=True, text=True, timeout=22)
+        assert result.returncode == 0, result.stderr
+        assert time.monotonic() - started < 20
+        status = Path(f"/proc/{child}/status")
+
+        def child_running():
+            try:
+                return "State:\tZ" not in status.read_text()
+            except FileNotFoundError:
+                return False
+
+        stopped_deadline = time.monotonic() + 1
+        while child_running() and time.monotonic() < stopped_deadline:
+            time.sleep(0.01)
+        assert not child_running(), "owned descendant still running"
+    finally:
+        try:
+            os.killpg(leader.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        leader.wait(timeout=3)
+        leader.stdout.close()

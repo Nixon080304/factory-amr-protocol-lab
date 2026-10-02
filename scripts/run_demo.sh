@@ -75,20 +75,20 @@ readiness_pid=''
 cleanup() {
     trap - EXIT INT TERM
     for owned_pid in "$readiness_pid" "$launch_pid"; do
-      if [[ -n $owned_pid ]] && kill -0 "$owned_pid" 2>/dev/null; then
+      if [[ -n $owned_pid ]] && kill -0 -- "-$owned_pid" 2>/dev/null; then
         kill -INT -- "-$owned_pid" 2>/dev/null || true
         for ((attempt=0; attempt<100; attempt++)); do
-            kill -0 "$owned_pid" 2>/dev/null || break
+            kill -0 -- "-$owned_pid" 2>/dev/null || break
             sleep 0.1
         done
-        if kill -0 "$owned_pid" 2>/dev/null; then
+        if kill -0 -- "-$owned_pid" 2>/dev/null; then
             kill -TERM -- "-$owned_pid" 2>/dev/null || true
             for ((attempt=0; attempt<50; attempt++)); do
-                kill -0 "$owned_pid" 2>/dev/null || break
+                kill -0 -- "-$owned_pid" 2>/dev/null || break
                 sleep 0.1
             done
         fi
-        if kill -0 "$owned_pid" 2>/dev/null; then
+        if kill -0 -- "-$owned_pid" 2>/dev/null; then
             kill -KILL -- "-$owned_pid" 2>/dev/null || true
         fi
         wait "$owned_pid" 2>/dev/null || true

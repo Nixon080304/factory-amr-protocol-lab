@@ -28,6 +28,7 @@
   <exec_depend>rclpy</exec_depend>
   <exec_depend>factory_interfaces</exec_depend>
   <exec_depend>visualization_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>lifecycle_msgs</exec_depend>
   <test_depend>ament_cmake_pytest</test_depend>
   <test_depend>launch_testing_ament_cmake</test_depend>

@@ -151,6 +151,6 @@ no production authentication or production security model.
 The installed Humble RViz renderer can log a first-map GLSL sampler diagnostic
 (`active samplers with a different type refer to the same texture image unit`),
 also reported in [upstream RViz issue 463](https://github.com/ros2/rviz/issues/463).
-The visualization bindings and live goal/identity topics are checked, and the
-GUI starts without a crash; a clean rendered view on every graphics driver is
-not guaranteed.
+The actual RViz view on the verified display shows the map, localization,
+scan, both costmaps, plan, goals, and live station identity labels despite this
+diagnostic. Rendering on every graphics driver is not guaranteed.
