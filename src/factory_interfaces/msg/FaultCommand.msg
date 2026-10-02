@@ -2,6 +2,7 @@
 uint64 command_id
 bool acknowledged
 string owner
+float64 ack_timeout_sec
 bool reset
 string name
 string mission_id

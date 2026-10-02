@@ -35,8 +35,7 @@ class FaultController:
             for key, (request, started) in tuple(self._entries.items()):
                 if (request.name == name and request.mission_id == mission_id
                     and request.station in (None, station) and request.activation_point == activation_point):
-                    if started is None:
-                        self._event('fault_activated', request)
+                    self._event('fault_activated', request)
                     if request.one_shot:
                         del self._entries[key]
                         self._event('fault_consumed', request)

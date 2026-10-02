@@ -18,7 +18,7 @@ from .controller import FaultController
 from .models import FaultRequest
 
 
-def attach_controls(node, *, owner, callback_group=None, on_reset=None):
+def attach_controls(node, *, owner, callback_group=None, on_reset=None, on_enable=None):
     """Keep configuration callbacks serialized with the gateway protocol boundary."""
     def event(name, request):
         node.events.publish(ProtocolEvent(stamp=node.get_clock().now().to_msg(), mission_id=request.mission_id,
@@ -26,21 +26,49 @@ def attach_controls(node, *, owner, callback_group=None, on_reset=None):
 
     controller = FaultController(on_event=event)
     acknowledgements = node.create_publisher(FaultCommand, '/factory/faults/acknowledgements', 100)
+    pending_controls = {}
+    def acknowledge(identifier):
+        acknowledgements.publish(FaultCommand(command_id=identifier, acknowledged=True, owner=owner))
+    def ready_controls():
+        now = time.monotonic()
+        for identifier, (ready, deadline) in tuple(pending_controls.items()):
+            if now >= deadline:
+                del pending_controls[identifier]
+            elif ready():
+                del pending_controls[identifier]
+                acknowledge(identifier)
+        if not pending_controls:
+            readiness_timer.cancel()
+    readiness_timer = node.create_timer(0.02, ready_controls, clock=Clock(), callback_group=callback_group)
+    readiness_timer.cancel()
     def command(message):
         if message.owner and message.owner != owner:
             return
+        ready = None
         if message.reset:
+            pending_controls.clear()
+            readiness_timer.cancel()
             controller.reset()
             if on_reset is not None:
-                on_reset()
+                ready = on_reset()
         else:
             try:
-                controller.enable(FaultRequest(message.name, message.mission_id, message.station or None,
-                    message.activation_point, message.duration, message.one_shot, message.fault_code))
+                control = FaultRequest(message.name, message.mission_id, message.station or None,
+                    message.activation_point, message.duration, message.one_shot, message.fault_code)
+                controller.enable(control)
+                if on_enable is not None:
+                    ready = on_enable(control)
             except (TypeError, ValueError) as error:
                 node.get_logger().error(f'Invalid fault command: {error}')
                 return
-        acknowledgements.publish(FaultCommand(command_id=message.command_id, acknowledged=True, owner=owner))
+        if ready is not None and not ready():
+            timeout = message.ack_timeout_sec
+            if not math.isfinite(timeout) or timeout <= 0:
+                return
+            pending_controls[message.command_id] = (ready, time.monotonic() + timeout)
+            readiness_timer.reset()
+            return
+        acknowledge(message.command_id)
     subscription = node.create_subscription(FaultCommand, '/factory/faults/commands', command, 100,
                                             callback_group=callback_group)
     return controller, subscription
@@ -91,6 +119,7 @@ class FaultInjectorNode(Node):
         with self._lock:
             self._command_id += 1
             command.command_id = self._command_id
+            command.ack_timeout_sec = float(self.ack_timeout)
             self._pending[command.command_id] = (future, set(owners), time.monotonic() + self.ack_timeout)
         self.commands.publish(command)
         return await future

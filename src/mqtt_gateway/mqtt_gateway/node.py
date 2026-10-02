@@ -5,7 +5,7 @@ import json
 import math
 import queue
 import time
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 
 import rclpy
 from rclpy.action import ActionClient
@@ -17,11 +17,19 @@ from geometry_msgs.msg import PoseWithCovarianceStamped
 from nav_msgs.msg import Odometry
 from factory_interfaces.action import ExecuteFactoryMission
 from factory_interfaces.msg import ProtocolEvent
-from .client import MqttClient
+from .client import MqttClient, FAULT_REQUEST_TOPIC
 from .validator import MissionValidator, MissionValidationError
 from .mission_registry import MissionRegistry, MissionConflictError
 from .reconnect_queue import ReconnectQueue
 from fault_injector.node import attach_controls
+from fault_injector.models import FaultRequest
+
+
+@dataclass(frozen=True)
+class PendingInjection:
+    payload: bytes
+    fault: FaultRequest
+    deadline: float
 
 
 class MqttGatewayNode(Node):
@@ -52,10 +60,17 @@ class MqttGatewayNode(Node):
         self._fault_disconnected = False
         self._disconnect_fault = None
         self._reconnect_at = 0.0
+        self._fault_request_transport = False
+        self._fault_subscription_ready = False
+        self._fault_generation = 0
+        self._pending_injections = deque()
         self.faults, self.fault_subscription = attach_controls(self, owner='mqtt_gateway', callback_group=self.protocol_group,
-                                                              on_reset=self._reset_fault_effects)
+                                                              on_reset=self._reset_controls,
+                                                              on_enable=self._enable_request_fault)
         self.client.set_handlers(lambda raw: self._enqueue('request', raw[:4097]),
                                  lambda connected: self._enqueue('connection', connected))
+        self.client.set_fault_handlers(lambda raw: self._enqueue('injected_request', raw[:4097]),
+                                       lambda ready: self._enqueue('fault_subscription', ready))
         self.timer = self.create_timer(0.02, self._drain, callback_group=self.protocol_group,
                                       clock=rclpy.clock.Clock())
         self.telemetry_timer = self.create_timer(0.5, self._sample_telemetry, callback_group=self.protocol_group,
@@ -138,6 +153,8 @@ class MqttGatewayNode(Node):
             **pose, linear_velocity=self.velocity[0], angular_velocity=self.velocity[1], timestamp=self._timestamp()))
 
     def _drain(self):
+        if self._fault_request_transport:
+            self._maintain_request_faults()
         if self._fault_disconnected and time.monotonic() >= self._reconnect_at:
             self._reset_fault_effects()
         # rclpy future callbacks are executor tasks, outside callback groups.
@@ -169,6 +186,12 @@ class MqttGatewayNode(Node):
                     telemetry = self.reconnect.pop_telemetry()
                     if telemetry is not None:
                         self.publish_telemetry(telemetry)
+            elif kind == 'fault_subscription':
+                generation, ready = value
+                if self._fault_request_transport and generation == self._fault_generation:
+                    self._fault_subscription_ready = ready
+            elif kind == 'injected_request':
+                self._request(value, generated=True)
             else:
                 self._request(value)
         # Discovery is asynchronous; do not block ROS while Nav2/bringup starts.
@@ -177,7 +200,19 @@ class MqttGatewayNode(Node):
                 del self.pending[mission_id]
                 self._dispatch(mission)
 
-    def _request(self, raw):
+    def _request(self, raw, *, generated=False):
+        if generated:
+            self._maintain_request_faults()
+            delivery = next((entry for entry in self._pending_injections if entry.payload == raw), None)
+            if not self._fault_request_transport or delivery is None:
+                try:
+                    mission_id = self.validator.parse_structure(raw).mission_id
+                except MissionValidationError:
+                    mission_id = 'invalid'
+                self._event(mission_id, 'mqtt_fault_packet_rejected', 'FAILED', 'No active injected delivery')
+                return
+            self._pending_injections.remove(delivery)
+            self.faults.finish(delivery.fault)
         mission_id = 'invalid'
         try:
             mission = self.validator.parse_structure(raw)
@@ -200,17 +235,66 @@ class MqttGatewayNode(Node):
             if state:
                 self._send_status(state)
             self._event(mission_id, 'mqtt_duplicate', 'SUCCEEDED', 'Duplicate mission')
+            if not generated:
+                self._inject_request_faults(mission)
             return
         self._event(mission_id, 'mqtt_acceptance_started')
         self.pending[mission_id] = mission
+        if not generated:
+            self._inject_request_faults(mission)
+
+    def _inject_request_faults(self, mission):
+        if not self._fault_request_transport or not self._fault_subscription_ready:
+            return
         for name in ('mqtt_duplicate', 'mqtt_conflict'):
-            fault = self.faults.consume(name, mission_id, mission.pickup, 'request')
+            if len(self._pending_injections) >= 100:
+                self._event(mission.mission_id, 'mqtt_fault_delivery_rejected', 'FAILED', 'Pending injection limit reached')
+                return
+            fault = self.faults.consume(name, mission.mission_id, mission.pickup, 'request')
             if fault is not None:
                 duplicate = asdict(mission)
                 if name == 'mqtt_conflict':
                     duplicate['part'] = 'gear'
-                self.client.publish('factory/missions/request', json.dumps(duplicate), qos=1)
-                self.faults.finish(fault)
+                payload = json.dumps(duplicate)
+                delivery = PendingInjection(payload.encode(), fault, time.monotonic() + fault.duration)
+                self._pending_injections.append(delivery)
+                if not self.client.publish(FAULT_REQUEST_TOPIC, payload, qos=1):
+                    self._pending_injections.remove(delivery)
+                    self.faults.finish(fault)
+                    self._event(mission.mission_id, 'mqtt_fault_delivery_rejected', 'FAILED', 'MQTT publish failed')
+
+    def _enable_request_fault(self, request):
+        if request.name in ('mqtt_duplicate', 'mqtt_conflict'):
+            if not self._fault_request_transport:
+                self._fault_generation += 1
+                self._fault_subscription_ready = False
+            self._fault_request_transport = True
+            self.client.enable_fault_requests(self._fault_generation)
+            generation = self._fault_generation
+            return lambda: (self._fault_request_transport and self._fault_generation == generation
+                            and self.connected and self._fault_subscription_ready
+                            and request in self.faults.query())
+
+    def _disable_request_faults(self):
+        for delivery in self._pending_injections:
+            self.faults.finish(delivery.fault)
+        self._pending_injections.clear()
+        self._fault_request_transport = self._fault_subscription_ready = False
+        self.client.disable_fault_requests()
+
+    def _maintain_request_faults(self):
+        active = self.faults.query()
+        now = time.monotonic()
+        for delivery in tuple(self._pending_injections):
+            if now >= delivery.deadline or (not delivery.fault.one_shot and delivery.fault not in active):
+                self._pending_injections.remove(delivery)
+                self.faults.finish(delivery.fault)
+        if not self._pending_injections and not any(r.name in ('mqtt_duplicate', 'mqtt_conflict') for r in active):
+            self._disable_request_faults()
+
+    def _reset_controls(self):
+        self._disable_request_faults()
+        return self._reset_fault_effects()
 
     def _reset_fault_effects(self):
         if self._fault_disconnected:
@@ -218,6 +302,9 @@ class MqttGatewayNode(Node):
             self.client.resume()
             self.faults.finish(self._disconnect_fault)
             self._disconnect_fault = None
+        # attach_controls polls this on the serialized protocol group. A SUBACK
+        # callback reaches connected only after the ROS timer consumes it.
+        return lambda: self.connected
 
     def _dispatch(self, mission):
         request = ExecuteFactoryMission.Goal(mission_id=mission.mission_id, robot_id=mission.robot_id,

@@ -135,7 +135,7 @@ def rig():
         transfer = peer.create_client(TransferPart, '/factory/transfer_part', callback_group=group)
         set_fault = peer.create_client(SetFault, '/factory/faults/set', callback_group=group)
         reset = peer.create_client(Trigger, '/factory/faults/reset', callback_group=group)
-        events, executed, statuses = [], [], []
+        events, executed, statuses, injected_packets = [], [], [], []
         payload = PayloadStateMachine()
         def observe(event):
             events.append(event)
@@ -178,9 +178,15 @@ def rig():
         runner, stop = start_executor(executor)
         client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id='scenario-' + uuid.uuid4().hex)
         subscribed = threading.Event()
-        client.on_connect = lambda client, *args: client.subscribe('factory/missions/+/status', qos=1)
+        client.on_connect = lambda client, *args: client.subscribe([
+            ('factory/missions/+/status', 1), ('factory/faults/injected_request', 1)])
         client.on_subscribe = lambda *args: subscribed.set()
-        client.on_message = lambda client, userdata, message: statuses.append(json.loads(message.payload))
+        def receive(client, userdata, message):
+            if message.topic == 'factory/faults/injected_request':
+                injected_packets.append(bytes(message.payload))
+            else:
+                statuses.append(json.loads(message.payload))
+        client.on_message = receive
         client.connect('127.0.0.1', broker_port)
         client.loop_start()
 
@@ -204,6 +210,8 @@ def rig():
             yield locals()
         finally:
             release.set()
+            if executed:
+                wait(local_done.is_set)
             client.disconnect()
             client.loop_stop()
             shutdown_executor(executor, runner, stop)
@@ -457,3 +465,113 @@ def test_owned_executor_drains_queued_handlers_before_node_destruction():
         executor._executor.shutdown(wait=True)
         node.destroy_node()
         context.shutdown()
+
+
+@pytest.mark.parametrize('recover_before_deadline', [False, True])
+def test_disconnect_reset_waits_for_broker_subscription(rig, recover_before_deadline):
+    rig['configure']('mqtt_disconnect', activation='accepted', duration=30.0)
+    rig['request']()
+    wait(lambda: rig['gateway']._fault_disconnected)
+    wait(rig['local_done'].is_set)
+    names = subprocess.run(['docker', 'ps', '--filter', f'publish={rig["broker_port"]}',
+                            '--format', '{{.Names}}'], check=True, capture_output=True, text=True, timeout=5).stdout.splitlines()
+    assert len(names) == 1 and names[0].startswith('factory-fault-')
+    broker = names[0]
+    paused = False
+    try:
+        subprocess.run(['docker', 'pause', broker], check=True, capture_output=True, text=True, timeout=5)
+        paused = True
+        future = rig['reset'].call_async(Trigger.Request())
+        if recover_before_deadline:
+            wait(lambda: future.done() or any(owners == {'mqtt_gateway'} for _, owners, _ in rig['control']._pending.values()))
+            assert not future.done(), 'reset acknowledged before request subscription restored'
+            subprocess.run(['docker', 'unpause', broker], check=True, capture_output=True, text=True, timeout=5)
+            paused = False
+            wait(future.done, timeout=3)
+            assert future.result().success, future.result().message
+            # Publish immediately after reset success, without another readiness wait.
+            rig['request']()
+            wait(lambda: any(e.event == 'mqtt_duplicate' for e in rig['events']))
+            assert rig['executed'] == ['M-fault']
+        else:
+            wait(future.done, timeout=3)
+            assert not future.result().success, 'unavailable broker must fail the reset readiness barrier'
+            assert 'mqtt_gateway' in future.result().message
+            assert not rig['gateway'].connected
+            retry = rig['reset'].call_async(Trigger.Request())
+            wait(retry.done, timeout=3)
+            assert not retry.result().success, 'retry cannot bypass outstanding request SUBACK'
+            assert 'mqtt_gateway' in retry.result().message
+            subprocess.run(['docker', 'unpause', broker], check=True, capture_output=True, text=True, timeout=5)
+            paused = False
+            recovered = rig['reset'].call_async(Trigger.Request())
+            wait(recovered.done, timeout=3)
+            assert recovered.result().success, recovered.result().message
+            rig['request']()
+            wait(lambda: any(e.event == 'mqtt_duplicate' for e in rig['events']))
+            assert rig['executed'] == ['M-fault']
+    finally:
+        if paused:
+            subprocess.run(['docker', 'unpause', broker], check=True, capture_output=True, text=True, timeout=5)
+        wait(lambda: rig['gateway'].connected, timeout=8)
+
+
+@pytest.mark.parametrize('name', ['mqtt_duplicate', 'mqtt_conflict'])
+def test_persistent_mqtt_controls_repeat_without_generated_recursion(rig, name):
+    rig['configure'](name, duration=2.0, one_shot=False)
+    rig['release'].clear()
+    rig['request']()
+    wait(lambda: any(e.event == 'fault_reset' for e in rig['events']))
+    rig['request']()
+    # Each external request must activate exactly one generated delivery.
+    wait(lambda: len([e for e in rig['events'] if e.event == 'fault_activated']) >= 2, timeout=3)
+    rig['release'].set()
+    wait(lambda: any(s['state'] == 'COMPLETED' for s in rig['statuses']))
+    wait(lambda: not rig['gateway'].faults.query(), timeout=3)
+    before = len([e for e in rig['events'] if e.event == 'mqtt_duplicate'])
+    rig['request']()
+    wait(lambda: len([e for e in rig['events'] if e.event == 'mqtt_duplicate']) > before)
+    assert len([e for e in rig['events'] if e.event == 'fault_activated']) == 2
+    assert len(rig['injected_packets']) == 2
+    assert not rig['gateway']._fault_request_transport
+    assert not rig['gateway']._pending_injections
+    assert rig['executed'] == ['M-fault']
+    assert [rig['plc'].stations[unit].registers[2] for unit in (1, 2)] == [1, 1]
+    if name == 'mqtt_conflict':
+        assert len([s for s in rig['statuses'] if s['error_code'] == 'MISSION_ID_CONFLICT']) == 2
+
+
+@pytest.mark.parametrize('recover_before_deadline', [False, True])
+def test_set_request_fault_waits_for_internal_subscription(rig, recover_before_deadline):
+    names = subprocess.run(['docker', 'ps', '--filter', f'publish={rig["broker_port"]}',
+                            '--format', '{{.Names}}'], check=True, capture_output=True, text=True, timeout=5).stdout.splitlines()
+    assert len(names) == 1 and names[0].startswith('factory-fault-')
+    broker, paused = names[0], False
+    try:
+        subprocess.run(['docker', 'pause', broker], check=True, capture_output=True, text=True, timeout=5)
+        paused = True
+        values = dict(name='mqtt_duplicate', mission_id='M-fault', station='assembly',
+                      activation_point='request', duration=1.0)
+        future = rig['set_fault'].call_async(SetFault.Request(json=json.dumps(values)))
+        wait(lambda: rig['gateway']._fault_request_transport)
+        assert not future.done() and not rig['gateway']._fault_subscription_ready
+        if recover_before_deadline:
+            subprocess.run(['docker', 'unpause', broker], check=True, capture_output=True, text=True, timeout=5)
+            paused = False
+            wait(future.done, timeout=3)
+            assert future.result().accepted, future.result().message
+            rig['request']()
+            wait(lambda: any(s['state'] == 'COMPLETED' for s in rig['statuses']))
+            wait(lambda: any(e.event == 'fault_consumed' for e in rig['events']))
+            assert len(rig['injected_packets']) == 1
+            assert rig['executed'] == ['M-fault']
+        else:
+            wait(future.done, timeout=3)
+            assert not future.result().accepted and 'mqtt_gateway' in future.result().message
+    finally:
+        if paused:
+            subprocess.run(['docker', 'unpause', broker], check=True, capture_output=True, text=True, timeout=5)
+        future = rig['reset'].call_async(Trigger.Request())
+        wait(future.done, timeout=3)
+        assert future.result().success, future.result().message
+        assert not rig['gateway']._fault_request_transport and not rig['gateway']._pending_injections

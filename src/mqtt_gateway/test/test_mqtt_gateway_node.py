@@ -9,7 +9,7 @@ from rclpy.action import ActionClient, ActionServer, GoalResponse
 from rclpy.context import Context
 from rclpy.executors import MultiThreadedExecutor, SingleThreadedExecutor
 from factory_interfaces.action import ExecuteFactoryMission
-from factory_interfaces.msg import ProtocolEvent
+from factory_interfaces.msg import FaultCommand, ProtocolEvent
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from nav_msgs.msg import Odometry
 from rosgraph_msgs.msg import Clock
@@ -19,13 +19,21 @@ from mqtt_gateway.node import MqttGatewayNode
 class Broker:
     def __init__(self):
         self.published = []
+        self.enabled_generations = []
+        self.disabled_count = 0
     def set_handlers(self, message, connection):
         self.message, self.connection = message, connection
+    def set_fault_handlers(self, message, connection):
+        self.fault_message, self.fault_connection = message, connection
     def start(self):
         self.connection(True)
     def publish(self, topic, payload, qos=0, retain=False):
         self.published.append((topic, json.loads(payload) if payload.startswith('{') else payload, qos, retain))
         return True
+    def enable_fault_requests(self, generation):
+        self.enabled_generations.append(generation)
+    def disable_fault_requests(self):
+        self.disabled_count += 1
     def close(self):
         pass
 
@@ -69,6 +77,14 @@ def rig(request):
             executor.spin_once(timeout_sec=0.02)
         assert predicate()
     yield broker, node, executed, busy, wait, peer
+    if isinstance(executor, MultiThreadedExecutor):
+        # Humble base shutdown does not join this fixture's owned worker pool.
+        # Drain handlers and surface their errors while ROS entities are alive.
+        executor._executor.shutdown(wait=True)
+        for future in executor._futures:
+            if future.done() and not future.cancelled():
+                future.result()
+        assert all(not worker.is_alive() for worker in executor._executor._threads)
     if server is not None:
         server.destroy()
     executor.shutdown()
@@ -87,6 +103,67 @@ def request(broker, mission_id='M-001', **changes):
 
 def statuses(broker):
     return [payload for topic, payload, _, _ in broker.published if topic.endswith('/status')]
+
+
+def arm_request_fault(rig, *, one_shot=True, duration=1.0):
+    broker, node, _, _, wait, peer = rig
+    acknowledgements = []
+    publisher = peer.create_publisher(FaultCommand, '/factory/faults/commands', 100)
+    peer.create_subscription(FaultCommand, '/factory/faults/acknowledgements', acknowledgements.append, 100)
+    wait(lambda: publisher.get_subscription_count() > 0)
+    publisher.publish(FaultCommand(command_id=123, owner='mqtt_gateway', name='mqtt_duplicate',
+        mission_id='M-001', station='assembly', activation_point='request', duration=duration,
+        one_shot=one_shot, fault_code=1, ack_timeout_sec=1.0))
+    wait(lambda: bool(broker.enabled_generations))
+    assert not acknowledgements, 'set acknowledged before injection-topic SUBACK'
+    broker.fault_connection((broker.enabled_generations[-1], True))
+    wait(lambda: any(a.command_id == 123 for a in acknowledgements))
+    return publisher, acknowledgements
+
+
+def test_one_shot_pending_delivery_drains_without_recursive_injection(rig):
+    broker, node, executed, _, wait, _ = rig
+    arm_request_fault(rig)
+    request(broker)
+    wait(lambda: bool(node._pending_injections))
+    assert node.faults.query() == ()
+    assert node._fault_request_transport
+    payload = node._pending_injections[0].payload
+    broker.fault_message(payload)
+    wait(lambda: not node._fault_request_transport and any(s['state'] == 'COMPLETED' for s in statuses(broker)))
+    assert broker.disabled_count == 1
+    assert len([p for p in broker.published if p[0] == 'factory/faults/injected_request']) == 1
+    assert len(executed) == 1
+
+
+@pytest.mark.parametrize('cancel', ['reset', 'expiry'])
+def test_pending_generated_packets_rejected_after_reset_or_expiry(rig, cancel):
+    broker, node, executed, _, wait, peer = rig
+    publisher, acknowledgements = arm_request_fault(rig, one_shot=False, duration=0.25)
+    rejected = []
+    peer.create_subscription(ProtocolEvent, '/factory/protocol_events',
+        lambda event: rejected.append(event) if event.event == 'mqtt_fault_packet_rejected' else None, 100)
+    wait(lambda: node.events.get_subscription_count() > 0)
+    request(broker)
+    wait(lambda: bool(node._pending_injections))
+    payload = node._pending_injections[0].payload
+    # Unrelated packets on the enabled internal path never enter the registry.
+    broker.fault_message(payload.replace(b'M-001', b'unrelated'))
+    wait(lambda: len(rejected) == 1)
+    assert node.registry.payload_for('unrelated') is None
+    if cancel == 'reset':
+        publisher.publish(FaultCommand(command_id=124, reset=True, ack_timeout_sec=1.0))
+        wait(lambda: any(a.command_id == 124 for a in acknowledgements))
+    wait(lambda: not node._fault_request_transport)
+    assert not node._pending_injections and node.faults.query() == ()
+    assert broker.disabled_count == 1
+    broker.fault_message(payload)
+    wait(lambda: len(rejected) == 2)
+    wait(lambda: any(s['state'] == 'COMPLETED' for s in statuses(broker)))
+    request(broker)
+    wait(lambda: node.incoming.empty())
+    assert len([p for p in broker.published if p[0] == 'factory/faults/injected_request']) == 1
+    assert len(executed) == 1
 
 
 def test_real_action_conversion_status_schema_and_duplicate(rig):
