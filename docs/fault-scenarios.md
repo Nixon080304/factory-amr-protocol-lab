@@ -24,6 +24,21 @@ simulation so a completed pickup cannot contaminate another case. Matrix runs
 continue after failures, save `summary.json` and `summary.md`, and exit nonzero
 if any outcome differs or the matrix is interrupted.
 
+The supervisor holds each DDS domain lease until owned descendants and services
+are verified stopped, including hard escalation after a driver timeout. A failed
+cleanup quarantines that domain in its lock file under the host temporary
+directory (normally `/tmp/factory-amr-scenario-domain-<domain>.lock`). The record
+retains the domain, process identities, service identities, and cleanup failures.
+Cooperating runners skip quarantine even when no process holds the lock. Clearing
+quarantine requires explicit manual verification of those recorded resources and
+exclusive acquisition of the same lock before updating its metadata. There is no
+automatic reclaim or general process-crash recovery guarantee.
+
+Commands that cannot start produce failed outcomes with explicit startup errors.
+If a case supplies no outcome, the matrix preserves a failed row with cleanup
+marked unverified, continues ordinary failures, and still saves both summaries.
+An interruption instead saves the partial matrix and preserves its signal exit.
+
 ## Measured matrix
 
 Fresh local run `20261003T040407-44f8e160e765` completed all 12 cases with zero

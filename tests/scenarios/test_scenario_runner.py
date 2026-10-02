@@ -1,8 +1,10 @@
 """Exercise the public runner with a transport-independent command boundary."""
+import fcntl
 import json
 import os
 from pathlib import Path
 import signal
+import socket
 import subprocess
 import time
 
@@ -22,6 +24,10 @@ output = pathlib.Path(output)
 (output / "started").write_text("started")
 mode = os.environ.get("FAKE_MODE", "success")
 if mode == "exit": sys.exit(17)
+if mode == "remove_output":
+    import shutil
+    shutil.rmtree(output)
+    sys.exit(17)
 if mode == "orphan":
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -102,6 +108,38 @@ def test_command_exit_code_is_propagated(tmp_path, command):
     result = run(tmp_path, command, 'exit')
     assert result.returncode == 17
     assert outcomes(tmp_path)[0]['command_exit_code'] == 17
+
+
+@pytest.mark.parametrize('missing', [True, False])
+def test_command_startup_error_records_failed_outcome(tmp_path, command, missing):
+    if missing:
+        command = tmp_path / 'nonexistent-command'
+    else:
+        command.chmod(0o644)
+    result = run(tmp_path, command)
+    assert result.returncode == 1
+    row = outcomes(tmp_path)[0]
+    assert not row['matched'] and row['cleanup_verified']
+    assert row['command_startup_error']['errno'] == (2 if missing else 13)
+    assert any('Command startup failed:' in failure for failure in row['failures'])
+
+
+@pytest.mark.parametrize('mode', ['missing_command', 'remove_output'])
+def test_matrix_preserves_summary_and_continues_after_missing_command_or_outcome(tmp_path, command, mode):
+    if mode == 'missing_command':
+        command = tmp_path / 'nonexistent-command'
+    result = subprocess.run([str(ROOT / 'scripts/run_all_scenarios.sh')], cwd=ROOT,
+        env=environment(tmp_path, command, mode), capture_output=True, text=True, timeout=15)
+    assert result.returncode == 1
+    summary = json.loads(next((tmp_path / 'reports').glob('*/summary.json')).read_text())
+    assert summary['complete'] and len(summary['outcomes']) == 12
+    assert summary['unexpected_outcomes'] == 12
+    assert len({row['scenario'] for row in summary['outcomes']}) == 12
+    assert all(not row['matched'] and row['failures'] for row in summary['outcomes'])
+    if mode == 'remove_output':
+        assert all(any('Missing case outcome' in failure for failure in row['failures'])
+                   for row in summary['outcomes'])
+    assert 'Unexpected outcomes: 12' in next((tmp_path / 'reports').glob('*/summary.md')).read_text()
 
 
 def wait_stopped(pid):
@@ -225,3 +263,128 @@ def test_foreign_process_hints_never_authorize_group_cleanup(tmp_path, command, 
     finally:
         sentinel.terminate()
         sentinel.wait(timeout=5)
+
+
+@pytest.fixture
+def lease_driver(tmp_path):
+    """Run the adapter's exact entrypoint; replace only expensive scenario work."""
+    path = tmp_path / 'lease_driver.py'
+    path.write_text('''#!/usr/bin/env python3
+import ast, builtins, json, os, pathlib, runpy, signal, subprocess, sys, time
+adapter = pathlib.Path(os.environ["FACTORY_TEST_ROOT"]) / "tests/scenarios/run_case.py"
+namespace = runpy.run_path(str(adapter))
+original_open = builtins.open
+def private_open(name, *args, **kwargs):
+    # Keep the original driver's lease mechanism real without touching shared locks.
+    if str(name).startswith("/tmp/factory-amr-scenario-domain-"):
+        name = pathlib.Path(os.environ["TMPDIR"]) / pathlib.Path(name).name
+    return original_open(name, *args, **kwargs)
+builtins.open = private_open
+def controlled_run(name, output):
+    if os.environ["FAKE_MODE"] == "lease_failure":
+        (output / "resources.json").write_text(json.dumps(dict(ports=[int(os.environ["TEST_PORT"])])))
+        sys.exit(17)
+    child = subprocess.Popen([sys.executable, "-c", "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"],
+        start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    (output / "child.pid").write_text(str(child.pid))
+    if os.environ["FAKE_MODE"] == "lease_hard":
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        time.sleep(60)
+    sys.exit(17)
+namespace.update(run=controlled_run, __name__="__main__")
+entry = ast.parse(adapter.read_text()).body[-1]
+exec(compile(ast.Module(body=[entry], type_ignores=[]), str(adapter), "exec"), namespace)
+''')
+    path.chmod(0o755)
+    return path
+
+
+@pytest.mark.parametrize('hard', [False, True])
+def test_domain_lease_remains_unavailable_until_owned_cleanup_finishes(tmp_path, lease_driver, hard):
+    lease_root = tmp_path / 'leases'
+    lease_root.mkdir()
+    env = {**environment(tmp_path, lease_driver, 'lease_hard' if hard else 'lease_normal'),
+           'TMPDIR': str(lease_root), 'FACTORY_TEST_ROOT': str(ROOT)}
+    process = subprocess.Popen([str(RUNNER), 'success'], cwd=ROOT, env=env,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    child = None
+    child_start = None
+    try:
+        end = time.monotonic() + 5
+        while not list(tmp_path.rglob('child.pid')) and time.monotonic() < end:
+            time.sleep(0.01)
+        child = int(next(tmp_path.rglob('child.pid')).read_text())
+        child_start = Path(f'/proc/{child}/stat').read_text().rsplit(')', 1)[1].split()[19]
+        ownership = json.loads(next(tmp_path.rglob('ownership.json')).read_text())
+        lock = lease_root / f"factory-amr-scenario-domain-{ownership['domain_id']}.lock"
+        acquired_while_live = False
+        while process.poll() is None:
+            with lock.open('a+') as candidate:
+                try:
+                    fcntl.flock(candidate, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    try:
+                        fields = Path(f'/proc/{child}/stat').read_text().rsplit(')', 1)[1].split()
+                        acquired_while_live |= fields[0] != 'Z'
+                    except FileNotFoundError:
+                        pass
+                except BlockingIOError:
+                    pass
+            time.sleep(0.01)
+        assert process.returncode == (124 if hard else 17)
+        wait_stopped(child)
+        assert not acquired_while_live, 'Domain lock acquired while owned descendant remained live'
+        assert outcomes(tmp_path)[0]['cleanup_verified']
+        with lock.open('a+') as candidate:
+            fcntl.flock(candidate, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        if process.poll() is None:
+            process.send_signal(signal.SIGTERM)
+            process.wait(timeout=10)
+        if child is not None:
+            try:
+                fields = Path(f'/proc/{child}/stat').read_text().rsplit(')', 1)[1].split()
+                if fields[19] == child_start:
+                    os.kill(child, signal.SIGKILL)
+            except (FileNotFoundError, ProcessLookupError):
+                pass
+
+
+def test_failed_cleanup_quarantines_domain_and_exhaustion_records_failure(tmp_path, lease_driver):
+    lease_root = tmp_path / 'leases'
+    lease_root.mkdir()
+    with socket.socket() as listener:
+        listener.bind(('127.0.0.1', 0))
+        listener.listen()
+        port = listener.getsockname()[1]
+        env = {**environment(tmp_path, lease_driver, 'lease_failure'), 'TMPDIR': str(lease_root),
+               'FACTORY_TEST_ROOT': str(ROOT), 'TEST_PORT': str(port)}
+        first = subprocess.run([str(RUNNER), 'success'], cwd=ROOT, env=env,
+                               capture_output=True, text=True, timeout=10)
+        assert first.returncode == 17
+        row = outcomes(tmp_path)[0]
+        assert not row['cleanup_verified']
+        domain = json.loads(next(tmp_path.rglob('ownership.json')).read_text())['domain_id']
+        lock = lease_root / f'factory-amr-scenario-domain-{domain}.lock'
+        quarantine = json.loads(lock.read_text())
+        assert quarantine['quarantined'] and quarantine['domain_id'] == domain
+        assert quarantine['resources']['ports'] == [port]
+        assert f'Owned port {port} remains open' in quarantine['cleanup_failures']
+        second = subprocess.run([str(RUNNER), 'success'], cwd=ROOT, env=env,
+                                capture_output=True, text=True, timeout=10)
+        assert second.returncode == 17
+        domains = [json.loads(path.read_text())['domain_id'] for path in tmp_path.rglob('ownership.json')]
+        assert len(domains) == 2 and len(set(domains)) == 2
+        # Exhaust only this private lock directory, never shared DDS leases.
+        for candidate_domain in range(100, 221):
+            candidate = lease_root / f'factory-amr-scenario-domain-{candidate_domain}.lock'
+            with candidate.open('a+') as handle:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if not candidate.read_text():
+                    handle.write(json.dumps(dict(quarantined=True, domain_id=candidate_domain)))
+        third = subprocess.run([str(RUNNER), 'success'], cwd=ROOT, env=env,
+                               capture_output=True, text=True, timeout=10)
+        assert third.returncode == 1
+        rows = outcomes(tmp_path)
+        assert len(rows) == 3
+        assert any(any('No isolated scenario DDS domain available' in failure for failure in row['failures'])
+                   for row in rows)

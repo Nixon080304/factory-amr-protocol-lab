@@ -7,14 +7,17 @@ export PYTHONPATH="$project_root/src/protocol_observer${PYTHONPATH:+:$PYTHONPATH
 exec python3 - "$project_root" "$@" <<'PY'
 import json
 import ctypes
+import fcntl
 import math
 import os
 from pathlib import Path
 import re
+import random
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from protocol_observer.report import compare_scenario, scenario_matrix_markdown
@@ -88,8 +91,59 @@ def reap_adopted():
                 return
         except ChildProcessError:
             return
-with (output / 'command.log').open('w') as log:
-    process = subprocess.Popen(command, cwd=root, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+command_startup_error = None
+lease = None
+ownership = None
+def write_lease_metadata(metadata):
+    # This descriptor already holds the exclusive flock; never truncate first.
+    lease.seek(0)
+    lease.truncate()
+    lease.write(json.dumps(metadata) + '\n')
+    lease.flush()
+    os.fsync(lease.fileno())
+def allocate_domain():
+    global lease, ownership
+    used = set()
+    for path in list(output.parent.glob('*/actual.json')) + list(output.parent.glob('*/ownership.json')):
+        domain = json.loads(path.read_text()).get('domain_id')
+        if domain is not None:
+            used.add(domain)
+    domains = [domain for domain in range(100, 221) if domain not in used]
+    random.shuffle(domains)
+    for domain in domains:
+        candidate = open(Path(tempfile.gettempdir()) / f'factory-amr-scenario-domain-{domain}.lock', 'a+')
+        try:
+            fcntl.flock(candidate, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            candidate.close()
+            continue
+        candidate.seek(0)
+        content = candidate.read()
+        try:
+            metadata = json.loads(content) if content else {}
+        except ValueError:
+            candidate.close()
+            continue
+        if not isinstance(metadata, dict) or metadata.get('quarantined'):
+            candidate.close()
+            continue
+        lease = candidate
+        ownership = dict(domain_id=domain, supervisor=process_identity(os.getpid()),
+                         output_dir=str(output), scenario=scenario)
+        # Fail closed if finalization cannot verify cleanup. No automatic reclaim.
+        write_lease_metadata({**ownership, 'quarantined': True,
+                              'cleanup_failures': ['Cleanup verification pending']})
+        os.environ['FACTORY_SCENARIO_DOMAIN'] = os.environ['ROS_DOMAIN_ID'] = str(domain)
+        (output / 'ownership.json').write_text(json.dumps(ownership) + '\n')
+        return
+    raise OSError('No isolated scenario DDS domain available; locked or quarantined domains require verification')
+def execute_command(log):
+    global timed_out, command_startup_error
+    try:
+        process = subprocess.Popen(command, cwd=root, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    except OSError as error:
+        command_startup_error = dict(errno=error.errno, message=str(error))
+        return 1
     while process.poll() is None and not interrupted and time.monotonic() - started < timeout:
         capture_descendants()
         time.sleep(0.05)
@@ -126,6 +180,15 @@ with (output / 'command.log').open('w') as log:
         time.sleep(0.02)
     reap_adopted()
     capture_descendants()
+    return process.returncode
+with (output / 'command.log').open('w') as log:
+    try:
+        allocate_domain()
+    except OSError as error:
+        command_startup_error = dict(errno=error.errno, message=str(error), stage='domain_allocation')
+        command_exit_code = 1
+    else:
+        command_exit_code = execute_command(log)
 cleanup_failures = []
 if live_owned():
     cleanup_failures.append('Owned descendants survived explicit cleanup')
@@ -177,8 +240,17 @@ for port in resources.get('ports', []):
         connection.settimeout(0.2)
         if connection.connect_ex(('127.0.0.1', port)) == 0:
             cleanup_failures.append(f'Owned port {port} remains open')
-result = compare_scenario(scenario, expected[scenario], output, command_exit_code=process.returncode,
+if lease is not None:
+    write_lease_metadata({**ownership, 'quarantined': bool(cleanup_failures),
+                          'cleanup_failures': cleanup_failures, 'resources': resources,
+                          'owned_processes': list(owned.values())})
+    lease.close()
+result = compare_scenario(scenario, expected[scenario], output, command_exit_code=command_exit_code,
                           timed_out=timed_out, interrupted=interrupted)
+if command_startup_error:
+    result['command_startup_error'] = command_startup_error
+    result['failures'].append('Command startup failed: ' + command_startup_error['message'])
+    result['matched'] = False
 result['elapsed_sec'] = time.monotonic() - started
 result['output_dir'] = str(output)
 result['cleanup_verified'] = not cleanup_failures
@@ -190,6 +262,6 @@ print(json.dumps(dict(scenario=scenario, actual=result['actual'].get('final_stat
     expected=result['expected']['final_state'], matched=result['matched'], failures=result['failures'],
     output_dir=str(output))))
 sys.exit(128 + interrupted if interrupted else 124 if timed_out else
-         (process.returncode if process.returncode > 0 else 128 - process.returncode)
-         if process.returncode else 0 if result['matched'] else 1)
+         (command_exit_code if command_exit_code > 0 else 128 - command_exit_code)
+         if command_exit_code else 0 if result['matched'] else 1)
 PY

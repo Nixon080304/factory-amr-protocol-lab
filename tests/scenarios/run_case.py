@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """Reuse reviewed real system assertions; export evidence only after cleanup."""
-import fcntl
 import json
 import os
 from pathlib import Path
-import random
 import signal
 import sys
 
@@ -99,29 +97,8 @@ if __name__ == '__main__':
     os.environ['ROS_LOCALHOST_ONLY'] = '1'
     os.environ.setdefault('DISPLAY', ':0')
     os.environ['LIBGL_ALWAYS_SOFTWARE'] = '1'
-    # Cooperating runners hold an exclusive domain lease until cleanup ends.
-    domains = list(range(100, 221))
-    used = set()
-    for path in list(output.parent.glob('*/actual.json')) + list(output.parent.glob('*/ownership.json')):
-        used.add(json.loads(path.read_text())['domain_id'])
-    domains = [domain for domain in domains if domain not in used]
-    random.shuffle(domains)
-    lease = None
-    for domain in domains:
-        candidate = open(f'/tmp/factory-amr-scenario-domain-{domain}.lock', 'a')
-        try:
-            fcntl.flock(candidate, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            lease = candidate
-            break
-        except BlockingIOError:
-            candidate.close()
-    if lease is None:
-        raise SystemExit('No isolated scenario DDS domain available')
-    os.environ['FACTORY_SCENARIO_DOMAIN'] = os.environ['ROS_DOMAIN_ID'] = str(domain)
-    (output / 'ownership.json').write_text(json.dumps(dict(domain_id=domain, command_pid=os.getpid())) + '\n')
+    # The public supervisor retains the assigned domain lease through cleanup.
+    os.environ['ROS_DOMAIN_ID'] = os.environ['FACTORY_SCENARIO_DOMAIN']
     signal.signal(signal.SIGTERM, interrupted)
     signal.signal(signal.SIGINT, interrupted)
-    try:
-        run(name, output)
-    finally:
-        lease.close()
+    run(name, output)

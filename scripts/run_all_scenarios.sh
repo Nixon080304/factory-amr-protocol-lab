@@ -13,12 +13,13 @@ import subprocess
 import sys
 import time
 import uuid
-from protocol_observer.report import scenario_matrix_markdown
+from protocol_observer.report import compare_scenario, scenario_matrix_markdown
 root = Path(sys.argv[1])
 expected = json.loads((root / 'tests/scenarios/expected_outcomes.yaml').read_text())
 run_id = time.strftime('%Y%m%dT%H%M%S') + '-' + uuid.uuid4().hex[:12]
 environment = {**os.environ, 'FACTORY_RUN_ID': run_id}
 output = Path(os.environ.get('FACTORY_REPORT_ROOT', root / 'reports')).resolve() / run_id
+output.mkdir(parents=True, exist_ok=False)
 outcomes = []
 interrupted = 0
 process = None
@@ -36,8 +37,13 @@ for scenario in expected:
     returncode = process.wait()
     path = output / scenario / 'outcome.json'
     if not path.exists():
-        raise SystemExit(f'{scenario} failed without an outcome: exit {returncode}')
-    outcomes.append(json.loads(path.read_text()))
+        row = compare_scenario(scenario, expected[scenario], path.parent,
+                               command_exit_code=returncode)
+        row.update(matched=False, output_dir=str(path.parent), cleanup_verified=False)
+        row['failures'].append(f'Missing case outcome: exit {returncode}; cleanup not verified')
+        outcomes.append(row)
+    else:
+        outcomes.append(json.loads(path.read_text()))
     if interrupted or returncode in (130, 143):
         break
 summary = dict(run_id=run_id, outcomes=outcomes, unexpected_outcomes=sum(not row['matched'] for row in outcomes),
