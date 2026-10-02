@@ -1,0 +1,507 @@
+{
+  "success": {
+    "final_state": "COMPLETED",
+    "error_code": null,
+    "source": "real_gazebo",
+    "action_executions": 1,
+    "trace": [
+      {
+        "event": "mission_started",
+        "protocol": "ROS",
+        "min": 1,
+        "max": 1
+      },
+      {
+        "event": "mission_finished",
+        "protocol": "ROS",
+        "outcome": "COMPLETED",
+        "min": 1,
+        "max": 1
+      },
+      {
+        "event": "modbus_pickup_finished",
+        "protocol": "MODBUS",
+        "outcome": "SUCCEEDED",
+        "min": 1
+      },
+      {
+        "event": "modbus_dropoff_finished",
+        "protocol": "MODBUS",
+        "outcome": "SUCCEEDED",
+        "min": 1
+      }
+    ]
+  },
+  "mqtt_duplicate": {
+    "final_state": "COMPLETED",
+    "error_code": null,
+    "source": "real_protocol_navigation_driver",
+    "action_executions": 1,
+    "trace": [
+      {
+        "event": "mqtt_acceptance_finished",
+        "protocol": "MQTT",
+        "outcome": "SUCCEEDED",
+        "min": 1
+      },
+      {
+        "event": "modbus_pickup_finished",
+        "protocol": "MODBUS",
+        "outcome": "SUCCEEDED",
+        "min": 1,
+        "max": 1
+      },
+      {
+        "event": "fault_activated",
+        "protocol": "FAULT",
+        "min": 1
+      },
+      {
+        "event": "fault_consumed",
+        "protocol": "FAULT",
+        "min": 1
+      },
+      {
+        "event": "fault_reset",
+        "protocol": "FAULT",
+        "min": 1
+      },
+      {
+        "event": "mqtt_duplicate",
+        "protocol": "MQTT",
+        "outcome": "SUCCEEDED",
+        "min": 1
+      }
+    ]
+  },
+  "mqtt_conflict": {
+    "final_state": "COMPLETED",
+    "error_code": null,
+    "source": "real_protocol_navigation_driver",
+    "action_executions": 1,
+    "trace": [
+      {
+        "event": "mqtt_acceptance_finished",
+        "protocol": "MQTT",
+        "outcome": "SUCCEEDED",
+        "min": 1
+      },
+      {
+        "event": "modbus_pickup_finished",
+        "protocol": "MODBUS",
+        "outcome": "SUCCEEDED",
+        "min": 1,
+        "max": 1
+      },
+      {
+        "event": "fault_activated",
+        "protocol": "FAULT",
+        "min": 1
+      },
+      {
+        "event": "fault_consumed",
+        "protocol": "FAULT",
+        "min": 1
+      },
+      {
+        "event": "fault_reset",
+        "protocol": "FAULT",
+        "min": 1
+      },
+      {
+        "event": "mqtt_rejected",
+        "protocol": "MQTT",
+        "outcome": "FAILED",
+        "min": 1,
+        "detail_contains": "MISSION_ID_CONFLICT"
+      }
+    ]
+  },
+  "mqtt_disconnect": {
+    "final_state": "COMPLETED",
+    "error_code": null,
+    "source": "real_protocol_navigation_driver",
+    "action_executions": 1,
+    "trace": [
+      {
+        "event": "mqtt_acceptance_finished",
+        "protocol": "MQTT",
+        "outcome": "SUCCEEDED",
+        "min": 1
+      },
+      {
+        "event": "modbus_pickup_finished",
+        "protocol": "MODBUS",
+        "outcome": "SUCCEEDED",
+        "min": 1,
+        "max": 1
+      },
+      {
+        "event": "fault_activated",
+        "protocol": "FAULT",
+        "min": 1
+      },
+      {
+        "event": "fault_consumed",
+        "protocol": "FAULT",
+        "min": 1
+      },
+      {
+        "event": "fault_reset",
+        "protocol": "FAULT",
+        "min": 1
+      }
+    ]
+  },
+  "modbus_delay": {
+    "final_state": "COMPLETED",
+    "error_code": null,
+    "source": "real_protocol_navigation_driver",
+    "action_executions": 1,
+    "trace": [
+      {
+        "event": "mqtt_acceptance_finished",
+        "protocol": "MQTT",
+        "outcome": "SUCCEEDED",
+        "min": 1
+      },
+      {
+        "event": "modbus_pickup_finished",
+        "protocol": "MODBUS",
+        "outcome": "SUCCEEDED",
+        "min": 1,
+        "max": 1
+      },
+      {
+        "event": "fault_activated",
+        "protocol": "FAULT",
+        "min": 1
+      },
+      {
+        "event": "fault_consumed",
+        "protocol": "FAULT",
+        "min": 1
+      },
+      {
+        "event": "fault_reset",
+        "protocol": "FAULT",
+        "min": 1
+      },
+      {
+        "event": "retry",
+        "protocol": "MODBUS",
+        "min": 1,
+        "max": 1
+      }
+    ]
+  },
+  "modbus_timeout": {
+    "final_state": "FAILED",
+    "error_code": "PLC_TIMEOUT",
+    "source": "real_protocol_navigation_driver",
+    "action_executions": 1,
+    "trace": [
+      {
+        "event": "mqtt_acceptance_finished",
+        "protocol": "MQTT",
+        "outcome": "SUCCEEDED",
+        "min": 1
+      },
+      {
+        "event": "modbus_pickup_finished",
+        "protocol": "MODBUS",
+        "outcome": "FAILED",
+        "min": 1,
+        "max": 1
+      },
+      {
+        "event": "fault_activated",
+        "protocol": "FAULT",
+        "min": 1
+      },
+      {
+        "event": "fault_consumed",
+        "protocol": "FAULT",
+        "min": 1
+      },
+      {
+        "event": "fault_reset",
+        "protocol": "FAULT",
+        "min": 1
+      }
+    ]
+  },
+  "modbus_stale_completion": {
+    "final_state": "FAILED",
+    "error_code": "STALE_PLC_STATE",
+    "source": "real_protocol_navigation_driver",
+    "action_executions": 1,
+    "trace": [
+      {
+        "event": "mqtt_acceptance_finished",
+        "protocol": "MQTT",
+        "outcome": "SUCCEEDED",
+        "min": 1
+      },
+      {
+        "event": "modbus_pickup_finished",
+        "protocol": "MODBUS",
+        "outcome": "FAILED",
+        "min": 1,
+        "max": 1
+      },
+      {
+        "event": "fault_activated",
+        "protocol": "FAULT",
+        "min": 1
+      },
+      {
+        "event": "fault_consumed",
+        "protocol": "FAULT",
+        "min": 1
+      },
+      {
+        "event": "fault_reset",
+        "protocol": "FAULT",
+        "min": 1
+      }
+    ]
+  },
+  "plc_fault": {
+    "final_state": "FAILED",
+    "error_code": "PLC_FAULT",
+    "source": "real_protocol_navigation_driver",
+    "action_executions": 1,
+    "trace": [
+      {
+        "event": "mqtt_acceptance_finished",
+        "protocol": "MQTT",
+        "outcome": "SUCCEEDED",
+        "min": 1
+      },
+      {
+        "event": "modbus_pickup_finished",
+        "protocol": "MODBUS",
+        "outcome": "FAILED",
+        "min": 1,
+        "max": 1
+      },
+      {
+        "event": "fault_activated",
+        "protocol": "FAULT",
+        "min": 1
+      },
+      {
+        "event": "fault_consumed",
+        "protocol": "FAULT",
+        "min": 1
+      },
+      {
+        "event": "fault_reset",
+        "protocol": "FAULT",
+        "min": 1
+      }
+    ]
+  },
+  "wrong_marker": {
+    "final_state": "FAILED",
+    "error_code": "STATION_NOT_CONFIRMED",
+    "source": "real_gazebo",
+    "action_executions": 1,
+    "trace": [
+      {
+        "event": "mission_started",
+        "protocol": "ROS",
+        "min": 1,
+        "max": 1
+      },
+      {
+        "event": "mission_finished",
+        "protocol": "ROS",
+        "outcome": "FAILED",
+        "min": 1,
+        "max": 1
+      },
+      {
+        "event": "fault_activated",
+        "protocol": "FAULT",
+        "min": 1
+      },
+      {
+        "event": "fault_consumed",
+        "protocol": "FAULT",
+        "min": 1
+      },
+      {
+        "event": "fault_reset",
+        "protocol": "FAULT",
+        "min": 1
+      },
+      {
+        "event": "wrong_marker_pose_applied",
+        "protocol": "SIMULATION",
+        "outcome": "SUCCEEDED",
+        "min": 1
+      },
+      {
+        "event": "perception_pickup_finished",
+        "protocol": "ROS",
+        "outcome": "FAILED",
+        "min": 1
+      },
+      {
+        "protocol": "MODBUS",
+        "min": 0,
+        "max": 0
+      }
+    ]
+  },
+  "nav_retry": {
+    "final_state": "COMPLETED",
+    "error_code": null,
+    "source": "real_gazebo",
+    "action_executions": 1,
+    "trace": [
+      {
+        "event": "mission_started",
+        "protocol": "ROS",
+        "min": 1,
+        "max": 1
+      },
+      {
+        "event": "mission_finished",
+        "protocol": "ROS",
+        "outcome": "COMPLETED",
+        "min": 1,
+        "max": 1
+      },
+      {
+        "event": "fault_activated",
+        "protocol": "FAULT",
+        "min": 1
+      },
+      {
+        "event": "fault_consumed",
+        "protocol": "FAULT",
+        "min": 1
+      },
+      {
+        "event": "fault_reset",
+        "protocol": "FAULT",
+        "min": 1
+      },
+      {
+        "event": "retry",
+        "protocol": "ROS",
+        "min": 1,
+        "max": 1
+      },
+      {
+        "event": "costmap_cleared",
+        "protocol": "ROS",
+        "outcome": "SUCCEEDED",
+        "min": 2,
+        "max": 2
+      },
+      {
+        "event": "navigation_pickup_started",
+        "protocol": "ROS",
+        "min": 2,
+        "max": 2
+      }
+    ]
+  },
+  "nav_failure": {
+    "final_state": "FAILED",
+    "error_code": "NAVIGATION_FAILED",
+    "source": "real_gazebo",
+    "action_executions": 1,
+    "trace": [
+      {
+        "event": "mission_started",
+        "protocol": "ROS",
+        "min": 1,
+        "max": 1
+      },
+      {
+        "event": "mission_finished",
+        "protocol": "ROS",
+        "outcome": "FAILED",
+        "min": 1,
+        "max": 1
+      },
+      {
+        "event": "fault_activated",
+        "protocol": "FAULT",
+        "min": 1
+      },
+      {
+        "event": "fault_consumed",
+        "protocol": "FAULT",
+        "min": 1
+      },
+      {
+        "event": "fault_reset",
+        "protocol": "FAULT",
+        "min": 1
+      },
+      {
+        "event": "retry",
+        "protocol": "ROS",
+        "min": 1,
+        "max": 1
+      },
+      {
+        "event": "costmap_cleared",
+        "protocol": "ROS",
+        "outcome": "SUCCEEDED",
+        "min": 2,
+        "max": 2
+      },
+      {
+        "event": "navigation_pickup_started",
+        "protocol": "ROS",
+        "min": 2,
+        "max": 2
+      }
+    ]
+  },
+  "qos_mismatch": {
+    "final_state": "RECOVERED",
+    "error_code": null,
+    "source": "isolated_dds",
+    "trace": [
+      {
+        "event": "qos_incompatible_offered",
+        "min": 1
+      },
+      {
+        "event": "qos_incompatible_requested",
+        "min": 1
+      },
+      {
+        "event": "qos_mismatch_finished",
+        "min": 1
+      },
+      {
+        "event": "qos_recovery_finished",
+        "min": 1
+      },
+      {
+        "event": "fault_activated",
+        "protocol": "FAULT",
+        "min": 1
+      },
+      {
+        "event": "fault_consumed",
+        "protocol": "FAULT",
+        "min": 1
+      },
+      {
+        "event": "fault_reset",
+        "protocol": "FAULT",
+        "min": 1
+      }
+    ]
+  }
+}

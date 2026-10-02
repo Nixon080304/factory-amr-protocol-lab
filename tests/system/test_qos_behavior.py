@@ -1,5 +1,7 @@
 """Real DDS incompatibility and recovery on a separate experiment topic."""
 import json
+import os
+from pathlib import Path
 import time
 
 from factory_interfaces.msg import FaultCommand, ProtocolEvent
@@ -19,7 +21,7 @@ from fault_injector.node import FaultInjectorNode
 def test_real_dds_mismatch_records_policies_and_recovers():
     FaultRequest('qos_mismatch', 'M-qos', activation_point='experiment_start', duration=2.0)
     context = Context()
-    rclpy.init(context=context, domain_id=92)
+    rclpy.init(context=context, domain_id=int(os.environ.get('FACTORY_SCENARIO_DOMAIN', '92')))
     control = FaultInjectorNode(context=context, parameter_overrides=[Parameter('fault_owners', value=['qos_experiment']),
                                Parameter('use_sim_time', value=True)])
     peer = rclpy.create_node('qos_behavior_probe', context=context)
@@ -59,7 +61,9 @@ def test_real_dds_mismatch_records_policies_and_recovers():
         assert names.index('qos_mismatch_started') < names.index('qos_incompatible_offered') < names.index('qos_mismatch_finished')
         assert experiment.topic.startswith('/factory/faults/qos_experiment/')
         assert peer.count_publishers('/factory/telemetry') == 0
-        output = ROOT / '.superpowers/sdd/2026-10-02-factory-amr-03-reliability-release/evidence/qos-trace.json'
+        output = (Path(os.environ['FACTORY_SCENARIO_OUTPUT']) / 'qos-trace.json'
+                  if 'FACTORY_SCENARIO_OUTPUT' in os.environ else
+                  ROOT / '.superpowers/sdd/2026-10-02-factory-amr-03-reliability-release/evidence/qos-trace.json')
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps([dict(event=event.event, protocol=event.protocol, detail=event.detail)
             for event in events], indent=2) + '\n')
@@ -75,6 +79,10 @@ def test_real_dds_mismatch_records_policies_and_recovers():
             node.destroy_node()
         context.shutdown()
         print('cleanup: owned QoS endpoints, executor and DDS context stopped')
+    if 'FACTORY_SCENARIO_OUTPUT' in os.environ:
+        return dict(final_state='RECOVERED' if recovery['sample_count'] >= 1 else 'NO_DATA',
+                    error_code=None, mission_id='M-qos', events=events,
+                    mismatch=mismatch, recovery=recovery)
 
 
 def test_simulation_reset_deadline_with_stalled_clock_and_missing_gazebo():

@@ -23,7 +23,7 @@ from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
 from std_srvs.srv import Trigger
 
-from test_protocol_faults import ROOT, free_port, services
+from test_protocol_faults import ROOT, free_port, services, record_owned_process, record_owned_resource
 from fault_injector.models import FaultRequest
 
 
@@ -34,13 +34,23 @@ def stamp(value):
 @pytest.mark.parametrize('name,error', [('wrong_marker', 'STATION_NOT_CONFIRMED'),
     ('nav_reject_once', None), ('nav_reject_twice', 'NAVIGATION_FAILED')])
 def test_autonomy_fault_outcome_recovery_and_trace(name, error):
+    # Match the owned launch's loopback transport before creating the probe.
+    # Restore the caller's environment even if setup or assertions fail.
+    with pytest.MonkeyPatch.context() as environment:
+        environment.setenv('ROS_LOCALHOST_ONLY', '1')
+        return autonomy_fault_outcome_recovery_and_trace(name, error)
+
+
+def autonomy_fault_outcome_recovery_and_trace(name, error):
     # Missing validation/routing used to make these scenarios unavailable.
     FaultRequest(name, 'M-autonomy', activation_point='navigation_start', duration=120.0)
-    output = ROOT / '.superpowers/sdd/2026-10-02-factory-amr-03-reliability-release/evidence' / (name + '-' + uuid.uuid4().hex)
-    output.mkdir(parents=True)
+    output = Path(os.environ['FACTORY_SCENARIO_OUTPUT']) if 'FACTORY_SCENARIO_OUTPUT' in os.environ else (
+        ROOT / '.superpowers/sdd/2026-10-02-factory-amr-03-reliability-release/evidence' / (name + '-' + uuid.uuid4().hex))
+    output.mkdir(parents=True, exist_ok=True)
     # A fresh domain per case also prevents lingering DDS discovery from the
     # preceding launch from being mistaken for a new lifecycle service peer.
-    domain = {'wrong_marker': 91, 'nav_reject_once': 94, 'nav_reject_twice': 95}[name]
+    domain = int(os.environ.get('FACTORY_SCENARIO_DOMAIN',
+        {'wrong_marker': 91, 'nav_reject_once': 94, 'nav_reject_twice': 95}[name]))
     rclpy.init(domain_id=domain)
     node = rclpy.create_node('autonomy_fault_probe',
                             parameter_overrides=[Parameter('use_sim_time', value=True)])
@@ -94,6 +104,8 @@ def test_autonomy_fault_outcome_recovery_and_trace(name, error):
             process = subprocess.Popen(['ros2', 'launch', 'factory_bringup', 'demo.launch.py', 'gui:=false',
                 'rviz:=false', f'broker_port:={broker_port}', f'plc_port:={plc.port}', f'output_dir:={output}'],
                 env=environment, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+            record_owned_process(process)
+            record_owned_resource('ports', gazebo_port)
             wait(lambda: subscribed and poses and configure.service_is_ready() and reset.service_is_ready(), 80)
             ready = subprocess.run(['ros2', 'run', 'factory_bringup', 'factory_wait_ready'], env=environment,
                                    capture_output=True, text=True, timeout=65)
@@ -184,3 +196,7 @@ def test_autonomy_fault_outcome_recovery_and_trace(name, error):
             children = re.findall(r'process started with pid \[(\d+)\]', (output / 'demo.log').read_text())
             assert not any(Path(f'/proc/{pid}').exists() for pid in children)
             print(f'cleanup: {len(children)} owned launch children stopped; Gazebo master={gazebo_port}')
+    if 'FACTORY_SCENARIO_OUTPUT' in os.environ:
+        return dict(final_state=terminal[0]['state'], error_code=terminal[0]['error_code'],
+                    mission_id='M-autonomy', action_executions=names.count('mission_started'),
+                    events=events, proof=str(output / 'scenario-proof.json'))

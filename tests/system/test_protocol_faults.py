@@ -6,6 +6,7 @@ come from the production Modbus gateway and payload state machine.
 import asyncio
 from contextlib import contextmanager
 import json
+import os
 from pathlib import Path
 import socket
 import subprocess
@@ -43,6 +44,24 @@ def free_port():
     with socket.socket() as connection:
         connection.bind(('127.0.0.1', 0))
         return connection.getsockname()[1]
+
+
+def record_owned_resource(kind, value):
+    """Publish only resources created by this case to its outer supervisor."""
+    directory = os.environ.get('FACTORY_SCENARIO_OUTPUT')
+    if not directory:
+        return
+    path = Path(directory) / 'resources.json'
+    data = json.loads(path.read_text()) if path.exists() else dict(containers=[], compose_projects=[], groups=[], ports=[])
+    data[kind].append(value)
+    temporary = path.with_suffix('.tmp')
+    temporary.write_text(json.dumps(data) + '\n')
+    temporary.replace(path)
+
+
+def record_owned_process(process):
+    start = Path(f'/proc/{process.pid}/stat').read_text().rsplit(')', 1)[1].split()[19]
+    record_owned_resource('groups', dict(pid=process.pid, start_ticks=start))
 
 
 def wait(predicate, timeout=8):
@@ -83,7 +102,12 @@ def services():
     broker_port = free_port()
     name = 'factory-fault-' + uuid.uuid4().hex
     config = ROOT / 'docker' / 'mosquitto.conf'
-    subprocess.run(['docker', 'run', '--detach', '--name', name,
+    owner = uuid.uuid4().hex
+    # Record before requesting creation: termination during docker run must not
+    # lose a container that the daemon already created. Its label proves owner.
+    record_owned_resource('containers', dict(name=name, owner=owner))
+    labels = ['--label', f'factory-amr.scenario-owner={owner}'] if 'FACTORY_SCENARIO_OUTPUT' in os.environ else []
+    subprocess.run(['docker', 'run', '--detach', '--name', name, *labels,
                     '-p', f'127.0.0.1:{broker_port}:1883',
                     '-v', f'{config}:/mosquitto/config/mosquitto.conf:ro',
                     'eclipse-mosquitto:2.0.22'], check=True, capture_output=True, text=True, timeout=30)
@@ -98,6 +122,8 @@ def services():
         asyncio.run_coroutine_threadsafe(plc.start(), loop).result(timeout=5)
         # The optional listener must be enabled explicitly, even with an ephemeral port.
         asyncio.run_coroutine_threadsafe(plc.start_fault_control(), loop).result(timeout=5)
+        for port in (broker_port, plc.port, plc.fault_control_port):
+            record_owned_resource('ports', port)
         probe.connect_async('127.0.0.1', broker_port)
         probe.loop_start()
         wait(connected.is_set)
@@ -124,7 +150,7 @@ def services():
 def rig():
     with services() as (broker_port, plc):
         context = Context()
-        rclpy.init(context=context, domain_id=89)
+        rclpy.init(context=context, domain_id=int(os.environ.get('FACTORY_SCENARIO_DOMAIN', '89')))
         control = FaultInjectorNode(context=context)
         gateway = MqttGatewayNode(context=context, parameter_overrides=[Parameter('broker_port', value=broker_port)])
         modbus = ModbusGatewayNode(context=context, parameter_overrides=[

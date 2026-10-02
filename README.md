@@ -91,8 +91,37 @@ localization poses, duplicate suppression, and observer artifacts. Domain 80
 is reserved for this test; package tests use 72–79. Services, ports, Gazebo
 master, and output directory are isolated per run.
 
-The successful simulation baseline is implemented. Reliability scenarios, CI,
-and publication remain later work. Vanished or hung transfer gateways can leave
+## Repeatable fault scenarios
+
+Run one scenario or the complete 12-case matrix after setup and a successful
+`colcon build --symlink-install`:
+
+```bash
+DISPLAY=:0 scripts/run_scenario.sh success
+scripts/run_scenario.sh mqtt_disconnect
+scripts/run_scenario.sh modbus_timeout
+DISPLAY=:0 scripts/run_scenario.sh wrong_marker
+DISPLAY=:0 scripts/run_scenario.sh nav_retry
+DISPLAY=:0 scripts/run_all_scenarios.sh
+```
+
+Each case writes actual behavior, correlated trace assertions, and command logs
+under `reports/<run-id>/<scenario>/`. Exit zero means both the expected final
+state and trace assertions match. The default deadline is 300 seconds per case;
+`FACTORY_SCENARIO_TIMEOUT` sets a positive number of seconds. Timeout returns
+124, interruption returns 130 or 143, and a failed scenario command preserves
+its exit code. Cleanup can take up to 65 additional seconds after a deadline.
+`FACTORY_REPORT_ROOT` selects a report root. Matrix runs create `summary.json`
+and `summary.md` and continue after unexpected outcomes.
+
+Success, wrong marker, navigation retry, and navigation failure use real Gazebo.
+Protocol fault cases use actual MQTT/ROS/Modbus peers and a bounded navigation
+action driver. QoS mismatch is a separate DDS experiment. Every case starts
+fresh resources and resets its controls. See [measured fault scenarios](docs/fault-scenarios.md)
+for names, evidence, and transport lessons. Full Gazebo verification requires
+a local rendering display; it is not claimed as CI coverage.
+
+Vanished or hung transfer gateways can leave
 a stopped robot with a pending mission and unknown PLC state. No bound on
 every mission or crash recovery is claimed. Restart the simulation to reset
 the single-part lifecycle. After successful pickup, another valid mission

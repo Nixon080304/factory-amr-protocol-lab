@@ -39,7 +39,7 @@ def test_successful_factory_mission():
     assert (ROOT / "scripts/run_demo.sh").is_file(), "full demo script missing"
     assert (ROOT / "src/factory_bringup/launch/demo.launch.py").is_file(), "full bringup missing"
     # Imports occur after the environment is isolated, before initializing DDS.
-    os.environ["ROS_DOMAIN_ID"] = "80"
+    os.environ["ROS_DOMAIN_ID"] = os.environ.get('FACTORY_SCENARIO_DOMAIN', '80')
     os.environ["ROS_LOCALHOST_ONLY"] = "1"
     from factory_interfaces.msg import ProtocolEvent, StationDetection
     import cv2
@@ -52,16 +52,17 @@ def test_successful_factory_mission():
     from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
     from sensor_msgs.msg import Image
     from std_msgs.msg import String
+    from std_srvs.srv import Trigger
     from visualization_msgs.msg import Marker
 
-    output = ROOT / ".superpowers/sdd/2026-10-02-factory-amr-02-simulation-autonomy/evidence" / (
-        "system-" + uuid.uuid4().hex)
-    output.mkdir(parents=True)
+    output = Path(os.environ['FACTORY_SCENARIO_OUTPUT']) if 'FACTORY_SCENARIO_OUTPUT' in os.environ else (
+        ROOT / ".superpowers/sdd/2026-10-02-factory-amr-02-simulation-autonomy/evidence" / ("system-" + uuid.uuid4().hex))
+    output.mkdir(parents=True, exist_ok=True)
     ports = set()
     while len(ports) < 3:
         ports.add(free_port())
     broker_port, plc_port, gazebo_port = ports
-    environment = {**os.environ, "FACTORY_ROS_DOMAIN_ID": "80", "ROS_LOCALHOST_ONLY": "1",
+    environment = {**os.environ, "FACTORY_ROS_DOMAIN_ID": os.environ['ROS_DOMAIN_ID'], "ROS_LOCALHOST_ONLY": "1",
                    "FACTORY_MQTT_PORT": str(broker_port), "FACTORY_PLC_PORT": str(plc_port),
                    "FACTORY_COMPOSE_PROJECT": "factory-system-" + uuid.uuid4().hex,
                    "GAZEBO_MASTER_URI": f"http://127.0.0.1:{gazebo_port}",
@@ -124,8 +125,18 @@ def test_successful_factory_mission():
         node.create_subscription(Marker, "/factory/station_markers", markers.append, 10),
     ]
     log = (output / "demo.log").open("w")
+    if 'FACTORY_SCENARIO_OUTPUT' in os.environ:
+        from test_protocol_faults import record_owned_resource, record_owned_process
+        existing = subprocess.check_output(['docker', 'ps', '-aq', '--filter',
+            'label=com.docker.compose.project=' + environment['FACTORY_COMPOSE_PROJECT']], text=True)
+        assert not existing.strip(), 'fresh scenario Compose project already exists'
+        record_owned_resource('compose_projects', environment['FACTORY_COMPOSE_PROJECT'])
+        for port in (broker_port, plc_port, gazebo_port):
+            record_owned_resource('ports', port)
     process = subprocess.Popen([str(ROOT / "scripts/run_demo.sh"), "--headless"], cwd=ROOT,
                                env=environment, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    if 'FACTORY_SCENARIO_OUTPUT' in os.environ:
+        record_owned_process(process)
     deadline = time.monotonic() + 270
     previous_termination = signal.getsignal(signal.SIGTERM)
 
@@ -150,6 +161,18 @@ def test_successful_factory_mission():
                 assert not registers.isError() and not coils.isError()
                 values.append((registers.registers, coils.bits[:5]))
             return values
+
+    def reset_scenario_controls():
+        if 'FACTORY_SCENARIO_OUTPUT' not in os.environ:
+            return
+        reset = node.create_client(Trigger, '/factory/faults/reset')
+        try:
+            wait(reset.service_is_ready, 10, 'fault reset service missing')
+            future = reset.call_async(Trigger.Request())
+            wait(future.done, 10, 'fault reset acknowledgement missing')
+            assert future.result().success, future.result().message
+        finally:
+            node.destroy_client(reset)
 
     try:
         # Connect only once Compose exposes the owned broker, without touching
@@ -184,6 +207,7 @@ def test_successful_factory_mission():
                 wait(active, 20, f"{name} inactive")
             finally:
                 node.destroy_client(lifecycle)
+        reset_scenario_controls()
         assert payloads[-1]["state"] == "AT_ASSEMBLY"
         before = plc_snapshot()
         assert [entry[0][2] for entry in before] == [0, 0]
@@ -337,6 +361,7 @@ def test_successful_factory_mission():
                  "trace": str(trace), "report": str(report)}
         (output / "system-proof.json").write_text(json.dumps(proof, indent=2) + "\n")
         print(json.dumps(proof, indent=2))
+        reset_scenario_controls()
     finally:
         # Signal the owned script, allowing its trap to stop its own project and
         # launch children. Escalate only the process group created above.
@@ -368,3 +393,7 @@ def test_successful_factory_mission():
     assert not any(Path(f"/proc/{pid}").exists() for pid in launched_pids), "owned launch child survived cleanup"
     print(f"Owned cleanup verified: {len(launched_pids)} launch children exited; Compose project removed; "
           f"{len(preexisting_containers)} preexisting containers preserved")
+    if 'FACTORY_SCENARIO_OUTPUT' in os.environ:
+        return dict(final_state=terminal[0]['state'], error_code=terminal[0]['error_code'], mission_id='M-001',
+                    action_executions=sum(event.event == 'mission_started' for event in events), events=events,
+                    proof=str(output / 'system-proof.json'))
