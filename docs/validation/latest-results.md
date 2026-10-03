@@ -23,7 +23,7 @@ contracts, mission events, physical assertions and dependency pins are unchanged
 | `colcon build --symlink-install --event-handlers console_direct+` | All ten packages pass in the retained pinned environment; current incremental build: 3.98 wall seconds |
 | Unrestricted `colcon test --return-code-on-test-failure` and `colcon test-result --verbose` | 174 fresh wrapper/Python records, zero errors/failures/skips, including Gazebo camera, payload, topic and navigation coverage |
 | `python3 -m pytest -q tests src/*/test` | 445 passed, two inherited Xacro warnings, 574.36 wall seconds |
-| `scripts/run_ci_checks.sh` | All ten non-Gazebo stages pass; 170 fresh wrapper/Python records with zero errors/failures/skips; separate stages: 165 pure, 36 contract/schema, 94 real protocol/DDS checks |
+| `scripts/run_ci_checks.sh` | All ten non-Gazebo stages pass; 170 fresh wrapper/Python records with zero errors/failures/skips; separate stages: 166 pure, 36 contract/schema, 94 real protocol/DDS checks |
 | `scripts/run_all_scenarios.sh` | 12/12 expected outcomes, 73/73 trace predicates, all owned cleanups verified on 12 distinct leased domains |
 | Supported GUI success case | COMPLETED; 24/24 child exits zero; wrapper exit 130; owned Compose project absent and ports closed |
 | Environment, Compose configuration, shell syntax, public links/assets, whitespace | Pass; ROS 2 Humble, Python 3.10.12, Compose 2.21.0, system OpenCV 4.5.4 |

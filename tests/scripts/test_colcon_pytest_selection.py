@@ -16,6 +16,14 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def rosdep_check_command():
+    command = ["rosdep", "check", "--from-paths", "src", "--ignore-src"]
+    skip_keys = os.environ.get("FACTORY_AMR_ROSDEP_SKIP_KEYS")
+    if skip_keys:
+        command.extend(["--skip-keys", skip_keys])
+    return command
+
+
 @pytest.mark.parametrize(
     "package", ["mqtt_gateway", "modbus_gateway", "protocol_observer"]
 )
@@ -47,10 +55,23 @@ def test_colcon_launcher_uses_the_project_python(tmp_path):
 
 def test_ros_package_dependencies_resolve_on_target():
     result = subprocess.run(
-        ["rosdep", "check", "--from-paths", "src", "--ignore-src"],
+        rosdep_check_command(),
         cwd=ROOT,
         capture_output=True,
         text=True,
         timeout=30,
     )
     assert result.returncode == 0, result.stderr + result.stdout
+
+
+def test_rosdep_check_uses_same_explicit_ci_skip(monkeypatch):
+    monkeypatch.setenv("FACTORY_AMR_ROSDEP_SKIP_KEYS", "nav2_bringup")
+    assert rosdep_check_command() == [
+        "rosdep",
+        "check",
+        "--from-paths",
+        "src",
+        "--ignore-src",
+        "--skip-keys",
+        "nav2_bringup",
+    ]
