@@ -129,6 +129,7 @@ def test_results_distinguish_clocks_revision_sources_and_current_hosted_ci():
         assert term in text
     current = text.split("## Current local verification", 1)[1].split("\n## ", 1)[0]
     assert "6b4f300f64cbd22270f69722278df0d083904340" in current
+    assert "baef48bc9af5e9ce62b54ca3319de7f355f72d75" in current
     assert "445 passed" in current
     assert "174 fresh wrapper/Python records" in current
     assert "12/12 expected outcomes" in current

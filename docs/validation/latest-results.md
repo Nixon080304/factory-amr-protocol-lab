@@ -9,8 +9,9 @@ assertions, and cleanup. Mission duration instead comes from the correlated
 
 The verified development source is revision
 `6b4f300f64cbd22270f69722278df0d083904340`, checked on 3 October 2026 from a
-clean worktree. Public history uses filtered commit identifiers; publication
-records the equivalent public revision separately. Since the earlier recording,
+clean worktree. Its filtered public equivalent is
+`baef48bc9af5e9ce62b54ca3319de7f355f72d75`; identifiers differ because private
+planning paths are absent from every public revision. Since the earlier recording,
 one production shutdown correction lets the visualization callback finish before
 ROS shutdown, disables automatic rclpy signal handling for that process, and
 restores its original handlers. Later changes only strengthen bounded test
