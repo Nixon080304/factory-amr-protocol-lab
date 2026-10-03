@@ -7,7 +7,7 @@ pip>=23,<26
 # setuptools supports PEP 621/660; colcon-core requires setuptools<80.
 setuptools>=64,<80
 # Modern setuptools calls canonicalize_version(strip_trailing_zero=False).
-packaging>=24.2
+packaging>=26.3
 # Shared local/CI quality tools; install only in the project environment.
 ruff==0.15.7
 clang-format==14.0.6
