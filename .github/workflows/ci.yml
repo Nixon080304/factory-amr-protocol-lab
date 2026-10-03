@@ -12,6 +12,8 @@ jobs:
     env:
       ROS_LOCALHOST_ONLY: "1"
       PYTHONNOUSERSITE: "1"
+      # Apply same narrow hosted-runner exception to setup and verification.
+      FACTORY_AMR_ROSDEP_SKIP_KEYS: nav2_bringup
     steps:
       - uses: actions/checkout@v4
       # CI-only provisioning; local users run setup_dev.sh once.
@@ -28,8 +30,6 @@ jobs:
         # Hosted gates exclude Gazebo/Nav2 launch. Individual Nav2 API packages
         # remain installed; skip only the launch meta-package whose runner-side
         # libunwind dependency is currently unsatisfiable.
-        env:
-          FACTORY_AMR_ROSDEP_SKIP_KEYS: nav2_bringup
         run: scripts/setup_dev.sh
       - name: Run matching local gates
         run: scripts/run_ci_checks.sh

@@ -6,6 +6,8 @@ import os
 import shutil
 import subprocess
 
+import yaml
+
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -34,6 +36,7 @@ fi
         path.chmod(0o755)
 
     environment = {**os.environ, "PATH": f"{tools}:{os.environ['PATH']}"}
+    environment.pop("FACTORY_AMR_ROSDEP_SKIP_KEYS", None)
     if skip_keys is not None:
         environment["FACTORY_AMR_ROSDEP_SKIP_KEYS"] = skip_keys
     result = subprocess.run(
@@ -63,5 +66,13 @@ def test_setup_accepts_explicit_ci_rosdep_skip_keys(tmp_path):
 
 
 def test_hosted_ci_declares_only_nav2_bringup_skip():
-    workflow = (ROOT / ".github/workflows/ci.yml").read_text()
-    assert "FACTORY_AMR_ROSDEP_SKIP_KEYS: nav2_bringup" in workflow
+    workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+    quality_job = workflow["jobs"]["quality"]
+    assert quality_job["env"]["FACTORY_AMR_ROSDEP_SKIP_KEYS"] == "nav2_bringup"
+
+    setup_step = next(
+        step
+        for step in quality_job["steps"]
+        if step.get("name") == "Set up project dependencies"
+    )
+    assert "FACTORY_AMR_ROSDEP_SKIP_KEYS" not in setup_step.get("env", {})
