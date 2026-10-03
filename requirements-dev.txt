@@ -3,7 +3,7 @@ pytest>=7,<9
 # A venv-local entry point keeps colcon's Python tests on the pinned interpreter.
 colcon-core==0.20.1
 # Avoid the workspace's legacy pip build-isolation behavior.
-pip>=23,<26
+pip>=26.2.1,<27
 # setuptools supports PEP 621/660; colcon-core requires setuptools<80.
 setuptools>=64,<80
 # Modern setuptools calls canonicalize_version(strip_trailing_zero=False).
