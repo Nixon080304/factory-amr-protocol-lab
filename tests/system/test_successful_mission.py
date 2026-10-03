@@ -721,7 +721,10 @@ def test_successful_factory_mission():
         if process.poll() is None:
             process.send_signal(signal.SIGINT)
             try:
-                process.wait(timeout=15)
+                # Two owned groups can each use 10s INT + 5s TERM, followed
+                # by Compose's 5s stop grace. Allow 5s scheduling/CLI headroom;
+                # this finite wait does not guarantee all host/Docker timing.
+                process.wait(timeout=40)
             except subprocess.TimeoutExpired:
                 os.killpg(process.pid, signal.SIGTERM)
                 try:
