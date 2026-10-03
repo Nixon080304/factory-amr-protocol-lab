@@ -23,7 +23,7 @@ contracts, mission events, physical assertions and dependency pins are unchanged
 | `colcon build --symlink-install --event-handlers console_direct+` | All ten packages pass in the retained pinned environment; current incremental build: 3.98 wall seconds |
 | Unrestricted `colcon test --return-code-on-test-failure` and `colcon test-result --verbose` | 174 fresh wrapper/Python records, zero errors/failures/skips, including Gazebo camera, payload, topic and navigation coverage |
 | `python3 -m pytest -q tests src/*/test` | 445 passed, two inherited Xacro warnings, 574.36 wall seconds |
-| `scripts/run_ci_checks.sh` | All ten non-Gazebo stages pass; 170 fresh wrapper/Python records with zero errors/failures/skips; separate stages: 161 pure, 36 contract/schema, 94 real protocol/DDS checks |
+| `scripts/run_ci_checks.sh` | All ten non-Gazebo stages pass; 170 fresh wrapper/Python records with zero errors/failures/skips; separate stages: 165 pure, 36 contract/schema, 94 real protocol/DDS checks |
 | `scripts/run_all_scenarios.sh` | 12/12 expected outcomes, 73/73 trace predicates, all owned cleanups verified on 12 distinct leased domains |
 | Supported GUI success case | COMPLETED; 24/24 child exits zero; wrapper exit 130; owned Compose project absent and ports closed |
 | Environment, Compose configuration, shell syntax, public links/assets, whitespace | Pass; ROS 2 Humble, Python 3.10.12, Compose 2.21.0, system OpenCV 4.5.4 |
@@ -32,6 +32,10 @@ These categories overlap and must not be summed as distinct tests. The current
 build reused the pinned checkout-local interpreter environment; fresh dependency
 bootstrap is verified separately in the release clone. Local unrestricted
 Gazebo coverage is not replaced with hosted non-Gazebo coverage.
+Hosted setup sets `FACTORY_AMR_ROSDEP_SKIP_KEYS=nav2_bringup` because that
+launch meta-package is outside the hosted non-Gazebo gate and its current runner
+dependency is unsatisfiable. Individual Nav2 API packages remain declared and
+installed. Local setup still installs all declared dependencies by default.
 
 The current matrix's successful mission spans **72.3 simulated seconds**, from
 3.8 s to 76.1 s; its complete case takes 97.367 wall seconds. Those clocks are

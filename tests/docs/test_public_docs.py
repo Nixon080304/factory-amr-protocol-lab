@@ -135,9 +135,11 @@ def test_results_distinguish_clocks_revision_sources_and_current_hosted_ci():
     assert "12/12 expected outcomes" in current
     assert "73/73 trace predicates" in current
     assert "170 fresh wrapper/Python records" in current
-    assert "161 pure" in current
+    assert "165 pure" in current
     assert "36 contract/schema" in current
     assert "94 real protocol/DDS" in current
+    assert "FACTORY_AMR_ROSDEP_SKIP_KEYS=nav2_bringup" in current
+    assert "Local setup still installs all declared dependencies" in current
     assert "## Current hosted CI" in text
     hosted = text.split("## Current hosted CI", 1)[1].split("\n## ", 1)[0]
     statuses = re.findall(r"^Status: (pending|success)\.", hosted, re.MULTILINE)

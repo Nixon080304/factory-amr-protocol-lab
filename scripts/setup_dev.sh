@@ -22,5 +22,10 @@ python3 -m venv --system-site-packages .venv
 set +u
 source /opt/ros/humble/setup.bash
 set -u
-rosdep install --from-paths src --ignore-src -r -y
+rosdep_args=(install --from-paths src --ignore-src -r -y)
+if [[ -n "${FACTORY_AMR_ROSDEP_SKIP_KEYS:-}" ]]; then
+    read -r -a rosdep_skip_keys <<< "$FACTORY_AMR_ROSDEP_SKIP_KEYS"
+    rosdep_args+=(--skip-keys "${rosdep_skip_keys[@]}")
+fi
+rosdep "${rosdep_args[@]}"
 printf 'Setup complete. Source .venv/bin/activate and /opt/ros/humble/setup.bash.\n'

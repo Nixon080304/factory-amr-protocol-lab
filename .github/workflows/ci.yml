@@ -25,6 +25,11 @@ jobs:
           if [ ! -f /etc/ros/rosdep/sources.list.d/20-default.list ]; then sudo rosdep init; fi
           rosdep update --rosdistro humble
       - name: Set up project dependencies
+        # Hosted gates exclude Gazebo/Nav2 launch. Individual Nav2 API packages
+        # remain installed; skip only the launch meta-package whose runner-side
+        # libunwind dependency is currently unsatisfiable.
+        env:
+          FACTORY_AMR_ROSDEP_SKIP_KEYS: nav2_bringup
         run: scripts/setup_dev.sh
       - name: Run matching local gates
         run: scripts/run_ci_checks.sh
