@@ -9,5 +9,5 @@ setuptools>=64,<80
 # Modern setuptools calls canonicalize_version(strip_trailing_zero=False).
 packaging>=24.2
 # Shared local/CI quality tools; install only in the project environment.
-ruff==0.15.7
+ruff==0.16.9
 clang-format==14.0.6
