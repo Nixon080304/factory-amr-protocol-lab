@@ -19,12 +19,19 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def save_json(path, value):
+    temporary = path.with_suffix(path.suffix + ".pending")
+    temporary.write_text(json.dumps(value))
+    temporary.replace(path)
+
+
 def identity(pid):
     fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
     return dict(
         pid=pid,
         parent=int(fields[1]),
         group=int(fields[2]),
+        session=int(fields[3]),
         start_ticks=fields[19],
         state=fields[0],
     )
@@ -143,17 +150,25 @@ wait() {{
     started = stopped = None
     actor_statuses = {}
     owned = {owner["pid"]: owner}
+    cleanup_errors = []
+    startup = True
 
     def emit(kind, **values):
-        parent_events.append(
-            dict(kind=kind, monotonic=time.monotonic(), wall_time=time.time(), **values)
+        row = dict(
+            kind=kind, monotonic=time.monotonic(), wall_time=time.time(), **values
         )
+        parent_events.append(row)
+        with (directory / "parent-events.jsonl").open("a") as handle:
+            handle.write(json.dumps(row) + "\n")
+
+    emit("initial_owner", identity=owner)
 
     def verify(record, expected_parent=None):
         current = identity(record["pid"])
         assert (
             current["start_ticks"] == record["start_ticks"]
             and current["group"] == record["group"]
+            and current["session"] == record["session"]
         )
         assert current["state"] != "Z"
         if expected_parent is not None:
@@ -163,15 +178,36 @@ wait() {{
     def capture_owned():
         # This process is a dedicated subreaper with only this fixture's
         # wrapper/descendants. Capture before readiness and before/after stop.
+        failures = []
         for record in descendants(os.getpid()):
-            previous = owned.get(record["pid"])
-            if previous is not None:
-                assert record["start_ticks"] == previous["start_ticks"]
-                assert record["group"] == previous["group"]
-            else:
+            emit("ownership_observation", identity=record)
+            try:
                 assert record["parent"] == os.getpid() or record["parent"] in owned
+                if record["parent"] != os.getpid():
+                    parent = identity(record["parent"])
+                    assert parent["start_ticks"] == owned[parent["pid"]]["start_ticks"]
                 assert record["group"] != os.getpgrp()
-                owned[record["pid"]] = record
+                previous = owned.get(record["pid"])
+                if previous is not None:
+                    assert record["start_ticks"] == previous["start_ticks"]
+                    if (record["group"], record["session"]) != (
+                        previous["group"],
+                        previous["session"],
+                    ):
+                        assert startup and previous["parent"] == owner["pid"]
+                        assert (
+                            previous["group"] == previous["session"] == owner["group"]
+                        )
+                        assert record["group"] == record["session"] == record["pid"]
+                        assert record["parent"] in (owner["pid"], os.getpid())
+                        emit("verified_startup_setsid", before=previous, after=record)
+                        owned[record["pid"]] = record
+                else:
+                    owned[record["pid"]] = record
+            except (AssertionError, OSError) as failure:
+                failures.append(repr(failure))
+        if failures:
+            raise AssertionError(failures)
 
     saved_send = process.send_signal
     saved_wait = process.wait
@@ -229,6 +265,7 @@ wait() {{
         for actor in actors:
             assert actor["group"] == actor["pid"]
             verify(actor, owner["pid"])
+        startup = False
         emit("verified_ready", wrapper=owner, actors=actors)
         started = time.monotonic()
         if mode in ("caller", "caller-early"):
@@ -248,33 +285,45 @@ wait() {{
     except (AssertionError, OSError, subprocess.TimeoutExpired) as failure:
         guard = repr(failure)
     finally:
-        capture_owned()
+        try:
+            capture_owned()
+        except (AssertionError, OSError) as failure:
+            cleanup_errors.append(repr(failure))
         if process.poll() is None:
-            kill_group(owner["group"], signal.SIGKILL)
-            saved_wait(timeout=5)
+            try:
+                kill_group(owner["group"], signal.SIGKILL)
+                saved_wait(timeout=5)
+            except (AssertionError, OSError, subprocess.TimeoutExpired) as failure:
+                cleanup_errors.append(repr(failure))
         process.send_signal, process.wait = saved_send, saved_wait
-        capture_owned()
-        for actor in owned.values():
+        try:
+            capture_owned()
+        except (AssertionError, OSError) as failure:
+            cleanup_errors.append(repr(failure))
+        for actor in list(owned.values()):
             if actor["pid"] == owner["pid"]:
                 continue
             try:
                 current = identity(actor["pid"])
             except FileNotFoundError:
                 continue
-            assert (
-                current["start_ticks"] == actor["start_ticks"]
-                and current["group"] == actor["group"]
-            )
-            assert current["parent"] == os.getpid() or current["parent"] in owned
-            if current["state"] != "Z":
-                emit(
-                    "owned_actor_reclamation",
-                    signal=int(signal.SIGKILL),
-                    identity=current,
-                )
-                # Kill only this exact captured identity. Wrapper-group kill
-                # above already handles its group; isolated actors are owned.
-                os.kill(current["pid"], signal.SIGKILL)
+            try:
+                assert current["start_ticks"] == actor["start_ticks"]
+                assert current["group"] == actor["group"]
+                assert current["session"] == actor["session"]
+                assert current["parent"] == os.getpid() or current["parent"] in owned
+                if current["parent"] != os.getpid():
+                    parent = identity(current["parent"])
+                    assert parent["start_ticks"] == owned[parent["pid"]]["start_ticks"]
+                if current["state"] != "Z":
+                    emit(
+                        "owned_actor_reclamation",
+                        signal=int(signal.SIGKILL),
+                        identity=current,
+                    )
+                    os.kill(current["pid"], signal.SIGKILL)
+            except (AssertionError, OSError) as failure:
+                cleanup_errors.append(repr(failure))
         # Reap only descendants adopted by this dedicated subreaper. They are
         # created by this one fixture, never unrelated host processes.
         end = time.monotonic() + 5
@@ -283,10 +332,14 @@ wait() {{
                 pid, status = os.waitpid(-1, os.WNOHANG)
             except ChildProcessError:
                 break
+            except OSError as failure:
+                cleanup_errors.append(repr(failure))
+                break
             if not pid:
                 time.sleep(0.01)
             else:
-                assert pid in owned, ("uncaptured adopted descendant", pid)
+                if pid not in owned:
+                    cleanup_errors.append(f"uncaptured adopted descendant {pid}")
                 actor_statuses[str(pid)] = os.waitstatus_to_exitcode(status)
                 emit(
                     "adopted_descendant_reaped",
@@ -296,6 +349,8 @@ wait() {{
         else:
             guard = guard or "owned adopted descendant reclamation bound expired"
         log.close()
+        if cleanup_errors:
+            guard = guard or repr(cleanup_errors)
     wrapper_events = (
         [json.loads(line) for line in events_path.read_text().splitlines()]
         if events_path.exists()
@@ -324,6 +379,7 @@ wait() {{
         wrapper=owner,
         actors=actors,
         owned_descendants=list(owned.values()),
+        cleanup_errors=cleanup_errors,
         wrapper_status=process.returncode,
         parent_events=parent_events,
         wrapper_events=wrapper_events,
@@ -376,89 +432,363 @@ def descendants(pid):
     return records
 
 
-def guard_safety(directory):
-    """Independent outer owner protects the intentionally broken inner guard."""
+def setsid_adapter(directory, arguments):
+    """Pause before the real kernel transition; execute the original argv."""
+    before = identity(os.getpid())
+    save_json(directory / "adapter-before.json", before)
+    deadline = time.monotonic() + 20
+    while not (directory / "release-setsid").exists():
+        assert time.monotonic() < deadline, "setsid release readiness expired"
+        time.sleep(0.01)
+    os.setsid()
+    after = identity(os.getpid())
+    save_json(directory / "adapter-after.json", after)
+    os.execvp(arguments[0], arguments)
+
+
+def controlled_inner(directory, fault):
+    """Observe the actual capture before/after real setsid, without data edits."""
+    os.environ["PATH"] = str(directory / "bin") + os.pathsep + os.environ["PATH"]
+    function = next(
+        node
+        for node in ast.parse(Path(__file__).read_text()).body
+        if isinstance(node, ast.FunctionDef) and node.name == "observe"
+    )
+    outer_try = next(node for node in function.body if isinstance(node, ast.Try))
+    final_capture_line = next(
+        node.lineno
+        for node in ast.walk(outer_try.finalbody[0])
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "capture_owned"
+    )
+    captured = False
+    refreshed = False
+    injected = False
+
+    def observer(frame, event, argument):
+        nonlocal captured, refreshed, injected
+        if (
+            event != "return"
+            or frame.f_code.co_name != "capture_owned"
+            or frame.f_code.co_filename != str(Path(__file__).resolve())
+        ):
+            return observer
+        caller = frame.f_back
+        assert caller.f_code is observe.__code__
+        before_path = directory / "adapter-before.json"
+        if not before_path.exists():
+            return observer
+        before = json.loads(before_path.read_text())
+        record = frame.f_locals["owned"].get(before["pid"])
+        if record is None:
+            return observer
+        if not captured:
+            actual = identity(before["pid"])
+            assert (
+                record["start_ticks"] == actual["start_ticks"] == before["start_ticks"]
+            )
+            assert (
+                record["group"] == record["session"] == caller.f_locals["owner"]["pid"]
+            )
+            assert actual["parent"] == caller.f_locals["owner"]["pid"]
+            save_json(
+                directory / "original-captured.json",
+                dict(captured=record, actual=actual, wrapper=caller.f_locals["owner"]),
+            )
+            captured = True
+            deadline = time.monotonic() + 20
+            while not (directory / "adapter-after.json").exists():
+                assert time.monotonic() < deadline, "actual setsid readiness expired"
+                time.sleep(0.01)
+        elif not refreshed and record["group"] == record["session"] == before["pid"]:
+            save_json(
+                directory / "refresh-observed.json",
+                dict(actual=identity(before["pid"]), captured=record),
+            )
+            refreshed = True
+        if fault and caller.f_lineno == final_capture_line and not injected:
+            injected = True
+            (directory / "named-observation-fault").touch()
+            raise AssertionError("named capture observation fault")
+        return observer
+
+    sys.settrace(observer)
+    try:
+        return observe("guard" if fault else "caller", directory / "inner")
+    finally:
+        sys.settrace(None)
+
+
+def guard_safety(directory, controlled=False, fault=False):
+    """Independent owner persists evidence before checks and always reclaims."""
     assert ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) == 0
     directory.mkdir()
+    progress = directory / "safety-events.jsonl"
+    captured = {}
+    actual_statuses = {}
+    failures = []
+
+    def emit(kind, **values):
+        with progress.open("a") as handle:
+            handle.write(
+                json.dumps(dict(kind=kind, monotonic=time.monotonic(), **values)) + "\n"
+            )
+
+    emit("outer_identity", identity=identity(os.getpid()))
+    if controlled:
+        (directory / "bin").mkdir()
+        shim = directory / "bin/setsid"
+        shim.write_text(
+            "#!"
+            + sys.executable
+            + "\nimport os, sys\nos.execv(sys.executable, [sys.executable, "
+            + repr(str(Path(__file__).resolve()))
+            + ", '--setsid-adapter', "
+            + repr(str(directory))
+            + "] + sys.argv[1:])\n"
+        )
+        shim.chmod(0o700)
     sentinel = subprocess.Popen(["sleep", "300"], start_new_session=True)
     sentinel_owner = identity(sentinel.pid)
+    emit("sentinel_identity", identity=sentinel_owner)
+    arguments = (
+        [
+            sys.executable,
+            __file__,
+            "--controlled-inner",
+            str(directory),
+            str(int(fault)),
+        ]
+        if controlled
+        else [sys.executable, __file__, "--observe", "guard", str(directory / "inner")]
+    )
     inner = subprocess.Popen(
-        [sys.executable, __file__, "--observe", "guard", str(directory / "inner")],
+        arguments,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         start_new_session=True,
     )
     inner_owner = identity(inner.pid)
-    captured = {}
-    actual_statuses = {}
-    guard = None
+    emit("inner_identity", identity=inner_owner)
+    captured[inner.pid] = inner_owner
+    captured[sentinel.pid] = sentinel_owner
+    initial_parents = {inner.pid: os.getpid(), sentinel.pid: os.getpid()}
+    startup = True
     inner_clean = sentinel_untouched = False
-    try:
-        deadline = time.monotonic() + 5
-        while not (directory / "inner/guard-boundary").exists():
-            assert inner.poll() is None, "inner exited before owned safety readiness"
-            for record in descendants(inner.pid):
+
+    def census():
+        for record in descendants(os.getpid()):
+            emit("ownership_observation", identity=record)
+            try:
+                assert record["parent"] == os.getpid() or record["parent"] in captured
+                if record["parent"] != os.getpid():
+                    assert (
+                        identity(record["parent"])["start_ticks"]
+                        == captured[record["parent"]]["start_ticks"]
+                    )
+                previous = captured.get(record["pid"])
+                if previous:
+                    assert previous["start_ticks"] == record["start_ticks"]
+                    if (previous["group"], previous["session"]) != (
+                        record["group"],
+                        record["session"],
+                    ):
+                        assert startup and record["pid"] not in (
+                            inner.pid,
+                            sentinel.pid,
+                        )
+                        wrapper_pid = initial_parents[record["pid"]]
+                        assert wrapper_pid in captured
+                        assert initial_parents[wrapper_pid] == inner.pid
+                        assert previous["group"] == previous["session"] == wrapper_pid
+                        assert record["group"] == record["session"] == record["pid"]
+                        assert record["parent"] in (wrapper_pid, os.getpid())
+                        if controlled:
+                            transition = json.loads(
+                                (directory / "adapter-after.json").read_text()
+                            )
+                            assert all(
+                                transition[key] == record[key]
+                                for key in ("pid", "start_ticks", "group", "session")
+                            )
+                        emit("verified_startup_setsid", before=previous, after=record)
+                assert record["group"] != os.getpgrp()
                 captured[record["pid"]] = record
-            assert time.monotonic() < deadline, "guard safety readiness expired"
+                initial_parents.setdefault(record["pid"], record["parent"])
+            except (AssertionError, OSError) as failure:
+                failures.append(repr(failure))
+
+    def current_owned(record):
+        current = identity(record["pid"])
+        assert all(
+            current[key] == record[key]
+            for key in ("pid", "start_ticks", "group", "session")
+        )
+        assert current["parent"] == os.getpid() or current["parent"] in captured
+        if current["parent"] != os.getpid():
+            assert (
+                identity(current["parent"])["start_ticks"]
+                == captured[current["parent"]]["start_ticks"]
+            )
+        assert current["group"] != os.getpgrp()
+        return current
+
+    try:
+        deadline = time.monotonic() + 20
+        boundary = directory / (
+            "original-captured.json" if controlled else "inner/guard-boundary"
+        )
+        while not boundary.exists():
+            census()
+            assert not failures, failures
+            assert inner.poll() is None, "inner exited before safety readiness"
+            assert time.monotonic() < deadline, "safety readiness expired"
             time.sleep(0.01)
-        for record in descendants(inner.pid):
-            captured[record["pid"]] = record
-        actors = [
+        census()
+        if controlled:
+            before = json.loads((directory / "adapter-before.json").read_text())
+            assert before["group"] == before["session"] == before["parent"]
+            (directory / "release-setsid").touch()
+            deadline = time.monotonic() + 20
+            while not (directory / "adapter-after.json").exists():
+                assert time.monotonic() < deadline, (
+                    "kernel transition readiness expired"
+                )
+                time.sleep(0.01)
+            after = json.loads((directory / "adapter-after.json").read_text())
+            assert (
+                after["pid"] == before["pid"]
+                and after["start_ticks"] == before["start_ticks"]
+            )
+            assert after["group"] == after["session"] == after["pid"]
+            census()
+        startup = False
+        if not controlled or fault:
+            (directory / "inner/guard-release").touch()
+        stdout, stderr = inner.communicate(
+            timeout=45 if controlled and not fault else 10
+        )
+        emit("inner_wait", actual_status=inner.returncode, stdout=stdout, stderr=stderr)
+        receipt = json.loads((directory / "inner/receipt.json").read_text())
+        assert inner.returncode == (1 if not controlled or fault else 0), receipt
+        if not controlled or fault:
+            assert (
+                receipt["guard"]
+                == "AssertionError('named pre-aggregate readiness fault')"
+            ), receipt
+        if fault:
+            assert receipt["cleanup_errors"] == [
+                "AssertionError('named capture observation fault')"
+            ], receipt
+        else:
+            assert not receipt["cleanup_errors"], receipt
+        if controlled:
+            assert (directory / "refresh-observed.json").exists()
+            assert any(
+                row["kind"] == "verified_startup_setsid"
+                for row in receipt["parent_events"]
+            ), receipt
+        inner_clean = receipt["cleanup_verified"] and all(
+            not Path(f"/proc/{row['pid']}").exists()
+            for row in captured.values()
+            if row["pid"] != sentinel.pid
+        )
+        current = current_owned(sentinel_owner)
+        sentinel_untouched = sentinel.poll() is None and current["state"] != "Z"
+        emit("sentinel_before_safety", identity=current, untouched=sentinel_untouched)
+    except (AssertionError, OSError, subprocess.TimeoutExpired) as failure:
+        failures.append(repr(failure))
+    finally:
+        # No capture/validation/reap assertion may skip another valid target.
+        deadline = time.monotonic() + 5
+        try:
+            census()
+        except (AssertionError, OSError) as failure:
+            failures.append(repr(failure))
+        # Stop established spawning parents first. A child created concurrently
+        # with the stop is captured/reclaimed in the post-stop bounded loop.
+        producers = [
             record
             for record in captured.values()
-            if record["group"] == record["pid"] and record["parent"] != inner.pid
+            if record["pid"] == inner.pid or initial_parents[record["pid"]] == inner.pid
         ]
-        assert len(actors) == 1, ("owned setsid actor missing or ambiguous", captured)
-        (directory / "inner/guard-release").touch()
-        stdout, stderr = inner.communicate(timeout=15)
-        assert inner.returncode == 1, (inner.returncode, stdout, stderr)
-        receipt = json.loads((directory / "inner/receipt.json").read_text())
-        assert (
-            receipt["guard"] == "AssertionError('named pre-aggregate readiness fault')"
-        ), receipt
-        inner_clean = all(not Path(f"/proc/{row['pid']}").exists() for row in actors)
-        current = identity(sentinel.pid)
-        assert all(
-            current[key] == sentinel_owner[key]
-            for key in ("pid", "start_ticks", "group", "parent")
-        )
-        sentinel_untouched = sentinel.poll() is None
-    except (AssertionError, OSError, subprocess.TimeoutExpired) as failure:
-        guard = repr(failure)
-    finally:
-        # Capture again before reclaim: only descendants of this inner owner,
-        # plus already captured actors adopted by this dedicated outer owner.
-        for record in descendants(inner.pid):
-            captured[record["pid"]] = record
-        for record in (inner_owner, *captured.values(), sentinel_owner):
+        for record in producers:
             try:
-                current = identity(record["pid"])
+                current = current_owned(record)
+                if current["state"] != "Z":
+                    emit(
+                        "owned_producer_stop",
+                        identity=current,
+                        signal=int(signal.SIGKILL),
+                    )
+                    os.kill(current["pid"], signal.SIGKILL)
             except FileNotFoundError:
                 continue
-            assert current["start_ticks"] == record["start_ticks"]
-            assert current["group"] == record["group"]
-            assert current["parent"] in (record["parent"], os.getpid())
-            assert current["group"] != os.getpgrp()
-            if current["state"] != "Z":
-                os.kill(current["pid"], signal.SIGKILL)
-        if inner.poll() is None:
-            inner.wait(timeout=5)
-        sentinel.wait(timeout=5)
-        deadline = time.monotonic() + 5
+            except (AssertionError, OSError) as failure:
+                failures.append(repr(failure))
+        # Persist the sentinel snapshot even if acceptance failed. That does
+        # not turn an unreached sentinel assertion into a passing predicate.
+        try:
+            emit(
+                "sentinel_cleanup_snapshot",
+                identity=current_owned(sentinel_owner),
+                acceptance_reached=sentinel_untouched,
+            )
+        except (AssertionError, OSError) as failure:
+            failures.append(repr(failure))
         while time.monotonic() < deadline:
             try:
-                pid, status = os.waitpid(-1, os.WNOHANG)
-            except ChildProcessError:
-                break
-            if pid:
+                census()
+            except (AssertionError, OSError) as failure:
+                failures.append(repr(failure))
+            for record in list(captured.values()):
+                try:
+                    current = current_owned(record)
+                    if current["state"] != "Z":
+                        emit(
+                            "owned_safety_signal",
+                            identity=current,
+                            signal=int(signal.SIGKILL),
+                        )
+                        os.kill(current["pid"], signal.SIGKILL)
+                except FileNotFoundError:
+                    continue
+                except (AssertionError, OSError) as failure:
+                    failures.append(repr(failure))
+            while True:
+                try:
+                    pid, status = os.waitpid(-1, os.WNOHANG)
+                except ChildProcessError:
+                    break
+                except OSError as failure:
+                    failures.append(repr(failure))
+                    break
+                if not pid:
+                    break
                 actual_statuses[str(pid)] = os.waitstatus_to_exitcode(status)
-            else:
-                time.sleep(0.01)
+                emit(
+                    "adopted_wait",
+                    pid=pid,
+                    actual_status=actual_statuses[str(pid)],
+                    identity_known=pid in captured,
+                )
+                for process in (inner, sentinel):
+                    if process.pid == pid:
+                        process.returncode = actual_statuses[str(pid)]
+                if pid not in captured:
+                    failures.append(f"unproven adopted identity {pid}")
+            if all(
+                not Path(f"/proc/{record['pid']}").exists()
+                for record in captured.values()
+            ):
+                break
+            time.sleep(0.01)
         else:
-            guard = guard or "outer owned reclamation bound expired"
+            failures.append("outer owned reclamation bound expired")
     result = dict(
-        guard=guard,
+        guard=repr(failures) if failures else None,
         captured=list(captured.values()),
         inner_status=inner.returncode,
         inner_clean=inner_clean,
@@ -467,13 +797,12 @@ def guard_safety(directory):
         sentinel_cleanup_status=sentinel.returncode,
         adopted_statuses=actual_statuses,
         safety_cleanup=all(
-            not Path(f"/proc/{row['pid']}").exists()
-            for row in (inner_owner, *captured.values(), sentinel_owner)
+            not Path(f"/proc/{row['pid']}").exists() for row in captured.values()
         ),
     )
     (directory / "guard-safety.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result), flush=True)
-    return 1 if guard or not result["safety_cleanup"] else 0
+    return 1 if failures or not result["safety_cleanup"] else 0
 
 
 def observation(tmp_path, mode):
@@ -513,6 +842,40 @@ def test_pre_readiness_guard_reclaims_only_owned_descendants(tmp_path):
     assert receipt["inner_clean"], receipt
 
 
+@pytest.mark.parametrize("fault", [False, True], ids=["actual-setsid", "capture-error"])
+def test_actual_setsid_cleanup_retains_capture_errors(tmp_path, fault):
+    output = tmp_path / "transition-safety"
+    result = subprocess.run(
+        [sys.executable, __file__, "--transition-safety", str(output), str(int(fault))],
+        capture_output=True,
+        text=True,
+        timeout=70,
+    )
+    assert (output / "guard-safety.json").exists(), result.stdout + result.stderr
+    receipt = json.loads((output / "guard-safety.json").read_text())
+    assert result.returncode == 0 and receipt["guard"] is None, receipt
+    assert receipt["inner_clean"] and receipt["safety_cleanup"], receipt
+    assert receipt["sentinel_untouched"], receipt
+    assert receipt["inner_status"] == (1 if fault else 0), receipt
+    before = json.loads((output / "adapter-before.json").read_text())
+    after = json.loads((output / "adapter-after.json").read_text())
+    captured = json.loads((output / "original-captured.json").read_text())
+    refreshed = json.loads((output / "refresh-observed.json").read_text())
+    assert captured["captured"]["group"] == captured["wrapper"]["pid"]
+    assert captured["captured"]["session"] == captured["wrapper"]["pid"]
+    assert (
+        before["pid"] == after["pid"] and before["start_ticks"] == after["start_ticks"]
+    )
+    assert after["group"] == after["session"] == after["pid"]
+    assert (
+        refreshed["captured"]["group"]
+        == refreshed["captured"]["session"]
+        == after["pid"]
+    )
+    assert refreshed["captured"]["start_ticks"] == before["start_ticks"]
+    assert (output / "named-observation-fault").exists() == fault
+
+
 @pytest.mark.parametrize("mode", ["success", "early"])
 def test_uninterrupted_source_cleanup_budget(tmp_path, mode):
     receipt = observation(tmp_path, mode)
@@ -533,6 +896,16 @@ def test_uninterrupted_source_cleanup_budget(tmp_path, mode):
 
 
 if __name__ == "__main__":
+    if sys.argv[1] == "--setsid-adapter":
+        setsid_adapter(Path(sys.argv[2]), sys.argv[3:])
+    if sys.argv[1] == "--controlled-inner":
+        raise SystemExit(controlled_inner(Path(sys.argv[2]), bool(int(sys.argv[3]))))
+    if sys.argv[1] == "--transition-safety":
+        raise SystemExit(
+            guard_safety(
+                Path(sys.argv[2]), controlled=True, fault=bool(int(sys.argv[3]))
+            )
+        )
     if sys.argv[1] == "--guard-safety":
         raise SystemExit(guard_safety(Path(sys.argv[2])))
     assert sys.argv[1] == "--observe"
