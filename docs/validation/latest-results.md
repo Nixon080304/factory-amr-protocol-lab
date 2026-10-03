@@ -91,8 +91,8 @@ warning or a shutdown failure and was not suppressed. The ignored observer only
 selects GUI mode and records provenance; all physical and child-exit assertions
 remain those of the product test.
 
-An earlier public GUI attempt on an earlier development revision completed its
-mission but reported 23 zero
+An earlier public GUI attempt at development revision
+`f47a4b779c90c17ae3fdf53416e98d8361726433` completed its mission but reported 23 zero
 child exits and a **null** visualization status. Its wrapper was terminated with
 **-15**, and owned Compose still existed at the public test's cleanup assertion;
 the outer supervisor reclaimed the resources afterward. Separately, a bounded

@@ -212,12 +212,17 @@ share packages to the model browser. A retained GUI receipt contains 407
 missing-`model.config` diagnostics. This known browser noise is separate from
 actual mesh-resolution failures and is not a diagnosed Gazebo crash cause.
 
-The current public GUI receipt records 24/24 zero child exits, but it is not a
-lifecycle fix. An earlier same-source attempt left a missing visualization exit
-status and failed public cleanup; a separate reader diagnostic raised a shutdown
-`RuntimeError`. Both causes remain unknown and require release-risk review.
+The current supported GUI receipt at development revision
+`6b4f300f64cbd22270f69722278df0d083904340` records 24/24 zero child exits. It
+includes a production shutdown correction covered by focused lifecycle tests.
+An earlier attempt at revision `f47a4b779c90c17ae3fdf53416e98d8361726433`
+left a missing visualization exit status and failed public cleanup; a separate
+reader diagnostic raised a shutdown `RuntimeError`. Two standalone close-up
+receipts also record Gazebo-client `SIGSEGV` during diagnostic teardown. Those
+historical causes remain unknown. A supported-path client SIGSEGV blocks release;
+the current pass does not prove lifecycle reliability on every graphics stack.
 See [source-bound validation](docs/validation/latest-results.md) for retained
-failures, exact clocks, and the passing receipt.
+failures, exact clocks, correction scope, and the passing receipt.
 
 Licensed under Apache-2.0. See [LICENSE](LICENSE).
 

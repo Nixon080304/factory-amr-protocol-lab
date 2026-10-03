@@ -173,6 +173,22 @@ def test_current_gui_receipt_retains_unresolved_shutdown_risks():
     assert "pending current-candidate GUI receipt" not in text
 
 
+def test_readme_matches_source_bound_gui_lifecycle_evidence():
+    readme = (ROOT / "README.md").read_text()
+    results = (ROOT / "docs/validation/latest-results.md").read_text()
+    for term in (
+        "6b4f300f64cbd22270f69722278df0d083904340",
+        "f47a4b779c90c17ae3fdf53416e98d8361726433",
+        "production shutdown correction",
+        "standalone close-up",
+        "SIGSEGV",
+        "supported-path client SIGSEGV blocks release",
+    ):
+        assert term in readme
+        assert term in results
+    assert "earlier same-source attempt" not in readme
+
+
 def test_architecture_connectors_assign_gateway_events_and_navigation_goals():
     root = ET.parse(ROOT / "docs/assets/architecture.svg").getroot()
     ns = {"svg": "http://www.w3.org/2000/svg"}
