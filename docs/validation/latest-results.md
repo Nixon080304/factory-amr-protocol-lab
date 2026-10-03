@@ -210,8 +210,10 @@ revision, no hosted workflow run had been observed.
 
 ## Current hosted CI
 
-Status: pending. Hosted success is unobserved before publication and an actual
-workflow run. Local checks do not establish a hosted result.
+Status: success. The non-Gazebo workflow passed at public commit
+`2290822c0f0da742627933b6b4b3dec42a7c3e2d` in
+[GitHub Actions run 37126082544](https://github.com/Nixon080304/factory-amr-protocol-lab/actions/runs/37126082544).
+This hosted gate does not replace the local Gazebo evidence above.
 
 ## Limits and diagnostics
 
