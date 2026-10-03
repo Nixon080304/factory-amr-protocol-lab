@@ -7,60 +7,63 @@ assertions, and cleanup. Mission duration instead comes from the correlated
 
 ## Current local verification
 
-The verified product source is revision
-`f47a4b779c90c17ae3fdf53416e98d8361726433`, checked on 3 October 2026 from a
-clean checkout. Its two bounded corrections are test-only: restore the Modbus
-tests' prior asyncio loop ownership, and validate strict publisher-owned phase
-causality rather than aggregate arrival order across separate DDS writers.
-Runtime protocols, source events, physical assertions and dependency pins are
-unchanged. No production shutdown correction was made during this verification.
+The verified development source is revision
+`6b4f300f64cbd22270f69722278df0d083904340`, checked on 3 October 2026 from a
+clean worktree. Public history uses filtered commit identifiers; publication
+records the equivalent public revision separately. Since the earlier recording,
+one production shutdown correction lets the visualization callback finish before
+ROS shutdown, disables automatic rclpy signal handling for that process, and
+restores its original handlers. Later changes only strengthen bounded test
+cleanup across direct callbacks and real `setsid` transitions. Runtime protocol
+contracts, mission events, physical assertions and dependency pins are unchanged.
 
 | Command or gate | Observed result |
 | --- | --- |
-| `colcon build --symlink-install --event-handlers console_direct+` | Initial clean all-ten-package build: 44.6 wall seconds at revision `94908fe79e36deafe88eae74decd9c4fcd66877b`; subsequent builds incremental |
-| Unrestricted `colcon test --return-code-on-test-failure` and `colcon test-result --verbose` | At revision `6959a96e40004e977fd5ee6a74540cc2c5c21448`: 174 fresh wrapper/Python records, zero errors/failures/skips, including Gazebo camera, payload, topic and navigation coverage; package sources unchanged at the current revision |
-| `python3 -m pytest -q tests src/*/test` | 426 passed, two inherited Xacro warnings, 426.46 wall seconds |
-| `scripts/run_all_scenarios.sh` | 12/12 expected outcomes, 73/73 trace predicates, all owned cleanups verified on distinct leased domains |
-| `scripts/run_ci_checks.sh` | All ten non-Gazebo stages pass; 170 fresh wrapper/Python records with zero errors/failures/skips; separate stages: 151 pure, 36 contract/schema, 85 real protocol/DDS checks |
+| `colcon build --symlink-install --event-handlers console_direct+` | All ten packages pass in the retained pinned environment; current incremental build: 3.98 wall seconds |
+| Unrestricted `colcon test --return-code-on-test-failure` and `colcon test-result --verbose` | 174 fresh wrapper/Python records, zero errors/failures/skips, including Gazebo camera, payload, topic and navigation coverage |
+| `python3 -m pytest -q tests src/*/test` | 445 passed, two inherited Xacro warnings, 574.36 wall seconds |
+| `scripts/run_ci_checks.sh` | All ten non-Gazebo stages pass; 170 fresh wrapper/Python records with zero errors/failures/skips; separate stages: 161 pure, 36 contract/schema, 94 real protocol/DDS checks |
+| `scripts/run_all_scenarios.sh` | 12/12 expected outcomes, 73/73 trace predicates, all owned cleanups verified on 12 distinct leased domains |
+| Supported GUI success case | COMPLETED; 24/24 child exits zero; wrapper exit 130; owned Compose project absent and ports closed |
 | Environment, Compose configuration, shell syntax, public links/assets, whitespace | Pass; ROS 2 Humble, Python 3.10.12, Compose 2.21.0, system OpenCV 4.5.4 |
 
-These categories overlap and must not be summed as distinct tests. The initial
-build reused the pinned interpreter environment; the shared runner subsequently
-used a separately bootstrapped checkout-local environment. Local unrestricted
+These categories overlap and must not be summed as distinct tests. The current
+build reused the pinned checkout-local interpreter environment; fresh dependency
+bootstrap is verified separately in the release clone. Local unrestricted
 Gazebo coverage is not replaced with hosted non-Gazebo coverage.
 
-The current matrix's successful mission spans **72.6 simulated seconds**, from
-4.1 s to 76.7 s; its complete case takes 101.314 wall seconds. Those clocks are
+The current matrix's successful mission spans **72.3 simulated seconds**, from
+3.8 s to 76.1 s; its complete case takes 97.367 wall seconds. Those clocks are
 distinct from both the current GUI receipt below and the earlier recording.
 Four matrix cases use physical Gazebo/Nav2, seven real protocol cases use a
 bounded navigation driver, and one is an isolated real DDS experiment.
 
 | Current matrix case | Expected/observed result | Case wall seconds |
 | --- | --- | --- |
-| `success` | COMPLETED | 101.314 |
-| `mqtt_duplicate` | COMPLETED, one action | 2.759 |
-| `mqtt_conflict` | COMPLETED, changed request rejected | 2.194 |
-| `mqtt_disconnect` | COMPLETED after connection recovery | 2.673 |
-| `modbus_delay` | COMPLETED | 2.847 |
-| `modbus_timeout` | FAILED / PLC_TIMEOUT | 2.102 |
-| `modbus_stale_completion` | FAILED / STALE_PLC_STATE | 2.186 |
-| `plc_fault` | FAILED / PLC_FAULT | 1.759 |
-| `wrong_marker` | FAILED / STATION_NOT_CONFIRMED; zero PLC contact | 48.795 |
-| `nav_retry` | COMPLETED after real costmap clear and same-leg retry | 86.361 |
-| `nav_failure` | FAILED / NAVIGATION_FAILED | 10.307 |
-| `qos_mismatch` | RECOVERED after incompatible then compatible DDS readers | 3.050 |
+| `success` | COMPLETED | 97.367 |
+| `mqtt_duplicate` | COMPLETED, one action | 2.670 |
+| `mqtt_conflict` | COMPLETED, changed request rejected | 2.160 |
+| `mqtt_disconnect` | COMPLETED after connection recovery | 2.670 |
+| `modbus_delay` | COMPLETED | 2.830 |
+| `modbus_timeout` | FAILED / PLC_TIMEOUT | 2.140 |
+| `modbus_stale_completion` | FAILED / STALE_PLC_STATE | 2.080 |
+| `plc_fault` | FAILED / PLC_FAULT | 1.750 |
+| `wrong_marker` | FAILED / STATION_NOT_CONFIRMED; zero PLC contact | 48.530 |
+| `nav_retry` | COMPLETED after real costmap clear and same-leg retry | 81.170 |
+| `nav_failure` | FAILED / NAVIGATION_FAILED | 8.840 |
+| `qos_mismatch` | RECOVERED after incompatible then compatible DDS readers | 3.000 |
 
-The first combined run at revision `94908fe79e36deafe88eae74decd9c4fcd66877b`
-had 383 passes and two launch failures because a direct Modbus test cleared the
-caller's asyncio loop. After the scoped fixture correction, revision
-`6959a96e40004e977fd5ee6a74540cc2c5c21448` had 384 passes and one false
-cross-writer arrival-order failure. Focused RED/GREEN and strict causal replay
-tests preceded the final 426-pass run. The physical camera freshness, rendered
-overlap, wrong-marker zero-PLC and coordinator admission checks remain intact.
+Earlier combined runs exposed a direct Modbus test clearing its caller's asyncio
+loop and a false aggregate arrival-order assertion across independent DDS
+writers. Focused RED/GREEN tests preceded their corrections. A later current-
+candidate command recorded 444 passes and one prelaunch Docker registry failure;
+a separately focused retry passed after the required base image became available.
+The fresh complete command above now establishes all 445 passes in one run. The
+failed infrastructure receipts remain preserved rather than being relabeled.
 
 ## Current public GUI receipt
 
-Status: observed. Source revision: `f47a4b779c90c17ae3fdf53416e98d8361726433`.
+Status: observed. Source revision: `6b4f300f64cbd22270f69722278df0d083904340`.
 The supported `scripts/run_demo.sh` GUI path runs through the production scenario
 supervisor with the unchanged successful-mission assertions and bounded command
 `timeout 300s python3 -m pytest -q tests/system/test_successful_mission.py -s`.
@@ -70,15 +73,16 @@ capture asset or injected traffic is used.
 
 | Measurement | Observed result |
 | --- | --- |
-| Correlated mission source stamps | 72.4 simulated seconds, from 4.5 s to 76.9 s |
-| Inner pytest | 1 passed, 1 warning, 108.45 wall seconds |
-| Complete supervised case | 110.117 wall seconds; COMPLETED; 4/4 trace predicates |
-| Assembly camera gate | 5 distinct fresh stamps over 0.5 simulated seconds; 5 exact rendered source overlaps |
-| Inspection camera gate | 6 fresh stamps; 4 exact rendered source overlaps; required five-stamp window satisfied |
+| Correlated mission source stamps | 71.9 simulated seconds, from 3.9 s to 75.8 s |
+| Inner pytest | 1 passed, 1 warning, 96.03 wall seconds |
+| Complete supervised case | 97.139 wall seconds; COMPLETED; 4/4 trace predicates |
+| Assembly camera gate | Fresh rendered-marker window passed for marker 10 |
+| Inspection camera gate | Fresh rendered-marker window passed for marker 20 |
 | PLC counters | `[0, 0]` before; `[1, 1]` after; robot request/presence coils clear |
 | Child lifecycle | 24/24 exit zero, including Gazebo server/client, RViz and visualization; wrapper exit 130 |
-| Public SIGINT-to-wrapper-exit wall time | 2.436 seconds; no TERM/KILL escalation |
 | Owned cleanup | All launch children and group gone, Compose removed, ports closed, preexisting containers preserved |
+| Final Gazebo position / yaw error | 0.0812 m / 0.1678 rad |
+| Final AMCL position / yaw error | 0.1265 m / 0.1919 rad |
 
 The warning is pytest's existing `PytestReturnNotNoneWarning`: under a scenario
 the product system test returns its evidence dictionary. It is not an Xacro
@@ -86,20 +90,20 @@ warning or a shutdown failure and was not suppressed. The ignored observer only
 selects GUI mode and records provenance; all physical and child-exit assertions
 remain those of the product test.
 
-This passing receipt is **not a lifecycle fix or a diagnosis**. An earlier public
-GUI attempt at this same revision completed its mission but reported 23 zero
+An earlier public GUI attempt on an earlier development revision completed its
+mission but reported 23 zero
 child exits and a **null** visualization status. Its wrapper was terminated with
 **-15**, and owned Compose still existed at the public test's cleanup assertion;
 the outer supervisor reclaimed the resources afterward. Separately, a bounded
 matched-reader visualization diagnostic exited with a post-SIGINT **RuntimeError**
-(`Unable to convert call argument to Python object`). Each cause remains unknown;
-there is **no product fix** for either retained risk. The later passing mission
-does not erase either failed receipt or prove universal lifecycle reliability.
-Both require independent release review and root adjudication before publication.
+(`Unable to convert call argument to Python object`). Their historical cause remains unknown.
+The production shutdown correction is covered by focused real-DDS lifecycle
+tests and the current supported GUI pass, but it does not rewrite or diagnose
+either historical receipt and does not prove reliability on every graphics stack.
 
-An intervening GUI attempt failed before launch because the Docker registry's
+An earlier verification attempt failed before launch because the Docker registry's
 anonymous-token hostname timed out in DNS. Normal DNS/TLS connectivity recovered
-without host repair; one authorized retry produced the receipt above. This
+without host repair; later complete verification produced the receipt above. This
 infrastructure failure is separate from the retained shutdown risks.
 
 ## Earlier recorded successful mission

@@ -127,6 +127,16 @@ def test_results_distinguish_clocks_revision_sources_and_current_hosted_ci():
         "RViz",
     ):
         assert term in text
+    current = text.split("## Current local verification", 1)[1].split("\n## ", 1)[0]
+    assert "6b4f300f64cbd22270f69722278df0d083904340" in current
+    assert "445 passed" in current
+    assert "174 fresh wrapper/Python records" in current
+    assert "12/12 expected outcomes" in current
+    assert "73/73 trace predicates" in current
+    assert "170 fresh wrapper/Python records" in current
+    assert "161 pure" in current
+    assert "36 contract/schema" in current
+    assert "94 real protocol/DDS" in current
     assert "## Current hosted CI" in text
     hosted = text.split("## Current hosted CI", 1)[1].split("\n## ", 1)[0]
     statuses = re.findall(r"^Status: (pending|success)\.", hosted, re.MULTILINE)
@@ -148,15 +158,15 @@ def test_current_gui_receipt_retains_unresolved_shutdown_risks():
     assert "Status: observed." in current
     assert re.search(r"Source revision: `[0-9a-f]{40}`", current)
     assert "24/24" in current and "wrapper exit 130" in current
-    assert "72.4 simulated seconds" in current
-    assert "4.5 s to 76.9 s" in current
-    assert "110.117" in current and "wall" in current
+    assert "71.9 simulated seconds" in current
+    assert "3.9 s to 75.8 s" in current
+    assert "97.139" in current and "wall" in current
     for risk in (
         "null",
         "-15",
         "RuntimeError",
-        "cause remains unknown",
-        "no product fix",
+        "historical cause remains unknown",
+        "production shutdown correction",
     ):
         assert risk in current
     assert "pending current-candidate GUI receipt" not in text
