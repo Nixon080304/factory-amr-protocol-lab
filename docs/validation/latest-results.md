@@ -5,7 +5,104 @@ deterministic Modbus TCP PLC simulator. A test's total wall time includes setup,
 assertions, and cleanup. Mission duration instead comes from the correlated
 `mission_started` and `mission_finished` source timestamps in simulation time.
 
-## Fresh successful mission
+## Current local verification
+
+The verified product source is revision
+`f47a4b779c90c17ae3fdf53416e98d8361726433`, checked on 3 October 2026 from a
+clean checkout. Its two bounded corrections are test-only: restore the Modbus
+tests' prior asyncio loop ownership, and validate strict publisher-owned phase
+causality rather than aggregate arrival order across separate DDS writers.
+Runtime protocols, source events, physical assertions and dependency pins are
+unchanged. No production shutdown correction was made during this verification.
+
+| Command or gate | Observed result |
+| --- | --- |
+| `colcon build --symlink-install --event-handlers console_direct+` | Initial clean all-ten-package build: 44.6 wall seconds at revision `94908fe79e36deafe88eae74decd9c4fcd66877b`; subsequent builds incremental |
+| Unrestricted `colcon test --return-code-on-test-failure` and `colcon test-result --verbose` | At revision `6959a96e40004e977fd5ee6a74540cc2c5c21448`: 174 fresh wrapper/Python records, zero errors/failures/skips, including Gazebo camera, payload, topic and navigation coverage; package sources unchanged at the current revision |
+| `python3 -m pytest -q tests src/*/test` | 426 passed, two inherited Xacro warnings, 426.46 wall seconds |
+| `scripts/run_all_scenarios.sh` | 12/12 expected outcomes, 73/73 trace predicates, all owned cleanups verified on distinct leased domains |
+| `scripts/run_ci_checks.sh` | All ten non-Gazebo stages pass; 170 fresh wrapper/Python records with zero errors/failures/skips; separate stages: 151 pure, 36 contract/schema, 85 real protocol/DDS checks |
+| Environment, Compose configuration, shell syntax, public links/assets, whitespace | Pass; ROS 2 Humble, Python 3.10.12, Compose 2.21.0, system OpenCV 4.5.4 |
+
+These categories overlap and must not be summed as distinct tests. The initial
+build reused the pinned interpreter environment; the shared runner subsequently
+used a separately bootstrapped checkout-local environment. Local unrestricted
+Gazebo coverage is not replaced with hosted non-Gazebo coverage.
+
+The current matrix's successful mission spans **72.6 simulated seconds**, from
+4.1 s to 76.7 s; its complete case takes 101.314 wall seconds. Those clocks are
+distinct from both the current GUI receipt below and the earlier recording.
+Four matrix cases use physical Gazebo/Nav2, seven real protocol cases use a
+bounded navigation driver, and one is an isolated real DDS experiment.
+
+| Current matrix case | Expected/observed result | Case wall seconds |
+| --- | --- | --- |
+| `success` | COMPLETED | 101.314 |
+| `mqtt_duplicate` | COMPLETED, one action | 2.759 |
+| `mqtt_conflict` | COMPLETED, changed request rejected | 2.194 |
+| `mqtt_disconnect` | COMPLETED after connection recovery | 2.673 |
+| `modbus_delay` | COMPLETED | 2.847 |
+| `modbus_timeout` | FAILED / PLC_TIMEOUT | 2.102 |
+| `modbus_stale_completion` | FAILED / STALE_PLC_STATE | 2.186 |
+| `plc_fault` | FAILED / PLC_FAULT | 1.759 |
+| `wrong_marker` | FAILED / STATION_NOT_CONFIRMED; zero PLC contact | 48.795 |
+| `nav_retry` | COMPLETED after real costmap clear and same-leg retry | 86.361 |
+| `nav_failure` | FAILED / NAVIGATION_FAILED | 10.307 |
+| `qos_mismatch` | RECOVERED after incompatible then compatible DDS readers | 3.050 |
+
+The first combined run at revision `94908fe79e36deafe88eae74decd9c4fcd66877b`
+had 383 passes and two launch failures because a direct Modbus test cleared the
+caller's asyncio loop. After the scoped fixture correction, revision
+`6959a96e40004e977fd5ee6a74540cc2c5c21448` had 384 passes and one false
+cross-writer arrival-order failure. Focused RED/GREEN and strict causal replay
+tests preceded the final 426-pass run. The physical camera freshness, rendered
+overlap, wrong-marker zero-PLC and coordinator admission checks remain intact.
+
+## Current public GUI receipt
+
+Status: observed. Source revision: `f47a4b779c90c17ae3fdf53416e98d8361726433`.
+The supported `scripts/run_demo.sh` GUI path runs through the production scenario
+supervisor with the unchanged successful-mission assertions and bounded command
+`timeout 300s python3 -m pytest -q tests/system/test_successful_mission.py -s`.
+An ignored task-local observer records owned identities and shutdown stacks;
+it does not change production calls, exception behavior or deadlines. No new
+capture asset or injected traffic is used.
+
+| Measurement | Observed result |
+| --- | --- |
+| Correlated mission source stamps | 72.4 simulated seconds, from 4.5 s to 76.9 s |
+| Inner pytest | 1 passed, 1 warning, 108.45 wall seconds |
+| Complete supervised case | 110.117 wall seconds; COMPLETED; 4/4 trace predicates |
+| Assembly camera gate | 5 distinct fresh stamps over 0.5 simulated seconds; 5 exact rendered source overlaps |
+| Inspection camera gate | 6 fresh stamps; 4 exact rendered source overlaps; required five-stamp window satisfied |
+| PLC counters | `[0, 0]` before; `[1, 1]` after; robot request/presence coils clear |
+| Child lifecycle | 24/24 exit zero, including Gazebo server/client, RViz and visualization; wrapper exit 130 |
+| Public SIGINT-to-wrapper-exit wall time | 2.436 seconds; no TERM/KILL escalation |
+| Owned cleanup | All launch children and group gone, Compose removed, ports closed, preexisting containers preserved |
+
+The warning is pytest's existing `PytestReturnNotNoneWarning`: under a scenario
+the product system test returns its evidence dictionary. It is not an Xacro
+warning or a shutdown failure and was not suppressed. The ignored observer only
+selects GUI mode and records provenance; all physical and child-exit assertions
+remain those of the product test.
+
+This passing receipt is **not a lifecycle fix or a diagnosis**. An earlier public
+GUI attempt at this same revision completed its mission but reported 23 zero
+child exits and a **null** visualization status. Its wrapper was terminated with
+**-15**, and owned Compose still existed at the public test's cleanup assertion;
+the outer supervisor reclaimed the resources afterward. Separately, a bounded
+matched-reader visualization diagnostic exited with a post-SIGINT **RuntimeError**
+(`Unable to convert call argument to Python object`). Each cause remains unknown;
+there is **no product fix** for either retained risk. The later passing mission
+does not erase either failed receipt or prove universal lifecycle reliability.
+Both require independent release review and root adjudication before publication.
+
+An intervening GUI attempt failed before launch because the Docker registry's
+anonymous-token hostname timed out in DNS. Normal DNS/TLS connectivity recovered
+without host repair; one authorized retry produced the receipt above. This
+infrastructure failure is separate from the retained shutdown risks.
+
+## Earlier recorded successful mission
 
 The recording uses product source revision
 `759af4f8901787c4476f24e744642b5b662e1796`, captured on 3 October 2026.
@@ -67,9 +164,9 @@ teardown. This additional lifecycle concern is not suppressed or resolved here.
 
 Two standalone close-up receipts record Gazebo client SIGSEGV during teardown;
 the cause remains unverified. The full public GUI mission instead records a
-clean client exit. A current-candidate public GUI start/mission/stop receipt,
-including every child exit status, remains a release gate. A supported-path
-client SIGSEGV blocks release. The resolved-mesh receipt also contains 407
+clean client exit. The current source-bound GUI receipt above records every
+child exit, but the retained shutdown risks still require release review.
+A supported-path client SIGSEGV blocks release. The resolved-mesh receipt also contains 407
 model-browser missing-`model.config` errors for unrelated ROS share packages.
 This accepted GUI noise does not mean the AMR meshes are missing and does not
 establish a crash cause. Actual asset-resolution failures remain separate.
@@ -122,8 +219,9 @@ concern does not alter the measured mission result. The subsequent reliability
 fix handles expected signal shutdown and drains owned executors before node
 destruction. The system gate now records and requires clean exits for every
 normal child, separately from wrapper interruption and process absence. These
-changes do not rewrite the six historical failures or substitute for the pending
-current-candidate GUI receipt. Rendering on
+changes do not rewrite the six historical failures. The current GUI receipt
+above is an observed pass, not proof that the later retained visualization
+failures are fixed. Rendering on
 every graphics driver is not guaranteed.
 
 Version 1 supports one fixed part and route. A confirmed or uncertain pickup consumes the

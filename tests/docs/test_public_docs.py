@@ -141,6 +141,27 @@ def test_results_distinguish_clocks_revision_sources_and_current_hosted_ci():
         assert re.search(r"`[0-9a-f]{40}`", hosted)
 
 
+def test_current_gui_receipt_retains_unresolved_shutdown_risks():
+    text = (ROOT / "docs/validation/latest-results.md").read_text()
+    assert "## Current public GUI receipt" in text
+    current = text.split("## Current public GUI receipt", 1)[1].split("\n## ", 1)[0]
+    assert "Status: observed." in current
+    assert re.search(r"Source revision: `[0-9a-f]{40}`", current)
+    assert "24/24" in current and "wrapper exit 130" in current
+    assert "72.4 simulated seconds" in current
+    assert "4.5 s to 76.9 s" in current
+    assert "110.117" in current and "wall" in current
+    for risk in (
+        "null",
+        "-15",
+        "RuntimeError",
+        "cause remains unknown",
+        "no product fix",
+    ):
+        assert risk in current
+    assert "pending current-candidate GUI receipt" not in text
+
+
 def test_architecture_connectors_assign_gateway_events_and_navigation_goals():
     root = ET.parse(ROOT / "docs/assets/architecture.svg").getroot()
     ns = {"svg": "http://www.w3.org/2000/svg"}
