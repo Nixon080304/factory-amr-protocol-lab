@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-pytest>=7,<9
+pytest>=9.1.1,<10
 # A venv-local entry point keeps colcon's Python tests on the pinned interpreter.
 colcon-core==0.20.1
 # Avoid the workspace's legacy pip build-isolation behavior.
