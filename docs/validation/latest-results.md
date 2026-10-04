@@ -111,6 +111,27 @@ anonymous-token hostname timed out in DNS. Normal DNS/TLS connectivity recovered
 without host repair; later complete verification produced the receipt above. This
 infrastructure failure is separate from the retained shutdown risks.
 
+## Visible payload mission recording
+
+The current mission GIF uses product source revision
+`9837ce27362309aca717929dbf4d9aee2b2dade6`, captured on 4 October 2026. The
+supported successful mission reached every state from `RECEIVED` through
+`COMPLETED`; both PLC cycle counters reached one, and the payload progressed
+from `AT_ASSEMBLY` through `IN_TRANSIT` to `AT_INSPECTION`. The final part pose
+was `(3, 2, 0.65)`.
+
+The recorder made 564 successful owned-window captures from 564 attempts over
+75.145 wall seconds: 282 Gazebo frames and 282 RViz frames. All 24 launch
+children exited cleanly, the interrupted wrapper returned 130, the owned
+Compose project was absent, and owned ports were closed after cleanup.
+
+The published GIF selects only real Gazebo frames: 9 pickup frames, 120
+transport frames, and 8 drop-off frames. Pickup and drop-off play at captured
+wall speed; transport plays at 4× wall speed. A nearest-neighbor crop follows
+the detected orange payload and labels the three phases. Playback holds sampled
+frames and creates no intermediate images. This establishes visible simulated
+carrying, not a physical grasp or hardware result.
+
 ## Earlier recorded successful mission
 
 The recording uses product source revision

@@ -6,18 +6,20 @@ confirms ArUco markers, MQTT accepts missions, and real Modbus TCP handshakes
 control the simulated PLC. Gazebo animates conveyors and payload. The observer
 writes a JSONL trace and a mission report.
 
-![Actual Gazebo and RViz mission recording](docs/assets/mission-demo.gif)
+![Actual Gazebo pickup, visible carrying, and drop-off recording](docs/assets/mission-demo.gif)
 
-The RViz mission plays at 4× wall speed, followed by zoomed Gazebo loading and
-unloading clips at captured wall speed. All frames come from application windows.
+The real Gazebo recording shows pickup and drop-off at captured wall speed, with
+robot transport at 4× wall speed. The crop follows the orange payload so its
+ride on the robot remains visible. All frames come from the application window;
+no intermediate frames are generated.
 
 ![Factory overview captured from Gazebo](docs/assets/factory-overview.png)
 
 ![AMR base, wheels, and LiDAR captured from Gazebo](docs/assets/amr-closeup.png)
 
 This separate close-up verifies installed robot mesh resolution after its search
-path correction. The mission GIF and overview retain their earlier source
-revision; this close-up does not claim another completed mission.
+path correction. The overview retains its earlier source revision; the close-up
+does not claim another completed mission.
 
 MQTT connects the dispatcher to the robot with validated JSON and replayable
 status. ROS 2 DDS carries typed actions, services, fresh sensor observations,
@@ -185,8 +187,9 @@ a local rendering display; it is not claimed as CI coverage.
 
 Version 1 has one robot, one motor part, and one fixed route. Conveyor motion is
 a bounded visual animation after a confirmed PLC cycle; there is no manipulator
-or physical grasp simulation. Payload is hidden during transport and placed on
-the inspection belt for unloading. Registries are process-local. MQTT and
+or physical grasp simulation. After loading, the payload rides on top of the
+robot as a robot-relative visual pose, then moves onto the inspection belt for
+unloading. Registries are process-local. MQTT and
 Modbus bind to localhost without production authentication. Optional MQTT
 authentication through an ignored password file is deferred and is not delivered;
 the supported broker default is anonymous and loopback-only. Hosted CI remains
