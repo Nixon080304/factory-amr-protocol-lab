@@ -82,6 +82,8 @@ def event(
 
 
 class TestGazeboPayload(unittest.TestCase):
+    CARRY_OFFSET = (-0.03, 0.0, 0.28)
+
     @classmethod
     def setUpClass(cls):
         rclpy.init()
@@ -121,7 +123,26 @@ class TestGazeboPayload(unittest.TestCase):
         message.stamp = self.node.get_clock().now().to_msg()
         publisher.publish(message)
 
-    def observe_animation(self, conveyor, expected_part):
+    def payload_is_on_robot(self, tolerance=0.015):
+        robot = self.pose("factory_amr")
+        part = self.pose("factory_part")
+        return all(
+            abs((part_value - robot_value) - offset) <= tolerance
+            for part_value, robot_value, offset in zip(
+                (part.position.x, part.position.y, part.position.z),
+                (robot.position.x, robot.position.y, robot.position.z),
+                self.CARRY_OFFSET,
+            )
+        )
+
+    def assert_payload_on_robot(self):
+        self.assertTrue(
+            self.payload_is_on_robot(),
+            "factory_part must remain visibly mounted on factory_amr",
+        )
+        return self.pose("factory_part")
+
+    def observe_animation(self, conveyor, expected_part=None):
         offsets = []
         visible_positions = []
         visible_link_positions = []
@@ -148,14 +169,15 @@ class TestGazeboPayload(unittest.TestCase):
                 self.assertAlmostEqual(part.position.z, 0.65, delta=0.005)
                 self.assertGreaterEqual(part.position.y, 1.8 - 0.005)
                 self.assertLessEqual(part.position.y, 2.0 + 0.005)
-            if (
-                max(offsets) >= 0.05
-                and abs(offsets[-1]) < 0.005
-                and all(
+            at_final_pose = (
+                self.payload_is_on_robot()
+                if expected_part is None
+                else all(
                     abs(value - expected) < 0.005
                     for value, expected in zip(xyz, expected_part)
                 )
-            ):
+            )
+            if max(offsets) >= 0.05 and abs(offsets[-1]) < 0.005 and at_final_pose:
                 break
         self.assertGreaterEqual(max(offsets), 0.05, "actual conveyor must visibly move")
         self.assertGreaterEqual(
@@ -169,8 +191,11 @@ class TestGazeboPayload(unittest.TestCase):
         )
         self.assertTrue(any(1.84 < value < 1.96 for value in visible_link_positions))
         self.assertAlmostEqual(offsets[-1], 0, delta=0.005)
-        self.assert_pose("factory_part", expected_part)
-        self.assert_pose("factory_part::part_link", expected_part)
+        if expected_part is None:
+            self.assert_payload_on_robot()
+        else:
+            self.assert_pose("factory_part", expected_part)
+            self.assert_pose("factory_part::part_link", expected_part)
         print(
             f"Actual {conveyor} offsets: min={min(offsets):.3f}, max={max(offsets):.3f}, "
             f"final={offsets[-1]:.3f}; factory_part={xyz}"
@@ -247,7 +272,29 @@ class TestGazeboPayload(unittest.TestCase):
         loaded = event()
         self.publish(publisher, loaded)
         self.spin_until(lambda: states[-1]["state"] == "IN_TRANSIT")
-        self.observe_animation("assembly_conveyor", (0, 0, -2))
+        self.observe_animation("assembly_conveyor")
+        before = self.assert_payload_on_robot()
+        from factory_simulation.entity_probe import set_entity_pose
+
+        moved_robot = Pose()
+        moved_robot.position.x = 1.0
+        moved_robot.position.y = -1.0
+        moved_robot.position.z = 0.01
+        moved_robot.orientation.w = 1.0
+        set_entity_pose(self.node, "factory_amr", moved_robot, timeout_sec=2)
+        self.spin_until(self.payload_is_on_robot, 3)
+        after = self.assert_payload_on_robot()
+        self.assertGreater(
+            abs(after.position.x - before.position.x)
+            + abs(after.position.y - before.position.y),
+            1.0,
+            "factory_part must travel with a moving factory_amr",
+        )
+        carried_xyz = (
+            after.position.x,
+            after.position.y,
+            after.position.z,
+        )
         self.assertEqual(
             states[-1],
             {
@@ -265,7 +312,7 @@ class TestGazeboPayload(unittest.TestCase):
                 event(kind="UNLOADING", outcome="FAILED"),
             ],
             "assembly_conveyor",
-            (0, 0, -2),
+            carried_xyz,
         )
         self.assertEqual(len(states), 2)
 

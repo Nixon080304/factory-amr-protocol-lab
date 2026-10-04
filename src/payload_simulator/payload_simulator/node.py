@@ -31,6 +31,11 @@ def pose(x, y, z):
     return result
 
 
+def carried_part_step():
+    """Keep the payload visible above the robot while it is in transit."""
+    return "factory_part", pose(-0.03, 0, 0.28), "factory_amr"
+
+
 def animation_steps(transfer_kind):
     """Return bounded model poses; station bodies and markers never move.
 
@@ -40,12 +45,14 @@ def animation_steps(transfer_kind):
     loading = transfer_kind == "LOADING"
     x = -3.0 if loading else 3.0
     conveyor = "assembly_conveyor" if loading else "inspection_conveyor"
-    steps = [("factory_part", pose(x, 2.0 if loading else 1.8, 0.65))]
+    steps = [("factory_part", pose(x, 2.0 if loading else 1.8, 0.65), "world")]
     for index, offset in enumerate((0.06, 0.12, 0.06, 0.0), start=1):
-        steps.append((conveyor, pose(x, 2.0 + offset, 0.603)))
+        steps.append((conveyor, pose(x, 2.0 + offset, 0.603), "world"))
         part_y = 2.0 - index * 0.05 if loading else 1.8 + index * 0.05
-        steps.append(("factory_part", pose(x, part_y, 0.65)))
-    steps.append(("factory_part", pose(0, 0, -2) if loading else pose(3, 2, 0.65)))
+        steps.append(("factory_part", pose(x, part_y, 0.65), "world"))
+    steps.append(
+        carried_part_step() if loading else ("factory_part", pose(3, 2, 0.65), "world")
+    )
     return deque(steps)
 
 
@@ -74,6 +81,8 @@ class PayloadSimulatorNode(Node):
         self._client = self.create_client(SetEntityState, "/gazebo/set_entity_state")
         self._animations = deque()
         self._steps = deque()
+        self._active_animation = None
+        self._carrying = False
         self._future = None
         self._visual_deadline = 0.0
         self._service_deadline = 0.0
@@ -110,6 +119,8 @@ class PayloadSimulatorNode(Node):
         self._publish_state(
             transition.mission_id, transition.transfer_kind, transition.cycle_counter
         )
+        if transition.transfer_kind == "UNLOADING":
+            self._carrying = False
         self._animations.append(transition.transfer_kind)
 
     def _visual_failed(self, reason):
@@ -118,6 +129,8 @@ class PayloadSimulatorNode(Node):
             self._future.cancel()
         self._future = None
         self._steps.clear()
+        self._active_animation = None
+        self._carrying = False
         self.get_logger().warning(
             f"Payload visual update failed: {reason}; logical state remains authoritative"
         )
@@ -125,9 +138,15 @@ class PayloadSimulatorNode(Node):
     def _tick(self):
         wall_now = time.monotonic()
         if not self._steps and self._future is None:
-            if not self._animations:
+            if self._animations:
+                self._active_animation = self._animations.popleft()
+                self._steps = animation_steps(self._active_animation)
+            elif self._carrying:
+                if self.get_clock().now().nanoseconds < self._next_step_sim_ns:
+                    return
+                self._steps.append(carried_part_step())
+            else:
                 return
-            self._steps = animation_steps(self._animations.popleft())
             self._visual_deadline = wall_now + 5.0
             self._next_step_sim_ns = self.get_clock().now().nanoseconds
         if wall_now >= self._visual_deadline:
@@ -144,6 +163,9 @@ class PayloadSimulatorNode(Node):
                 if not success:
                     self._visual_failed("Gazebo rejected entity pose")
                     return
+                if not self._steps and self._active_animation is not None:
+                    self._carrying = self._active_animation == "LOADING"
+                    self._active_animation = None
                 self._next_step_sim_ns = (
                     self.get_clock().now().nanoseconds + 150_000_000
                 )
@@ -157,11 +179,11 @@ class PayloadSimulatorNode(Node):
             return
         if not self._client.service_is_ready():
             return
-        name, target = self._steps.popleft()
+        name, target, reference_frame = self._steps.popleft()
         request = SetEntityState.Request()
         request.state.name = name
         request.state.pose = target
-        request.state.reference_frame = "world"
+        request.state.reference_frame = reference_frame
         self._future = self._client.call_async(request)
         self._service_deadline = wall_now + 1.0
 
