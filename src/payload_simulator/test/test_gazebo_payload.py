@@ -2,6 +2,7 @@
 """Measure actual Gazebo motion after real successful ProtocolEvent messages."""
 
 import json
+import math
 import os
 from pathlib import Path
 import socket
@@ -126,12 +127,19 @@ class TestGazeboPayload(unittest.TestCase):
     def payload_is_on_robot(self, tolerance=0.015):
         robot = self.pose("factory_amr")
         part = self.pose("factory_part")
+        yaw = 2.0 * math.atan2(robot.orientation.z, robot.orientation.w)
+        local_x, local_y, local_z = self.CARRY_OFFSET
+        world_offset = (
+            math.cos(yaw) * local_x - math.sin(yaw) * local_y,
+            math.sin(yaw) * local_x + math.cos(yaw) * local_y,
+            local_z,
+        )
         return all(
             abs((part_value - robot_value) - offset) <= tolerance
             for part_value, robot_value, offset in zip(
                 (part.position.x, part.position.y, part.position.z),
                 (robot.position.x, robot.position.y, robot.position.z),
-                self.CARRY_OFFSET,
+                world_offset,
             )
         )
 
@@ -290,6 +298,15 @@ class TestGazeboPayload(unittest.TestCase):
             1.0,
             "factory_part must travel with a moving factory_amr",
         )
+        rotated_robot = Pose()
+        rotated_robot.position.x = -1.0
+        rotated_robot.position.y = 1.5
+        rotated_robot.position.z = 0.01
+        rotated_robot.orientation.z = math.sin(math.pi / 4.0)
+        rotated_robot.orientation.w = math.cos(math.pi / 4.0)
+        set_entity_pose(self.node, "factory_amr", rotated_robot, timeout_sec=2)
+        self.spin_until(self.payload_is_on_robot, 3)
+        after = self.assert_payload_on_robot()
         carried_xyz = (
             after.position.x,
             after.position.y,
