@@ -154,6 +154,36 @@ def test_results_distinguish_clocks_revision_sources_and_current_hosted_ci():
         assert re.search(r"`[0-9a-f]{40}`", hosted)
 
 
+def test_successful_hosted_status_matches_public_summaries():
+    results = (ROOT / "docs/validation/latest-results.md").read_text()
+    hosted = results.split("## Current hosted CI", 1)[1].split("\n## ", 1)[0]
+    assert "Status: success." in hosted
+    for page in (ROOT / "README.md", ROOT / "docs/architecture.md"):
+        text = page.read_text()
+        prose = " ".join(text.split())
+        assert "hosted CI is observed passing" in prose
+        assert "hosted workflow success remains unobserved" not in text
+
+
+def test_current_gif_provenance_is_distinct_from_superseded_recording():
+    text = (ROOT / "docs/validation/latest-results.md").read_text()
+    current = text.split("## Visible payload mission recording", 1)[1].split(
+        "\n## ", 1
+    )[0]
+    current_prose = " ".join(current.split())
+    assert "Gazebo frames" in current
+    assert "RViz frames" in current
+    assert "137 real Gazebo source frames" in current_prose
+    assert "78 encoded GIF frames" in current_prose
+    assert "960 × 600" in current_prose
+    assert "12.99 seconds" in current_prose
+    historical = text.split("## Superseded recording evidence", 1)[1].split("\n## ", 1)[
+        0
+    ]
+    assert "513 successful native frames from 514 capture attempts" in historical
+    assert "RViz" in historical
+
+
 def test_current_gui_receipt_retains_unresolved_shutdown_risks():
     text = (ROOT / "docs/validation/latest-results.md").read_text()
     assert "## Current public GUI receipt" in text

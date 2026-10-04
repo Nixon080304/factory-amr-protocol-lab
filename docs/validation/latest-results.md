@@ -125,16 +125,17 @@ The recorder made 564 successful owned-window captures from 564 attempts over
 children exited cleanly, the interrupted wrapper returned 130, the owned
 Compose project was absent, and owned ports were closed after cleanup.
 
-The published GIF selects only real Gazebo frames: 9 pickup frames, 120
-transport frames, and 8 drop-off frames. Pickup and drop-off play at captured
+The renderer selects 137 real Gazebo source frames: 9 pickup frames, 120
+transport frames, and 8 drop-off frames. GIF optimization stores 78 encoded GIF
+frames at 960 × 600 over 12.99 seconds. Pickup and drop-off play at captured
 wall speed; transport plays at 4× wall speed. A nearest-neighbor crop follows
 the detected orange payload and labels the three phases. Playback holds sampled
 frames and creates no intermediate images. This establishes visible simulated
 carrying, not a physical grasp or hardware result.
 
-## Earlier recorded successful mission
+## Superseded recording evidence
 
-The recording uses product source revision
+The earlier recording uses product source revision
 `759af4f8901787c4476f24e744642b5b662e1796`, captured on 3 October 2026.
 Mission `M-001` completes once; replaying its ID does not create another action
 or PLC cycle. A distinct post-pickup request fails with `RESTART_REQUIRED`.
@@ -159,7 +160,7 @@ and unloading positions. A static part initially left the loading client view
 stale despite updated service poses; the final part uses a kinematic link with
 gravity disabled, preserving stable command-owned poses while showing motion.
 
-## Evidence and clock boundaries
+### Evidence and clock boundaries
 
 The demo assets are captured from owned Gazebo and RViz application windows.
 Native frames retain their capture times. The navigation view plays at 4× wall

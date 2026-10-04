@@ -148,13 +148,15 @@ request; duplicates replay that status. The printed output directory contains
 Version 1 supports one robot, one motor part, and one fixed route. Resetting the
 single-part lifecycle requires restarting the simulation. Registries and active
 aggregation are process-local. Deterministic reliability
-scenarios and local CI gates are implemented; restart recovery is unsupported,
-and hosted workflow success remains unobserved. See [validation results](validation/latest-results.md).
+scenarios and local CI gates are implemented; restart recovery is unsupported.
+The hosted CI is observed passing, but it excludes local-only Gazebo rendering
+and navigation. See [validation results](validation/latest-results.md).
 
 Confirmed transfers drive bounded, best-effort visuals. The part travels 0.2 m
 along each station belt in four intermediate poses. Loading then places the part
-at local pose `(-0.03, 0, 0.28)` in the `factory_amr` reference frame. A bounded
-150 ms simulated-clock refresh keeps the visual pose attached during transport.
+at local pose `(-0.03, 0, 0.28)` in the `factory_amr` reference frame. A nominal
+150 ms refresh while simulation time advances keeps the visual pose attached
+during transport.
 Unloading stops that refresh and places the part at `(3, 2, 0.65)`. Its kinematic
 link has gravity disabled so commanded poses stay stable and Gazebo publishes
 motion. This is an animation,

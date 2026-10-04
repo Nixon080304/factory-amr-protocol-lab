@@ -192,8 +192,8 @@ robot as a robot-relative visual pose, then moves onto the inspection belt for
 unloading. Registries are process-local. MQTT and
 Modbus bind to localhost without production authentication. Optional MQTT
 authentication through an ignored password file is deferred and is not delivered;
-the supported broker default is anonymous and loopback-only. Hosted CI remains
-unobserved until the repository is published and its workflow runs.
+the supported broker default is anonymous and loopback-only. The hosted CI is
+observed passing, but it excludes local-only Gazebo rendering and navigation.
 
 Vanished or hung transfer gateways can leave
 a stopped robot with a pending mission and unknown PLC state. No bound on
