@@ -15,6 +15,7 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node, PushRosNamespace
 from launch_ros.parameter_descriptions import ParameterFile
 from nav2_common.launch import RewrittenYaml
+import yaml
 
 
 LOCALIZATION_NODES = ("map_server", "amcl")
@@ -94,6 +95,34 @@ def coordinator_parameters(config: FleetConfig, robot: RobotConfig) -> dict:
                     pose.y,
                     pose.yaw,
                 ]
+    return result
+
+
+def agent_parameters(config, robot, stations):
+    """Pass the same configured policy and map-origin station poses to each agent."""
+    result = {
+        "robot_id": robot.robot_id,
+        "frame_prefix": robot.frame_prefix,
+        "use_sim_time": True,
+        "battery_start_percent": robot.battery_start_percent,
+        "station_names": list(stations),
+        "dock_id": config.energy.dock_id,
+    }
+    for name, values in stations.items():
+        result[f"stations.{name}.pose"] = [float(values[k]) for k in ("x", "y", "yaw")]
+    dock = config.docks[config.energy.dock_id]
+    for name in ("staging_pose", "charging_pose"):
+        pose = getattr(dock, name)
+        result[f"dock.{name}"] = [pose.x, pose.y, pose.yaw]
+    for name in (
+        "reserve_percent",
+        "idle_percent_per_sec",
+        "move_percent_per_m",
+        "operation_percent",
+        "charge_percent_per_sec",
+        "dock_allowance_m",
+    ):
+        result["energy." + name] = getattr(config.energy, name)
     return result
 
 
@@ -242,6 +271,9 @@ def fleet_launch_actions(
     actions = simulator_actions(
         world or str(simulation / "worlds/factory_floor.world"), gui
     )
+    stations = yaml.safe_load((bringup / "config/stations.yaml").read_text())[
+        "stations"
+    ]
     for spec in robot_launch_specs(config):
         actions.extend(
             robot_actions(
@@ -280,7 +312,26 @@ def fleet_launch_actions(
                 executable="mission_coordinator",
                 namespace=spec.namespace,
                 output="screen",
-                parameters=[coordinator_parameters(config, robot)],
+                parameters=[
+                    {
+                        **coordinator_parameters(config, robot),
+                        **{
+                            f"stations.{name}.pose": [
+                                float(values[k]) for k in ("x", "y", "yaw")
+                            ]
+                            for name, values in stations.items()
+                        },
+                    }
+                ],
+            )
+        )
+        actions.append(
+            Node(
+                package="robot_agent",
+                executable="robot_agent",
+                namespace=spec.namespace,
+                output="screen",
+                parameters=[agent_parameters(config, robot, stations)],
             )
         )
     return actions

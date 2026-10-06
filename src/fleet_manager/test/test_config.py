@@ -10,6 +10,39 @@ import sys
 import pytest
 import yaml
 
+
+def test_configurable_energy_rates_drive_fleet_agent_predictions(tmp_path):
+    # Ignoring simulation rates would make cost and live drain disagree.
+    source = Path(__file__).resolve().parents[2] / "factory_bringup/config/fleet.yaml"
+    data = yaml.safe_load(source.read_text())
+    data["energy"].update(
+        idle_percent_per_sec=0.02,
+        move_percent_per_m=0.4,
+        operation_percent=1.5,
+        charge_percent_per_sec=2.0,
+        dock_allowance_m=15.0,
+    )
+    path = tmp_path / "fleet.yaml"
+    path.write_text(yaml.safe_dump(data))
+    config = loader()(path)
+    assert config.energy.idle_percent_per_sec == 0.02
+    assert config.energy.move_percent_per_m == 0.4
+    assert config.energy.operation_percent == 1.5
+    assert config.energy.charge_percent_per_sec == 2.0
+    assert config.energy.dock_allowance_m == 15.0
+
+
+@pytest.mark.parametrize("value", [-1, float("nan"), float("inf"), True])
+def test_energy_rate_validation_rejects_invalid_prediction_inputs(tmp_path, value):
+    source = Path(__file__).resolve().parents[2] / "factory_bringup/config/fleet.yaml"
+    data = yaml.safe_load(source.read_text())
+    data["energy"]["move_percent_per_m"] = value
+    path = tmp_path / "fleet.yaml"
+    path.write_text(yaml.safe_dump(data))
+    with pytest.raises(ValueError, match="move_percent_per_m"):
+        loader()(path)
+
+
 PACKAGE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE))
 

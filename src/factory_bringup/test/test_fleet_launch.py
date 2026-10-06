@@ -94,6 +94,32 @@ def fleet(size):
 
 
 @pytest.mark.parametrize("size", [2, 10])
+def test_each_configured_robot_gets_energy_agent_station_frames_and_dock(size):
+    # Missing agent or copied parameters leaves fleet candidates silent or coupled.
+    config = fleet(size)
+    actions = production().fleet_launch_actions(config, gui="false", rviz="false")
+    agents = [
+        a for a in actions if isinstance(a, Node) and a.node_package == "robot_agent"
+    ]
+    assert len(agents) == size
+    context = LaunchContext()
+    for robot, node in zip(config.robots, agents):
+        node._perform_substitutions(context)
+        assert node.expanded_node_namespace == robot.namespace
+        params = evaluate_parameters(context, node._Node__parameters)[0]
+        assert params["robot_id"] == robot.robot_id
+        assert params["frame_prefix"] == robot.frame_prefix
+        assert params["use_sim_time"] is True
+        assert params["battery_start_percent"] == robot.battery_start_percent
+        assert params["station_names"] == ("assembly", "inspection")
+        assert params["stations.assembly.pose"] == (-3.0, 0.8, 1.5707963267948966)
+        assert params["dock_id"] == "dock_01"
+        assert params["dock.charging_pose"] == (4.0, -2.0, 0.0)
+        assert params["energy.reserve_percent"] == 20.0
+        assert params["energy.dock_allowance_m"] == 10.0
+
+
+@pytest.mark.parametrize("size", [2, 10])
 def test_specs_isolate_every_robot_stack(size):
     # Reusing entity, namespace, frame, description topic, or lifecycle paths couples robots.
     config = fleet(size)

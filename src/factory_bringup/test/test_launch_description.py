@@ -60,3 +60,19 @@ def test_demo_routes_gateway_through_fleet_and_configured_robot(
         "/factory/execute_mission",
         namespace + "/factory/execute_mission",
     ) in coordinator.expanded_remapping_rules
+    assert "robot_agent" in nodes, "V1 demo must publish configured robot health"
+    agent = nodes["robot_agent"]
+    agent._perform_substitutions(context)
+    assert agent.expanded_node_namespace == namespace
+    values = evaluate_parameters(context, agent._Node__parameters)[0]
+    assert values["robot_id"] == "amr_01" and values["frame_prefix"] == ""
+    assert ("odom", "/odom") in agent.expanded_remapping_rules
+    assert ("amcl_pose", "/amcl_pose") in agent.expanded_remapping_rules
+    assert (
+        "factory/mission_state",
+        "/factory/mission_state",
+    ) in agent.expanded_remapping_rules
+    assert (
+        "compute_path_to_pose",
+        "/compute_path_to_pose",
+    ) in agent.expanded_remapping_rules

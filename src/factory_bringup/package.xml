@@ -23,6 +23,7 @@
   <exec_depend>mission_coordinator</exec_depend>
   <exec_depend>mqtt_gateway</exec_depend>
   <exec_depend>fleet_manager</exec_depend>
+  <exec_depend>robot_agent</exec_depend>
   <exec_depend>modbus_gateway</exec_depend>
   <exec_depend>protocol_observer</exec_depend>
   <exec_depend>station_perception</exec_depend>

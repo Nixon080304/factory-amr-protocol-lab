@@ -46,6 +46,11 @@ class EnergyPolicyConfig:
     charge_below_percent: float
     charge_until_percent: float
     dock_id: str
+    idle_percent_per_sec: float = 0.001
+    move_percent_per_m: float = 0.1
+    operation_percent: float = 0.5
+    charge_percent_per_sec: float = 1.0
+    dock_allowance_m: float = 10.0
 
 
 @dataclass(frozen=True)
@@ -315,8 +320,25 @@ def _parse_config(data):
             f"docks.{dock_id}: dock resource requires staging and charging poses"
         )
 
+    simulation_defaults = {
+        "idle_percent_per_sec": 0.001,
+        "move_percent_per_m": 0.1,
+        "operation_percent": 0.5,
+        "charge_percent_per_sec": 1.0,
+        "dock_allowance_m": 10.0,
+    }
+    energy_values = _mapping(data["energy"], "energy")
+    rates = {}
+    for name, default in simulation_defaults.items():
+        rates[name] = _number(energy_values.get(name, default), "energy." + name)
+        if rates[name] < 0:
+            raise ValueError(f"energy.{name}: expected a nonnegative number")
     value = _mapping(
-        data["energy"],
+        {
+            key: item
+            for key, item in energy_values.items()
+            if key not in simulation_defaults
+        },
         "energy",
         ("reserve_percent", "charge_below_percent", "charge_until_percent", "dock_id"),
     )
@@ -334,7 +356,7 @@ def _parse_config(data):
     dock_id = _identifier(value["dock_id"], "energy.dock_id")
     if dock_id not in docks:
         raise ValueError(f"energy.dock_id: unknown dock {dock_id!r}")
-    energy = EnergyPolicyConfig(reserve, charge_below, charge_until, dock_id)
+    energy = EnergyPolicyConfig(reserve, charge_below, charge_until, dock_id, **rates)
     return FleetConfig(
         tuple(robots),
         tuple(resources),

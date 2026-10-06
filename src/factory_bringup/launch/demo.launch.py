@@ -4,6 +4,8 @@
 from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
+from factory_bringup.fleet_launch import agent_parameters
+from fleet_manager.config import load_fleet_config
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
@@ -25,6 +27,10 @@ def generate_launch_description():
     fleet_file = bringup / "config/fleet.yaml"
     fleet = yaml.safe_load(fleet_file.read_text())
     robot_namespace = fleet["robots"][0]["namespace"]
+    fleet_config = load_fleet_config(fleet_file)
+    robot = fleet_config.robots[0]
+    agent_config = agent_parameters(fleet_config, robot, stations)
+    agent_config["frame_prefix"] = ""
     launches = []
     for package, filename, arguments in [
         (
@@ -56,6 +62,22 @@ def generate_launch_description():
                 "journal_path", default_value="artifacts/fleet/missions.sqlite3"
             ),
             *launches,
+            Node(
+                package="robot_agent",
+                executable="robot_agent",
+                namespace=robot_namespace,
+                output="screen",
+                parameters=[agent_config],
+                remappings=[
+                    (name, "/" + name)
+                    for name in (
+                        "odom",
+                        "amcl_pose",
+                        "factory/mission_state",
+                        "compute_path_to_pose",
+                    )
+                ],
+            ),
             *[
                 Node(
                     package=package,

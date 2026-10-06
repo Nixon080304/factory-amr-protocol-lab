@@ -61,3 +61,9 @@ energy:
   charge_below_percent: 30.0
   charge_until_percent: 80.0
   dock_id: dock_01
+  # Simulation percentages, not measured hardware discharge characteristics.
+  idle_percent_per_sec: 0.001
+  move_percent_per_m: 0.1
+  operation_percent: 0.5
+  charge_percent_per_sec: 1.0
+  dock_allowance_m: 10.0
