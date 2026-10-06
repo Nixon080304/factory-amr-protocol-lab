@@ -1,0 +1,273 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Validate fleet inputs before consumers can launch or assign robots."""
+
+from copy import deepcopy
+from dataclasses import FrozenInstanceError
+import importlib
+from pathlib import Path
+import sys
+
+import pytest
+import yaml
+
+PACKAGE = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PACKAGE))
+
+
+def loader():
+    try:
+        return importlib.import_module("fleet_manager.config").load_fleet_config
+    except ModuleNotFoundError:
+        pytest.fail("fleet configuration loader is not implemented")
+
+
+@pytest.fixture
+def data():
+    return {
+        "robots": [
+            {
+                "robot_id": "amr_01",
+                "namespace": "/amr_01",
+                "frame_prefix": "amr_01/",
+                "spawn": [0.0, -3.0, 0.0],
+                "battery_start_percent": 100.0,
+            },
+            {
+                "robot_id": "amr_02",
+                "namespace": "/amr_02",
+                "frame_prefix": "amr_02/",
+                "spawn": [1.0, -3.0, 0.0],
+                "battery_start_percent": 60.0,
+            },
+        ],
+        "resources": [
+            {"resource_id": "assembly", "kind": "station", "capacity": 1},
+            {"resource_id": "inspection", "kind": "station", "capacity": 1},
+            {"resource_id": "central_aisle", "kind": "traffic_zone", "capacity": 1},
+            {"resource_id": "dock_01", "kind": "dock", "capacity": 1},
+        ],
+        "routes": {
+            "assembly_to_inspection": ["assembly", "central_aisle", "inspection"]
+        },
+        "docks": {
+            "dock_01": {
+                "staging_pose": [3.5, -2.0, 0.0],
+                "charging_pose": [4.0, -2.0, 0.0],
+            }
+        },
+        "energy": {
+            "reserve_percent": 20.0,
+            "charge_below_percent": 30.0,
+            "charge_until_percent": 80.0,
+            "dock_id": "dock_01",
+        },
+    }
+
+
+def load_data(tmp_path, data):
+    path = tmp_path / "fleet.yaml"
+    path.write_text(yaml.safe_dump(data))
+    return loader()(path)
+
+
+def test_two_robot_configuration_is_ready_for_consumers(tmp_path, data):
+    config = load_data(tmp_path, data)
+    assert tuple(robot.robot_id for robot in config.robots) == ("amr_01", "amr_02")
+    assert config.robots[0].namespace == "/amr_01"
+    assert config.robots[0].frame_prefix == "amr_01/"
+    assert (
+        config.robots[1].spawn.x,
+        config.robots[1].spawn.y,
+        config.robots[1].spawn.yaw,
+    ) == (1.0, -3.0, 0.0)
+    assert config.robots[1].battery_start_percent == 60.0
+    assert config.resources[2].resource_id == "central_aisle"
+    assert config.resources[2].kind == "traffic_zone"
+    assert config.resources[2].capacity == 1
+    assert config.routes["assembly_to_inspection"] == (
+        "assembly",
+        "central_aisle",
+        "inspection",
+    )
+    assert config.docks["dock_01"].staging_pose.x == 3.5
+    assert config.docks["dock_01"].charging_pose.x == 4.0
+    assert config.energy.reserve_percent == 20.0
+    assert config.energy.charge_below_percent == 30.0
+    assert config.energy.charge_until_percent == 80.0
+    assert config.energy.dock_id == "dock_01"
+
+
+def test_committed_fleet_file_loads():
+    config = loader()(PACKAGE.parent / "factory_bringup/config/fleet.yaml")
+    assert tuple(robot.robot_id for robot in config.robots) == ("amr_01", "amr_02")
+    assert {resource.resource_id for resource in config.resources} == {
+        "assembly",
+        "inspection",
+        "central_aisle",
+        "dock_01",
+    }
+
+
+@pytest.mark.parametrize("field", ["robot_id", "namespace", "frame_prefix", "spawn"])
+def test_duplicate_robot_identity_or_spawn_is_rejected(tmp_path, data, field):
+    data["robots"][1][field] = deepcopy(data["robots"][0][field])
+    with pytest.raises(ValueError, match=rf"robots\[1\]\.{field}:.*duplicate"):
+        load_data(tmp_path, data)
+
+
+def test_same_spawn_position_with_different_yaw_is_rejected(tmp_path, data):
+    data["robots"][1]["spawn"] = [0.0, -3.0, 1.57]
+    with pytest.raises(ValueError, match=r"robots\[1\]\.spawn:"):
+        load_data(tmp_path, data)
+
+
+def test_unknown_route_resource_is_rejected(tmp_path, data):
+    data["routes"]["assembly_to_inspection"][1] = "missing"
+    with pytest.raises(
+        ValueError, match=r"routes\.assembly_to_inspection\[1\]:.*unknown"
+    ):
+        load_data(tmp_path, data)
+
+
+@pytest.mark.parametrize("capacity", [0, 2, -1, 1.0, True, "1"])
+def test_only_integer_capacity_one_is_supported(tmp_path, data, capacity):
+    data["resources"][0]["capacity"] = capacity
+    with pytest.raises(ValueError, match=r"resources\[0\]\.capacity:"):
+        load_data(tmp_path, data)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("reserve_percent", -1),
+        ("reserve_percent", 31),
+        ("charge_below_percent", 20),
+        ("charge_until_percent", 30),
+        ("charge_until_percent", 101),
+        ("charge_until_percent", float("nan")),
+        ("reserve_percent", True),
+        ("reserve_percent", "20"),
+    ],
+)
+def test_invalid_energy_thresholds_are_rejected(tmp_path, data, field, value):
+    data["energy"][field] = value
+    with pytest.raises(ValueError, match=r"energy\."):
+        load_data(tmp_path, data)
+
+
+def test_unknown_energy_dock_is_rejected(tmp_path, data):
+    data["energy"]["dock_id"] = "missing"
+    with pytest.raises(ValueError, match=r"energy\.dock_id:.*unknown"):
+        load_data(tmp_path, data)
+
+
+def test_dock_without_resource_is_rejected(tmp_path, data):
+    data["docks"]["missing"] = data["docks"].pop("dock_01")
+    with pytest.raises(ValueError, match=r"docks\.missing:.*unknown"):
+        load_data(tmp_path, data)
+
+
+def test_dock_resource_without_poses_is_rejected(tmp_path, data):
+    data["docks"] = {}
+    with pytest.raises(ValueError, match=r"docks\.dock_01:"):
+        load_data(tmp_path, data)
+
+
+def test_non_dock_resource_cannot_define_dock_poses(tmp_path, data):
+    data["docks"]["assembly"] = deepcopy(data["docks"]["dock_01"])
+    with pytest.raises(ValueError, match=r"docks\.assembly:"):
+        load_data(tmp_path, data)
+
+
+def test_duplicate_resource_id_is_rejected(tmp_path, data):
+    data["resources"][1]["resource_id"] = "assembly"
+    with pytest.raises(ValueError, match=r"resources\[1\]\.resource_id:.*duplicate"):
+        load_data(tmp_path, data)
+
+
+@pytest.mark.parametrize(
+    "section", ["robots", "resources", "routes", "energy", "docks"]
+)
+def test_missing_sections_are_rejected(tmp_path, data, section):
+    del data[section]
+    with pytest.raises(ValueError, match=rf"{section}:"):
+        load_data(tmp_path, data)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("namespace", "amr_01"),
+        ("namespace", "/"),
+        ("namespace", "/amr-01"),
+        ("frame_prefix", ""),
+        ("frame_prefix", "/amr_01/"),
+        ("robot_id", ""),
+        ("spawn", [0, 0]),
+        ("spawn", [0, float("inf"), 0]),
+        ("battery_start_percent", -1),
+        ("battery_start_percent", 101),
+    ],
+)
+def test_invalid_robot_fields_are_rejected(tmp_path, data, field, value):
+    data["robots"][0][field] = value
+    with pytest.raises(ValueError, match=rf"robots\[0\]\.{field}(?:\[\d+\])?:"):
+        load_data(tmp_path, data)
+
+
+def test_unknown_fields_are_rejected_instead_of_silently_ignored(tmp_path, data):
+    data["robots"][0]["battery_start_precent"] = 10
+    with pytest.raises(ValueError, match=r"robots\[0\]\.battery_start_precent:"):
+        load_data(tmp_path, data)
+
+
+@pytest.mark.parametrize(
+    "section,value",
+    [
+        ("robots", []),
+        ("robots", {}),
+        ("routes", {"empty": []}),
+        ("resources", [{"resource_id": "wrong", "kind": "unknown", "capacity": 1}]),
+    ],
+)
+def test_malformed_sections_are_rejected(tmp_path, data, section, value):
+    data[section] = value
+    with pytest.raises(ValueError, match=rf"{section}"):
+        load_data(tmp_path, data)
+
+
+def test_missing_dock_pose_is_rejected(tmp_path, data):
+    del data["docks"]["dock_01"]["charging_pose"]
+    with pytest.raises(ValueError, match=r"docks\.dock_01\.charging_pose:"):
+        load_data(tmp_path, data)
+
+
+def test_config_cannot_be_mutated_after_validation(tmp_path, data):
+    config = load_data(tmp_path, data)
+    with pytest.raises(FrozenInstanceError):
+        config.robots[0].battery_start_percent = 0
+    with pytest.raises(FrozenInstanceError):
+        config.robots[0].spawn.x = 999
+    with pytest.raises(FrozenInstanceError):
+        config.resources[0].capacity = 2
+    with pytest.raises(FrozenInstanceError):
+        config.energy.reserve_percent = 0
+    with pytest.raises(FrozenInstanceError):
+        config.docks["dock_01"].charging_pose.x = 0
+    with pytest.raises(TypeError):
+        config.routes["assembly_to_inspection"] = ("missing",)
+    with pytest.raises(TypeError):
+        config.docks["dock_02"] = config.docks["dock_01"]
+
+
+@pytest.mark.parametrize("text", ["", "[]", "robots: [", "robots: []\nrobots: []"])
+def test_invalid_yaml_reports_file_context(tmp_path, text):
+    path = tmp_path / "fleet.yaml"
+    path.write_text(text)
+    with pytest.raises(ValueError, match="fleet.yaml"):
+        loader()(path)
+
+
+def test_missing_file_reports_file_context(tmp_path):
+    with pytest.raises(ValueError, match="missing.yaml"):
+        loader()(tmp_path / "missing.yaml")

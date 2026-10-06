@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: Apache-2.0
+# Add each robot here; all fleet consumers iterate over this configuration.
+# Poses are [x, y, yaw] in the shared map frame.
+robots:
+  - robot_id: amr_01
+    namespace: /amr_01
+    frame_prefix: amr_01/
+    spawn: [0.0, -3.0, 0.0]
+    battery_start_percent: 100.0
+  - robot_id: amr_02
+    namespace: /amr_02
+    frame_prefix: amr_02/
+    spawn: [1.0, -3.0, 0.0]
+    battery_start_percent: 60.0
+
+resources:
+  - resource_id: assembly
+    kind: station
+    capacity: 1
+  - resource_id: inspection
+    kind: station
+    capacity: 1
+  - resource_id: central_aisle
+    kind: traffic_zone
+    capacity: 1
+  - resource_id: dock_01
+    kind: dock
+    capacity: 1
+
+routes:
+  assembly_to_inspection: [assembly, central_aisle, inspection]
+  inspection_to_assembly: [inspection, central_aisle, assembly]
+
+docks:
+  dock_01:
+    staging_pose: [3.5, -2.0, 0.0]
+    charging_pose: [4.0, -2.0, 0.0]
+
+energy:
+  reserve_percent: 20.0
+  charge_below_percent: 30.0
+  charge_until_percent: 80.0
+  dock_id: dock_01
