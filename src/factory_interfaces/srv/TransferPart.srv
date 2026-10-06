@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 string mission_id
+string robot_id
 string station_id
 string part
 ---

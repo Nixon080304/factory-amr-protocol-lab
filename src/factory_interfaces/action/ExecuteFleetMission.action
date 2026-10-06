@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0
+string mission_id
+# Leave empty for automatic fleet assignment.
+string requested_robot_id
+string pickup_station
+string dropoff_station
+string part
+---
+bool success
+string final_state
+string assigned_robot_id
+string error_code
+string message
+---
+string state
+string assigned_robot_id
+string detail
+float32 progress

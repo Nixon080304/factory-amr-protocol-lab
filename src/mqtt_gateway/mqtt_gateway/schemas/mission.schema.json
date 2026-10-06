@@ -3,12 +3,12 @@
   "title": "Factory mission request",
   "type": "object",
   "additionalProperties": false,
-  "required": ["mission_id", "robot_id", "pickup", "dropoff", "part"],
+  "required": ["mission_id", "pickup", "dropoff", "part"],
   "properties": {
     "mission_id": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9_-]+$(?![\\s\\S])"},
-    "robot_id": {"type": "string", "maxLength": 64, "enum": ["amr_01"]},
+    "robot_id": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9_-]+$(?![\\s\\S])"},
     "pickup": {"type": "string", "maxLength": 64, "enum": ["assembly"]},
     "dropoff": {"type": "string", "maxLength": 64, "enum": ["inspection"]},
-    "part": {"type": "string", "maxLength": 64, "enum": ["motor"]}
+    "part": {"type": "string", "maxLength": 64, "enum": ["motor", "gear"]}
   }
 }

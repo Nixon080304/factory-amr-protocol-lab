@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+string mission_id
+string pickup_station
+string dropoff_station
+string part
+---
+bool feasible
+float64 path_cost
+float32 predicted_final_battery
+string reason

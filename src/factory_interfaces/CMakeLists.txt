@@ -9,15 +9,23 @@ find_package(ament_cmake REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 find_package(builtin_interfaces REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "action/ExecuteFactoryMission.action"
+  "action/ExecuteFleetMission.action"
+  "action/DockRobot.action"
   "msg/StationDetection.msg"
+  "msg/RobotState.msg"
   "msg/ProtocolEvent.msg"
   "srv/TransferPart.srv"
+  "srv/EstimateMissionCost.srv"
+  "srv/AcquireResource.srv"
+  "srv/RenewResource.srv"
+  "srv/ReleaseResource.srv"
   "srv/SetFault.srv"
   "msg/FaultCommand.msg"
-  DEPENDENCIES builtin_interfaces std_msgs
+  DEPENDENCIES builtin_interfaces std_msgs geometry_msgs
 )
 
 ament_export_dependencies(rosidl_default_runtime)

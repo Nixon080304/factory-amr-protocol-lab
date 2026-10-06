@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+string dock_id
+geometry_msgs/PoseStamped staging_pose
+geometry_msgs/PoseStamped charging_pose
+float32 target_percent
+---
+bool success
+string error_code
+string message
+---
+string state
+float32 battery_percent
+string detail

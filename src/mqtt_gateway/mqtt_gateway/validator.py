@@ -46,10 +46,14 @@ class MissionValidator:
         except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
             raise MissionValidationError("Payload must be valid UTF-8 JSON") from error
         self._check(payload, self._structure)
+        payload.setdefault("robot_id", None)
         return MissionPayload(**payload)
 
     def validate_configuration(self, mission: MissionPayload) -> None:
-        self._check(asdict(mission), self._validator)
+        payload = asdict(mission)
+        if mission.robot_id is None:
+            del payload["robot_id"]
+        self._check(payload, self._validator)
 
     @staticmethod
     def _check(payload, validator) -> None:

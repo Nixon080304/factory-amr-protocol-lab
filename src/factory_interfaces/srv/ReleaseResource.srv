@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+string robot_id
+string mission_id
+string resource_id
+string lease_id
+---
+bool released
+string reason
