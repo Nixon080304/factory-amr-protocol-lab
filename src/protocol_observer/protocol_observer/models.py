@@ -17,6 +17,7 @@ class ProtocolEventRecord:
     latency_ms: float
     detail: str
     sequence: Optional[int] = None
+    robot_id: str = ""
 
     def __post_init__(self) -> None:
         if self.stamp.tzinfo is None or self.stamp.utcoffset() is None:
@@ -33,6 +34,7 @@ class ProtocolEventRecord:
         return {
             "stamp": self.stamp.isoformat(),
             "mission_id": self.mission_id,
+            "robot_id": self.robot_id,
             "protocol": self.protocol,
             "direction": self.direction,
             "event": self.event,

@@ -2,6 +2,7 @@
 
 import json
 import time
+import pytest
 import rclpy
 from rclpy.context import Context
 from rclpy.executors import SingleThreadedExecutor
@@ -10,11 +11,63 @@ from factory_interfaces.msg import ProtocolEvent
 from protocol_observer.node import ProtocolObserverNode
 
 
-def test_dds_trace_report_late_phase_and_write_failure(tmp_path):
+def test_transport_boundary_preserves_both_robot_ids(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from rclpy.expand_topic_name import expand_topic_name
+    from rclpy.node import Node
+
+    endpoints = []
+    namespace = "/amr_01"
+    output = tmp_path / "amr_01"
+    monkeypatch.setattr(Node, "__init__", lambda self, *args, **kwargs: None)
+    monkeypatch.setattr(Node, "set_parameters", lambda self, values: [])
+    monkeypatch.setattr(
+        Node,
+        "declare_parameter",
+        lambda self, name, value: SimpleNamespace(value=str(output)),
+    )
+
+    def subscription(self, kind, topic, callback, qos, **kwargs):
+        endpoints.append(expand_topic_name(topic, "protocol_observer", namespace))
+        return SimpleNamespace()
+
+    monkeypatch.setattr(Node, "create_subscription", subscription)
+    for robot_id in ("amr_01", "amr_02"):
+        namespace = f"/{robot_id}"
+        output = tmp_path / robot_id
+        node = ProtocolObserverNode(namespace=namespace)
+        for assigned_robot in ("amr_01", "amr_02"):
+            message = ProtocolEvent(
+                mission_id=f"mission_{assigned_robot}",
+                robot_id=assigned_robot,
+                protocol="ROS",
+                event="mission_finished",
+                outcome="COMPLETED",
+            )
+            message.stamp.sec = 42
+            node._observe(message)
+        rows = [
+            json.loads(line)
+            for line in (output / "protocol_events.jsonl").read_text().splitlines()
+        ]
+        assert [(row["mission_id"], row.get("robot_id")) for row in rows] == [
+            ("mission_amr_01", "amr_01"),
+            ("mission_amr_02", "amr_02"),
+        ]
+        reports = [path.read_text() for path in output.glob("mission_*.md")]
+        assert any("Robot IDs: amr_01" in report for report in reports)
+        assert any("Robot IDs: amr_02" in report for report in reports)
+    # Protocol events are deliberately fleet-wide, even under a ROS namespace.
+    assert endpoints == ["/factory/protocol_events", "/factory/protocol_events"]
+
+
+@pytest.mark.parametrize("namespace", ["/amr_01", "/amr_02"])
+def test_dds_trace_report_late_phase_and_write_failure(tmp_path, namespace):
     context = Context()
     rclpy.init(context=context, domain_id=79)
     node = ProtocolObserverNode(
         context=context,
+        namespace=namespace,
         parameter_overrides=[Parameter("output_dir", value=str(tmp_path))],
     )
     peer = rclpy.create_node("observer_peer", context=context)
@@ -26,6 +79,7 @@ def test_dds_trace_report_late_phase_and_write_failure(tmp_path):
     def publish(name, seconds, outcome="", nanoseconds=0, protocol="ROS", detail=""):
         message = ProtocolEvent(
             mission_id="M-001",
+            robot_id=namespace.removeprefix("/"),
             protocol=protocol,
             event=name,
             outcome=outcome,
@@ -50,6 +104,7 @@ def test_dds_trace_report_late_phase_and_write_failure(tmp_path):
             for line in (tmp_path / "protocol_events.jsonl").read_text().splitlines()
         ]
         assert [r["sequence"] for r in records] == [1, 2, 3, 4]
+        assert [r["robot_id"] for r in records] == [namespace.removeprefix("/")] * 4
         assert records[-1]["stamp"].startswith("1970-01-01T00:00:12")
         report = (
             tmp_path

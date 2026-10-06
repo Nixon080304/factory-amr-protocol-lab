@@ -62,6 +62,7 @@ class ProtocolObserverNode(Node):
                     message.stamp.sec + message.stamp.nanosec / 1e9, timezone.utc
                 ),
                 mission_id=message.mission_id,
+                robot_id=message.robot_id,
                 protocol=message.protocol,
                 direction=message.direction,
                 event=message.event,

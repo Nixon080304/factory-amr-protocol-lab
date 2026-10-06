@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "mission_coordinator/navigation_adapter.hpp"
+#include "mission_coordinator/robot_context.hpp"
 
 namespace mission_coordinator {
 NavigationAdapter::NavigationAdapter(rclcpp::Node *node) {
-  client_ = rclcpp_action::create_client<Nav>(node, "/navigate_to_pose");
-  local_ = node->create_client<Clear>("/local_costmap/clear_entirely_local_costmap");
-  global_ = node->create_client<Clear>("/global_costmap/clear_entirely_global_costmap");
+  client_ = rclcpp_action::create_client<Nav>(node, RobotContext::navigation_action);
+  local_ = node->create_client<Clear>(RobotContext::local_costmap);
+  global_ = node->create_client<Clear>(RobotContext::global_costmap);
 }
 void NavigationAdapter::navigate(const geometry_msgs::msg::PoseStamped &pose,
                                  std::function<void(bool)> done) {
@@ -73,15 +74,15 @@ void NavigationAdapter::clear_costmaps(
     }
   };
   try {
-    local_->async_send_request(std::make_shared<Clear::Request>(),
-                               [callback](rclcpp::Client<Clear>::SharedFuture future) {
-                                 callback("/local_costmap/clear_entirely_local_costmap",
-                                          future);
-                               });
+    local_->async_send_request(
+        std::make_shared<Clear::Request>(),
+        [this, callback](rclcpp::Client<Clear>::SharedFuture future) {
+          callback(local_->get_service_name(), future);
+        });
     global_->async_send_request(
         std::make_shared<Clear::Request>(),
-        [callback](rclcpp::Client<Clear>::SharedFuture future) {
-          callback("/global_costmap/clear_entirely_global_costmap", future);
+        [this, callback](rclcpp::Client<Clear>::SharedFuture future) {
+          callback(global_->get_service_name(), future);
         });
   } catch (const std::exception &) {
     ++generation_;

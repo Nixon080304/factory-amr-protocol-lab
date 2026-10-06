@@ -37,6 +37,9 @@ install(TARGETS mission_ros mission_coordinator ARCHIVE DESTINATION lib LIBRARY 
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_robot_context test/test_robot_context.cpp)
+  target_include_directories(test_robot_context PRIVATE include)
+  ament_target_dependencies(test_robot_context rclcpp)
   ament_add_gtest(test_mission_state_machine test/test_mission_state_machine.cpp)
   target_link_libraries(test_mission_state_machine mission_state_machine)
   find_package(rosgraph_msgs REQUIRED)

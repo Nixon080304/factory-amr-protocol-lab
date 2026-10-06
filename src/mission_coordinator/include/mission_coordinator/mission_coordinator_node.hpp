@@ -15,6 +15,7 @@
 #include <std_msgs/msg/string.hpp>
 #include "mission_coordinator/navigation_adapter.hpp"
 #include "mission_coordinator/mission_state_machine.hpp"
+#include "mission_coordinator/robot_context.hpp"
 
 namespace mission_coordinator {
 class MissionCoordinatorNode : public rclcpp::Node {
@@ -50,6 +51,7 @@ private:
   std::string state_name() const;
   std::string phase(const std::string &prefix) const;
   MissionStateMachine machine_;
+  const RobotContext robot_;
   NavigationAdapter navigation_;
   rclcpp_action::Server<Mission>::SharedPtr server_;
   std::shared_ptr<Handle> goal_;

@@ -48,6 +48,7 @@ protected:
 
 class CoordinatorTest : public testing::Test {
 protected:
+  virtual std::string robot_id() const { return "amr_01"; }
   static void SetUpTestSuite() { rclcpp::init(0, nullptr); }
   static void TearDownTestSuite() { rclcpp::shutdown(); }
   void SetUp() override {
@@ -55,14 +56,18 @@ protected:
       rclcpp::init(0, nullptr);
     }
     coordinator = std::make_shared<DispatchBoundaryNode>(
-        rclcpp::NodeOptions().parameter_overrides(
-            {{"use_sim_time", true}, {"perception_timeout_sec", 2.0}}));
-    peer = std::make_shared<rclcpp::Node>("mission_test_peers");
+        rclcpp::NodeOptions()
+            .arguments({"--ros-args", "-r", "__ns:=/" + robot_id()})
+            .parameter_overrides({{"use_sim_time", true},
+                                  {"robot_id", robot_id()},
+                                  {"frame_prefix", robot_id() + "/"},
+                                  {"perception_timeout_sec", 2.0}}));
+    peer = std::make_shared<rclcpp::Node>("mission_test_peers", "/" + robot_id());
     clock_pub = peer->create_publisher<rosgraph_msgs::msg::Clock>("/clock", 10);
     pose_pub = peer->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
-        "/amcl_pose", rclcpp::SensorDataQoS());
+        "amcl_pose", rclcpp::SensorDataQoS());
     detection_pub = peer->create_publisher<factory_interfaces::msg::StationDetection>(
-        "/factory/station_detection", rclcpp::SensorDataQoS());
+        "factory/station_detection", rclcpp::SensorDataQoS());
     fault_pub = peer->create_publisher<factory_interfaces::msg::FaultCommand>(
         "/factory/faults/commands", 100);
     fault_ack_sub = peer->create_subscription<factory_interfaces::msg::FaultCommand>(
@@ -76,12 +81,12 @@ protected:
           events.push_back(*event);
         });
     states_sub = peer->create_subscription<std_msgs::msg::String>(
-        "/factory/mission_state", rclcpp::QoS(100).reliable(),
+        "factory/mission_state", rclcpp::QoS(100).reliable(),
         [this](std_msgs::msg::String::SharedPtr message) {
           states.push_back(message->data);
         });
     nav = rclcpp_action::create_server<Nav>(
-        peer, "/navigate_to_pose",
+        peer, "navigate_to_pose",
         [](auto, auto) { return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE; },
         [](auto) { return rclcpp_action::CancelResponse::ACCEPT; },
         [this](auto handle) {
@@ -97,8 +102,8 @@ protected:
             }
           }
         });
-    for (const auto &name : {"/local_costmap/clear_entirely_local_costmap",
-                             "/global_costmap/clear_entirely_global_costmap"}) {
+    for (const auto &name : {"local_costmap/clear_entirely_local_costmap",
+                             "global_costmap/clear_entirely_global_costmap"}) {
       clears.push_back(peer->create_service<nav2_msgs::srv::ClearEntireCostmap>(
           name, [this](std::shared_ptr<nav2_msgs::srv::ClearEntireCostmap::Request>,
                        std::shared_ptr<nav2_msgs::srv::ClearEntireCostmap::Response>) {
@@ -122,15 +127,19 @@ protected:
           response->message = "fake PLC completion";
           transfer->send_response(*header, *response);
         });
-    client = rclcpp_action::create_client<Mission>(peer, "/factory/execute_mission");
+    client = rclcpp_action::create_client<Mission>(peer, "factory/execute_mission");
     executor.add_node(coordinator);
     executor.add_node(peer);
     ASSERT_TRUE(client->wait_for_action_server(2s));
     pump(20);
   }
   void TearDown() override {
-    executor.remove_node(coordinator);
-    executor.remove_node(peer);
+    if (coordinator) {
+      executor.remove_node(coordinator);
+    }
+    if (peer) {
+      executor.remove_node(peer);
+    }
     coordinator.reset();
     peer.reset();
   }
@@ -155,6 +164,8 @@ protected:
       pose_pub->publish(pose);
       if (detect && !feedback.empty() && feedback.back().find("VERIFYING") == 0) {
         factory_interfaces::msg::StationDetection detection;
+        detection.header.frame_id =
+            camera_frame.empty() ? robot_id() + "/camera_optical_frame" : camera_frame;
         detection.header.stamp = stamp;
         if (repeated_stamp < 0) {
           detection.header.stamp.sec = -1;
@@ -271,6 +282,7 @@ protected:
   std::string hold_transfer_station;
   std::shared_ptr<rmw_request_id_t> pending_transfer;
   double repeated_stamp = 0;
+  std::string camera_frame;
 };
 
 TEST_F(CoordinatorTest, ValidMissionCompletesWithOrderedFeedbackAndPhases) {
@@ -281,6 +293,9 @@ TEST_F(CoordinatorTest, ValidMissionCompletesWithOrderedFeedbackAndPhases) {
   EXPECT_TRUE(result.result->success);
   EXPECT_EQ(result.result->final_state, "COMPLETED");
   EXPECT_EQ(transfers.size(), 2u);
+  for (const auto &request : transfers) {
+    EXPECT_EQ(request.robot_id, "amr_01");
+  }
   pump(10);
   const std::vector<std::string> expected = {"RECEIVED",
                                              "NAVIGATING_TO_PICKUP",
@@ -293,6 +308,7 @@ TEST_F(CoordinatorTest, ValidMissionCompletesWithOrderedFeedbackAndPhases) {
   EXPECT_EQ(states, expected);
   std::vector<std::string> event_states;
   for (const auto &e : events) {
+    EXPECT_EQ(e.robot_id, "amr_01");
     if (e.event == "state_changed") {
       event_states.push_back(e.detail);
     }
@@ -313,6 +329,7 @@ TEST_F(CoordinatorTest, ValidMissionCompletesWithOrderedFeedbackAndPhases) {
             1);
 }
 TEST_F(CoordinatorTest, RejectsInvalidAndBusyGoals) {
+  EXPECT_EQ(send("missing_robot", ""), nullptr);
   EXPECT_EQ(send("bad", "other"), nullptr);
   EXPECT_EQ(send("bad", "amr_01", "inspection"), nullptr);
   EXPECT_EQ(send("bad", "amr_01", "assembly", "assembly"), nullptr);
@@ -324,6 +341,98 @@ TEST_F(CoordinatorTest, RejectsInvalidAndBusyGoals) {
   pump(10);
   EXPECT_TRUE(std::any_of(events.begin(), events.end(), [](auto e) {
     return e.mission_id == "second" && e.detail == "ROBOT_BUSY";
+  }));
+}
+
+class SecondCoordinatorTest : public CoordinatorTest {
+protected:
+  std::string robot_id() const override { return "amr_02"; }
+};
+
+TEST_F(SecondCoordinatorTest, ExecutesOnlyItsAssignedRobotAndCorrelatesEvents) {
+  EXPECT_EQ(send("wrong_robot", "amr_01"), nullptr);
+  auto handle = send("second_robot", "amr_02");
+  ASSERT_NE(handle, nullptr);
+  EXPECT_TRUE(finish(handle).result->success);
+  EXPECT_EQ(target.header.frame_id, "map");
+  ASSERT_EQ(transfers.size(), 2u);
+  for (const auto &request : transfers) {
+    EXPECT_EQ(request.robot_id, "amr_02");
+  }
+  pump(10);
+  ASSERT_FALSE(events.empty());
+  for (const auto &message : events) {
+    EXPECT_EQ(message.robot_id, "amr_02");
+  }
+}
+
+TEST_F(CoordinatorTest, TwoProductionStacksExposeDistinctRobotLocalEndpoints) {
+  auto second = std::make_shared<mission_coordinator::MissionCoordinatorNode>(
+      rclcpp::NodeOptions()
+          .arguments({"--ros-args", "-r", "__ns:=/amr_02"})
+          .parameter_overrides({{"robot_id", "amr_02"}, {"frame_prefix", "amr_02/"}}));
+  executor.add_node(second);
+  pump(30);
+  for (const std::string robot : {"amr_01", "amr_02"}) {
+    const std::string ns = "/" + robot;
+    for (const std::string topic : {"amcl_pose", "factory/station_detection"}) {
+      const auto subscriptions =
+          peer->get_subscriptions_info_by_topic(ns + "/" + topic);
+      ASSERT_EQ(subscriptions.size(), 1u);
+      EXPECT_EQ(subscriptions.front().node_name(), "mission_coordinator");
+      EXPECT_EQ(subscriptions.front().node_namespace(), ns);
+    }
+    const auto services =
+        peer->get_service_names_and_types_by_node("mission_coordinator", ns);
+    EXPECT_EQ(services.count(ns + "/factory/execute_mission/_action/send_goal"), 1u);
+    const auto clients =
+        peer->get_node_graph_interface()->get_client_names_and_types_by_node(
+            "mission_coordinator", ns);
+    for (const std::string suffix : {"navigate_to_pose/_action/send_goal",
+                                     "local_costmap/clear_entirely_local_costmap",
+                                     "global_costmap/clear_entirely_global_costmap"}) {
+      EXPECT_EQ(clients.count(ns + "/" + suffix), 1u);
+    }
+    EXPECT_EQ(clients.count("/factory/transfer_part"), 1u);
+  }
+  EXPECT_THROW(coordinator->set_parameter({"robot_id", "amr_02"}),
+               rclcpp::exceptions::ParameterImmutableException);
+  EXPECT_THROW(coordinator->set_parameter({"frame_prefix", "amr_02/"}),
+               rclcpp::exceptions::ParameterImmutableException);
+  executor.remove_node(second);
+}
+
+TEST_F(CoordinatorTest, FaultEventsCarryLocalIdentity) {
+  configure_fault("nav_reject_once");
+  ASSERT_TRUE(finish(send()).result->success);
+  pump(10);
+  EXPECT_TRUE(std::any_of(events.begin(), events.end(), [](const auto &message) {
+    return message.protocol == "FAULT" && message.robot_id == "amr_01";
+  }));
+}
+
+TEST_F(CoordinatorTest, ForeignCameraFrameNeverContactsSharedStation) {
+  camera_frame = "amr_02/camera_optical_frame";
+  EXPECT_EQ(finish(send()).result->error_code, "STATION_NOT_CONFIRMED");
+  EXPECT_TRUE(transfers.empty());
+}
+
+TEST_F(CoordinatorTest, FaultForAnotherRobotDoesNotRejectLocalNavigation) {
+  factory_interfaces::msg::FaultCommand command;
+  command.owner = "mission_coordinator";
+  command.robot_id = "amr_02";
+  command.name = "nav_reject_twice";
+  command.mission_id = "test";
+  command.station = "assembly";
+  command.activation_point = "navigation_start";
+  command.duration = 10.0;
+  command.one_shot = true;
+  fault_pub->publish(command);
+  pump(10);
+  ASSERT_TRUE(finish(send()).result->success);
+  EXPECT_EQ(clear_count, 0);
+  EXPECT_FALSE(std::any_of(events.begin(), events.end(), [](const auto &message) {
+    return message.event == "fault_activated";
   }));
 }
 TEST_F(CoordinatorTest, CompletedPayloadRequiresRestartBeforeAnotherExecution) {
@@ -481,6 +590,14 @@ TEST_F(CoordinatorTest, ClearsBothCostmapsBeforeSoleRetry) {
   EXPECT_EQ(clear_count, 2);
   EXPECT_EQ(nav_handles.size(), 3u);
   EXPECT_EQ(clears_on_navigation, (std::vector<int>{0, 2, 2}));
+  pump(10);
+  for (const std::string suffix : {"local_costmap/clear_entirely_local_costmap",
+                                   "global_costmap/clear_entirely_global_costmap"}) {
+    EXPECT_TRUE(std::any_of(events.begin(), events.end(), [&](const auto &message) {
+      return message.event == "costmap_cleared" &&
+             message.detail == "{\"service\":\"/amr_01/" + suffix + "\"}";
+    }));
+  }
 }
 TEST_F(CoordinatorTest, SecondNavigationFailureIsTerminal) {
   fail_navigation = 2;

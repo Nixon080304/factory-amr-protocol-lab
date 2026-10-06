@@ -135,24 +135,23 @@ def scenario_matrix_markdown(outcomes: Sequence[dict]) -> str:
 
 
 def _duration_ms(phase: str, events: Sequence[ProtocolEventRecord]) -> Optional[float]:
-    start = None
+    starts = {}
     total = 0.0
     pairs = 0
     for event in events:
         if event.event == f"{phase}_started":
-            if start is not None:
+            if event.robot_id in starts:
                 return None
-            start = event.stamp
+            starts[event.robot_id] = event.stamp
         elif event.event == f"{phase}_finished":
-            if start is None:
+            if event.robot_id not in starts:
                 return None
-            elapsed = (event.stamp - start).total_seconds() * 1000
+            elapsed = (event.stamp - starts.pop(event.robot_id)).total_seconds() * 1000
             if elapsed < 0:
                 return None
             total += elapsed
             pairs += 1
-            start = None
-    return total if pairs and start is None else None
+    return total if pairs and not starts else None
 
 
 def _markdown_text(value: str) -> str:
@@ -210,6 +209,13 @@ class MissionReport:
             "# Mission report",
             "",
             f"Mission ID: {_markdown_text(self.mission_id)}",
+            "Robot IDs: "
+            + ", ".join(
+                _markdown_text(robot_id)
+                for robot_id in sorted(
+                    {event.robot_id for event in self.events if event.robot_id}
+                )
+            ),
             "",
             "| Metric | Value |",
             "| --- | --- |",

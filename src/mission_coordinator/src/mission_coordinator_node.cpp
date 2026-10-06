@@ -8,8 +8,23 @@
 #include <sstream>
 
 namespace mission_coordinator {
+namespace {
+RobotContext local_robot(rclcpp::Node *node) {
+  rcl_interfaces::msg::ParameterDescriptor identity;
+  identity.read_only = true;
+  const auto id = node->declare_parameter<std::string>("robot_id", "amr_01", identity);
+  const bool namespaced = std::string(node->get_namespace()) != "/";
+  const auto prefix = node->declare_parameter<std::string>(
+      "frame_prefix", namespaced ? id + "/" : "", identity);
+  if (namespaced && prefix.empty()) {
+    throw std::invalid_argument("namespaced robots require a nonempty frame_prefix");
+  }
+  return RobotContext(id, prefix);
+}
+} // namespace
 MissionCoordinatorNode::MissionCoordinatorNode(const rclcpp::NodeOptions &options)
-    : Node("mission_coordinator", options), navigation_(this) {
+    : Node("mission_coordinator", options), robot_(local_robot(this)),
+      navigation_(this) {
   if (!has_parameter("use_sim_time")) {
     declare_parameter("use_sim_time", true);
   } else {
@@ -41,11 +56,11 @@ MissionCoordinatorNode::MissionCoordinatorNode(const rclcpp::NodeOptions &option
       [this](factory_interfaces::msg::FaultCommand::SharedPtr message) {
         fault_command(*message);
       });
-  states_ = create_publisher<std_msgs::msg::String>("/factory/mission_state",
+  states_ = create_publisher<std_msgs::msg::String>(RobotContext::state_topic,
                                                     rclcpp::QoS(100).reliable());
   transfer_client_ = create_client<Transfer>("/factory/transfer_part");
   localization_ = create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
-      "/amcl_pose", rclcpp::SensorDataQoS(),
+      RobotContext::pose_topic, rclcpp::SensorDataQoS(),
       [this](geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr message) {
         const auto &p = message->pose.pose;
         if (message->header.stamp.sec < 0 ||
@@ -56,30 +71,32 @@ MissionCoordinatorNode::MissionCoordinatorNode(const rclcpp::NodeOptions &option
         const double stamp = rclcpp::Time(message->header.stamp).seconds();
         // A sensor can arrive before the matching /clock update. Keep one
         // current-leg candidate; localized() still forbids future evidence.
-        pose_valid_ =
-            goal_ && stamp >= localization_started_ &&
-            message->header.frame_id == "map" && std::isfinite(p.position.x) &&
-            std::isfinite(p.position.y) && std::isfinite(p.position.z) &&
-            std::isfinite(p.orientation.x) && std::isfinite(p.orientation.y) &&
-            std::isfinite(p.orientation.z) && std::isfinite(p.orientation.w) &&
-            std::abs(p.orientation.x * p.orientation.x +
-                     p.orientation.y * p.orientation.y +
-                     p.orientation.z * p.orientation.z +
-                     p.orientation.w * p.orientation.w - 1.0) < 0.01;
+        pose_valid_ = goal_ && stamp >= localization_started_ &&
+                      message->header.frame_id == RobotContext::map_frame &&
+                      std::isfinite(p.position.x) && std::isfinite(p.position.y) &&
+                      std::isfinite(p.position.z) && std::isfinite(p.orientation.x) &&
+                      std::isfinite(p.orientation.y) &&
+                      std::isfinite(p.orientation.z) &&
+                      std::isfinite(p.orientation.w) &&
+                      std::abs(p.orientation.x * p.orientation.x +
+                               p.orientation.y * p.orientation.y +
+                               p.orientation.z * p.orientation.z +
+                               p.orientation.w * p.orientation.w - 1.0) < 0.01;
         pose_ = p;
         pose_stamp_ = stamp;
       });
   detections_ = create_subscription<factory_interfaces::msg::StationDetection>(
-      "/factory/station_detection", rclcpp::SensorDataQoS(),
+      RobotContext::detection_topic, rclcpp::SensorDataQoS(),
       [this](factory_interfaces::msg::StationDetection::SharedPtr message) {
         queue_detection(*message);
       });
   server_ = rclcpp_action::create_server<Mission>(
-      this, "/factory/execute_mission",
+      this, RobotContext::mission_action,
       [this](auto, auto request) {
         std::string error;
         if (!std::regex_match(request->mission_id, std::regex("[A-Za-z0-9_-]{1,64}")) ||
-            request->robot_id != "amr_01" || request->pickup_station != "assembly" ||
+            !robot_.accepts_robot(request->robot_id) ||
+            request->pickup_station != "assembly" ||
             request->dropoff_station != "inspection" || request->part != "motor") {
           error = "INVALID_MISSION";
         } else if (reserved_) {
@@ -156,6 +173,7 @@ void MissionCoordinatorNode::event(const std::string &name, const std::string &o
   message.stamp = now();
   message.mission_id =
       mission.empty() && goal_ ? goal_->get_goal()->mission_id : mission;
+  message.robot_id = robot_.robot_id;
   message.protocol = "ROS";
   message.direction = "INTERNAL";
   message.event = name;
@@ -196,7 +214,7 @@ void MissionCoordinatorNode::navigate() {
   localization_started_ = phase_started_;
   auto coordinates = poses_.at(machine_.current_station());
   geometry_msgs::msg::PoseStamped pose;
-  pose.header.frame_id = "map";
+  pose.header.frame_id = RobotContext::map_frame;
   pose.header.stamp = now();
   pose.pose.position.x = coordinates[0];
   pose.pose.position.y = coordinates[1];
@@ -265,6 +283,7 @@ void MissionCoordinatorNode::fault_event(
   factory_interfaces::msg::ProtocolEvent message;
   message.stamp = now();
   message.mission_id = control.mission_id;
+  message.robot_id = robot_.robot_id;
   message.protocol = "FAULT";
   message.direction = "INTERNAL";
   message.event = name;
@@ -275,6 +294,9 @@ void MissionCoordinatorNode::fault_event(
 }
 void MissionCoordinatorNode::fault_command(
     const factory_interfaces::msg::FaultCommand &message) {
+  if (!message.robot_id.empty() && !robot_.accepts_robot(message.robot_id)) {
+    return;
+  }
   if (!message.owner.empty() && message.owner != "mission_coordinator") {
     return;
   }
@@ -306,6 +328,7 @@ void MissionCoordinatorNode::fault_command(
   factory_interfaces::msg::FaultCommand ack;
   ack.command_id = message.command_id;
   ack.owner = "mission_coordinator";
+  ack.robot_id = robot_.robot_id;
   ack.acknowledged = true;
   fault_acks_->publish(ack);
 }
@@ -390,7 +413,9 @@ void MissionCoordinatorNode::queue_detection(
   }
   received_stamp_ = stamp;
   const int marker = machine_.current_station() == "assembly" ? 10 : 20;
-  if (message.station_id != machine_.current_station() || message.marker_id != marker) {
+  if ((!message.header.frame_id.empty() &&
+       message.header.frame_id != robot_.local_frame("camera_optical_frame")) ||
+      message.station_id != machine_.current_station() || message.marker_id != marker) {
     last_stamp_ = stamp;
     clear();
     return;
@@ -472,6 +497,7 @@ void MissionCoordinatorNode::transfer() {
   }
   auto request = std::make_shared<Transfer::Request>();
   request->mission_id = machine_.mission().mission_id;
+  request->robot_id = robot_.robot_id;
   request->station_id = machine_.current_station();
   request->part = machine_.mission().part;
   const auto generation = mission_generation_;

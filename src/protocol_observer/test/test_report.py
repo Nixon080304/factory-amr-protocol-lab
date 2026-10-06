@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from dataclasses import replace
 
 import pytest
 
@@ -73,6 +74,30 @@ def test_timestamp_then_sequence_order_controls_ties():
     )
     assert [item.sequence for item in report.events] == [9, 1, 2, 3]
     assert report.final_outcome == "COMPLETED"
+
+
+def test_phase_finish_from_other_robot_cannot_complete_first_robot_phase():
+    report = MissionReport.from_events(
+        "M-001",
+        [
+            replace(event(1, "navigation_pickup_started"), robot_id="amr_01"),
+            replace(event(3, "navigation_pickup_finished"), robot_id="amr_02"),
+        ],
+    )
+    assert report.durations_ms["navigation_pickup"] is None
+
+
+def test_interleaved_robot_phases_keep_independent_start_stamps():
+    report = MissionReport.from_events(
+        "M-001",
+        [
+            replace(event(1, "navigation_pickup_started"), robot_id="amr_01"),
+            replace(event(2, "navigation_pickup_started"), robot_id="amr_02"),
+            replace(event(4, "navigation_pickup_finished"), robot_id="amr_01"),
+            replace(event(6, "navigation_pickup_finished"), robot_id="amr_02"),
+        ],
+    )
+    assert report.durations_ms["navigation_pickup"] == 7000.0
 
 
 def test_failed_report_counts_retries_and_retains_missing_phases():

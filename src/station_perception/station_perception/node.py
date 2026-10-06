@@ -23,8 +23,8 @@ from station_perception.detector import ArucoStationDetector
 
 
 class StationDetectorNode(Node):
-    def __init__(self):
-        super().__init__("station_detector")
+    def __init__(self, **kwargs):
+        super().__init__("station_detector", **kwargs)
         if not self.has_parameter("use_sim_time"):
             self.declare_parameter("use_sim_time", True)
         elif not self.get_parameter("use_sim_time").value:
@@ -48,10 +48,10 @@ class StationDetectorNode(Node):
         self._detector = ArucoStationDetector(mapping)
         self._bridge = CvBridge()
         self._publisher = self.create_publisher(
-            StationDetection, "/factory/station_detection", 10
+            StationDetection, "factory/station_detection", 10
         )
         self._subscription = self.create_subscription(
-            Image, "/camera/image_raw", self._on_image, qos_profile_sensor_data
+            Image, "camera/image_raw", self._on_image, qos_profile_sensor_data
         )
 
     def _on_image(self, image: Image):
