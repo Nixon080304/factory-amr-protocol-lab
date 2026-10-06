@@ -52,6 +52,8 @@ route_segments:
       exit_pose: [-1.5, -2.2, 3.141592653589793]
 
 docks:
+  # Staging is outside dock ownership. Agents require fresh, independently
+  # confirmed Bool contact on /<namespace>/factory/dock_contact to charge.
   dock_01:
     staging_pose: [3.5, -2.0, 0.0]
     charging_pose: [4.0, -2.0, 0.0]

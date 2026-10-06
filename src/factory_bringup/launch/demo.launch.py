@@ -76,6 +76,7 @@ def generate_launch_description():
                         "amcl_pose",
                         "factory/mission_state",
                         "compute_path_to_pose",
+                        "navigate_to_pose",
                     )
                 ],
             ),

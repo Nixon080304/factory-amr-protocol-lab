@@ -76,3 +76,4 @@ def test_demo_routes_gateway_through_fleet_and_configured_robot(
         "compute_path_to_pose",
         "/compute_path_to_pose",
     ) in agent.expanded_remapping_rules
+    assert ("navigate_to_pose", "/navigate_to_pose") in agent.expanded_remapping_rules

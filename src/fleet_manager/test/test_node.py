@@ -44,6 +44,184 @@ def request(mission_id="m1", pin=None):
     return MissionRequest(mission_id, "assembly", "inspection", "motor", pin)
 
 
+def test_charging_action_endpoint_uses_configured_namespace(rig):
+    api, adapter, *_ = rig
+    robot = replace(
+        adapter.config.robots[0], robot_id="forklift", namespace="/floor/cart"
+    )
+    assert api.robot_endpoints(robot).get("dock") == "/floor/cart/factory/dock_robot"
+
+
+def test_ros_dock_goal_serializes_config_and_fences_failed_result(rig):
+    from factory_interfaces.action import DockRobot
+    from fleet_manager.node import FleetManagerNode
+    from rclpy.task import Future
+    from types import SimpleNamespace
+
+    _, adapter, _, _, _ = rig
+    assert hasattr(adapter.core, "queue_charging"), "fleet charging is missing"
+    adapter.observe(RobotSnapshot("amr_01", "AVAILABLE", Pose2D(0, 0, 0), 20, "EMPTY"))
+    charge = adapter.core.queue_charging(adapter.config.energy, 100)[0]
+    node = object.__new__(FleetManagerNode)
+    node.adapter = adapter
+    response, completed, goals, replies = Future(), Future(), [], []
+
+    def send(goal, feedback_callback):
+        goals.append(goal)
+        return response
+
+    node.docks = {
+        "amr_01": SimpleNamespace(server_is_ready=lambda: True, send_goal_async=send)
+    }
+    node.send_dock_goal(
+        "amr_01", charge, lambda _: None, replies.append, lambda *_: None
+    )
+    assert goals[0].dock_id == "dock_01" and goals[0].target_percent == 80.0
+    assert goals[0].staging_pose.header.frame_id == "amr_01/map"
+    assert goals[0].staging_pose.pose.position.x == 3.5
+    assert goals[0].charging_pose.pose.position.x == 4.0
+    response.set_result(
+        SimpleNamespace(accepted=True, get_result_async=lambda: completed)
+    )
+    completed.set_result(
+        SimpleNamespace(
+            status=6, result=DockRobot.Result(success=False, error_code="CONTACT_LOST")
+        )
+    )
+    assert len(replies) == 1 and not replies[0].success
+    assert replies[0].error_code == "CONTACT_LOST"
+
+
+def test_manager_restart_rejects_dock_reacquire_from_existing_charging_robot(rig):
+    from types import SimpleNamespace
+
+    _, adapter, _, _, _ = rig
+    adapter.observe(RobotSnapshot("amr_01", "CHARGING", Pose2D(4, -2, 0), 20, "EMPTY"))
+    response = adapter.resource(
+        "acquire",
+        SimpleNamespace(
+            robot_id="amr_01", mission_id="dock-old", resource_id="dock_01"
+        ),
+    )
+    assert response["granted"] is False
+    assert response["reason"] == "dock charging not authorized"
+
+
+@pytest.mark.parametrize("mode", ["CHARGING", "AVAILABLE"])
+def test_manager_restart_never_grants_an_occupied_dock_to_other_robot(rig, mode):
+    from types import SimpleNamespace
+
+    _, adapter, _, _, _ = rig
+    adapter.observe(RobotSnapshot("amr_01", mode, Pose2D(4, -2, 0), 50, "EMPTY"))
+    adapter.observe(RobotSnapshot("amr_02", "AVAILABLE", Pose2D(1, -3, 0), 20, "EMPTY"))
+    adapter.core.queue_charging(adapter.config.energy, 100)
+    response = adapter.resource(
+        "acquire",
+        SimpleNamespace(
+            robot_id="amr_02", mission_id="dock-new", resource_id="dock_01"
+        ),
+    )
+    assert response["granted"] is False
+    assert response["reason"] == "dock reconciliation required"
+
+
+def test_restart_occupied_robot_never_receives_mission_even_above_charge_threshold(rig):
+    _, adapter, _, _, _ = rig
+    adapter.observe(RobotSnapshot("amr_01", "AVAILABLE", Pose2D(4, -2, 0), 50, "EMPTY"))
+    adapter.core.submit(request(pin="amr_01"), 100)
+    decision = adapter.core.assign("m1", {"amr_01": CostEstimate(True, 1, 40)}, 100)
+    assert decision.robot_id is None
+
+
+def test_safe_dock_cancel_releases_fleet_reservation_and_fences_late_callback(rig):
+    from types import SimpleNamespace
+
+    api, adapter, _, robots, _ = rig
+    goals = []
+
+    def start(robot_id, charge, feedback, result, accepted):
+        goals.append(SimpleNamespace(charge=charge, feedback=feedback, result=result))
+        accepted(goals[-1], "")
+
+    robots.send_dock_goal = start
+    adapter.observe(RobotSnapshot("amr_01", "AVAILABLE", Pose2D(0, -3, 0), 20, "EMPTY"))
+    adapter.tick()
+    adapter.tick()
+    goals[0].result(api.RobotReply(False, "CANCELLED", cancelled=True))
+    adapter.observe(RobotSnapshot("amr_01", "AVAILABLE", Pose2D(0, -3, 0), 80, "EMPTY"))
+    adapter.tick()
+    assert adapter.core.charging_snapshot() == ()
+    goals[0].feedback(api.RobotFeedback("CHARGING"))
+    goals[0].result(api.RobotReply(False, "LEASE_LOST"))
+    adapter.tick()
+    assert adapter.core.charging_snapshot() == ()
+
+
+def test_shared_staging_admits_next_robot_only_after_head_confirms_charging(rig):
+    from types import SimpleNamespace
+
+    api, adapter, _, robots, _ = rig
+    goals = []
+
+    def start(robot_id, charge, feedback, result, accepted):
+        goal = SimpleNamespace(robot_id=robot_id, feedback=feedback, result=result)
+        goals.append(goal)
+        accepted(goal, "")
+
+    robots.send_dock_goal = start
+    for robot_id in ("amr_02", "amr_01"):
+        adapter.observe(
+            RobotSnapshot(robot_id, "AVAILABLE", Pose2D(0, -3, 0), 20, "EMPTY")
+        )
+    adapter.tick()
+    adapter.tick()
+    assert [goal.robot_id for goal in goals] == ["amr_01"]
+    assert [charge.robot_id for charge in adapter.core.charging_snapshot()] == [
+        "amr_01",
+        "amr_02",
+    ]
+    goals[0].feedback(api.RobotFeedback("ENTERING"))
+    adapter.tick()
+    assert len(goals) == 1
+    goals[0].feedback(api.RobotFeedback("CHARGING"))
+    adapter.tick()
+    assert [goal.robot_id for goal in goals] == ["amr_01", "amr_02"]
+
+
+def test_delayed_charging_heartbeat_after_confirmed_exit_does_not_block_handoff(rig):
+    from types import SimpleNamespace
+
+    api, adapter, _, robots, _ = rig
+    goals = []
+
+    def start(robot_id, charge, feedback, result, accepted):
+        goal = SimpleNamespace(feedback=feedback, result=result)
+        goals.append(goal)
+        accepted(goal, "")
+
+    robots.send_dock_goal = start
+    for robot_id in ("amr_01", "amr_02"):
+        adapter.observe(
+            RobotSnapshot(robot_id, "AVAILABLE", Pose2D(0, -3, 0), 20, "EMPTY")
+        )
+    adapter.tick()
+    goals[0].feedback(api.RobotFeedback("CHARGING"))
+    adapter.tick()
+    goals[0].result(api.RobotReply(True))
+    adapter.observe(
+        RobotSnapshot("amr_01", "AVAILABLE", Pose2D(3.5, -2, 0), 80, "EMPTY")
+    )
+    adapter.tick()
+    adapter.observe(RobotSnapshot("amr_01", "CHARGING", Pose2D(4, -2, 0), 79, "EMPTY"))
+    response = adapter.resource(
+        "acquire",
+        SimpleNamespace(
+            robot_id="amr_02", mission_id="dock-next", resource_id="dock_01"
+        ),
+    )
+    assert response["granted"] is True
+
+
 def test_cancel_resource_wait_removes_only_exact_waiter_without_releasing_owner(rig):
     from types import SimpleNamespace
 
@@ -806,6 +984,7 @@ def test_names_derive_from_namespace_even_when_robot_id_differs(rig):
         "action": "/warehouse/cart/factory/execute_mission",
         "cost": "/warehouse/cart/factory/estimate_mission_cost",
         "state": "/warehouse/cart/factory/robot_state",
+        "dock": "/warehouse/cart/factory/dock_robot",
     }
 
 

@@ -117,23 +117,70 @@ class AgentAdapter:
         self._phase = ""
         self._lease_until = 0.0
         self._dock_contact = False
+        self._dock_geometry = None
+        self._dock_key = None
+        self._dock_contact_until = float("inf")
         self._cache = OrderedDict()
 
-    def set_charge_authorization(self, *, lease_until, contact):
+    def configure_dock(self, dock_id, pose, tolerance, yaw_tolerance):
+        self._dock_geometry = (dock_id, tuple(pose), tolerance, yaw_tolerance)
+
+    def begin_docking(self, key):
+        self._advance()
+        self._dock_key = key
+        self.mode = "DOCKING"
+
+    def end_docking(self, recovery):
+        self._advance()
+        self._dock_key = None
+        self.mode = "RECOVERY_REQUIRED" if recovery else "AVAILABLE"
+
+    def set_charge_authorization(
+        self, *, lease_until, contact, lease_key=None, contact_until=float("inf")
+    ):
         deadline = nonnegative(lease_until, "lease_until")
         if type(contact) is not bool:
             raise ValueError("contact must be bool")
         self._advance()
+        if self._dock_geometry:
+            matches = (
+                self._dock_key is not None
+                and lease_key is not None
+                and lease_key.robot_id == self.robot_id
+                and lease_key.mission_id == self._dock_key.mission_id
+                and lease_key.resource_id == self._dock_geometry[0]
+                and lease_key.lease_id == self._dock_key.lease_id
+                and bool(lease_key.lease_id)
+            )
+            if not matches:
+                deadline, contact = 0.0, False
         self._lease_until = deadline
         self._dock_contact = contact
+        self._dock_contact_until = contact_until
+
+    def charge_authorized(self):
+        if not self._dock_geometry:
+            return False
+        _, target, tolerance, yaw_tolerance = self._dock_geometry
+        return (
+            self._dock_contact
+            and self.pose is not None
+            and math.hypot(self.pose[0] - target[0], self.pose[1] - target[1])
+            <= tolerance
+            and abs(math.remainder(self.pose[2] - target[2], 2 * math.pi))
+            <= yaw_tolerance
+        )
 
     def _advance(self):
         now = self.clock()
         elapsed = max(0.0, now - self._wall)
         # Split at authorization expiry so a long timer gap cannot charge past it.
-        authorized = min(elapsed, max(0.0, self._lease_until - self._wall))
+        deadline = min(self._lease_until, self._dock_contact_until)
+        if self._dock_geometry and self._odom_receipt is not None:
+            deadline = min(deadline, self._odom_receipt + self.stale_sec)
+        authorized = min(elapsed, max(0.0, deadline - self._wall))
         self.energy.advance(
-            authorized, 0, self.mode, lease_valid=True, contact=self._dock_contact
+            authorized, 0, self.mode, lease_valid=True, contact=self.charge_authorized()
         )
         self.energy.advance(elapsed - authorized, 0, self.mode)
         self._wall = max(self._wall, now)
@@ -166,6 +213,7 @@ class AgentAdapter:
         return True
 
     def localization(self, stamp, x, y, yaw, frame):
+        self._advance()
         if (
             not finite_pose((x, y, yaw))
             or type(stamp) not in (int, float)

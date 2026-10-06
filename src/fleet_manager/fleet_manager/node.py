@@ -5,7 +5,13 @@ from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
 from action_msgs.msg import GoalStatus
-from factory_interfaces.action import ExecuteFactoryMission, ExecuteFleetMission
+from factory_interfaces.action import (
+    DockRobot,
+    ExecuteFactoryMission,
+    ExecuteFleetMission,
+)
+from geometry_msgs.msg import PoseStamped
+import math
 from factory_interfaces.msg import RobotState
 from factory_interfaces.srv import (
     AcquireResource,
@@ -71,7 +77,7 @@ class FleetManagerNode(Node):
         self.protocol_group = MutuallyExclusiveCallbackGroup()
         self._waiters = {}
         self._results = {}
-        self.actions, self.costs, self.states = {}, {}, []
+        self.actions, self.costs, self.states, self.docks = {}, {}, [], {}
         self.journal = MissionJournal(journal_path)
         self.adapter = FleetAdapter(config, self.journal, self)
         for robot in config.robots:
@@ -86,6 +92,9 @@ class FleetManagerNode(Node):
                 EstimateMissionCost,
                 endpoints["cost"],
                 callback_group=self.protocol_group,
+            )
+            self.docks[robot.robot_id] = ActionClient(
+                self, DockRobot, endpoints["dock"], callback_group=self.protocol_group
             )
             self.states.append(
                 self.create_subscription(
@@ -321,6 +330,71 @@ class FleetManagerNode(Node):
 
         handle.cancel_goal_async().add_done_callback(cancelled)
 
+    def send_dock_goal(self, robot_id, charge, feedback, result, accepted):
+        client = self.docks[robot_id]
+        if not client.server_is_ready():
+            accepted(None, "dock action unavailable")
+            return
+        robot = next(
+            robot for robot in self.adapter.config.robots if robot.robot_id == robot_id
+        )
+        dock = self.adapter.config.docks[charge.dock_id]
+
+        def pose(value):
+            message = PoseStamped()
+            message.header.frame_id = robot.frame_prefix + "map"
+            message.pose.position.x, message.pose.position.y = (
+                float(value.x),
+                float(value.y),
+            )
+            message.pose.orientation.z, message.pose.orientation.w = (
+                math.sin(value.yaw / 2),
+                math.cos(value.yaw / 2),
+            )
+            return message
+
+        handle = None
+
+        def completed(future):
+            try:
+                outcome = future.result()
+                reply = outcome.result
+                result(
+                    RobotReply(
+                        reply.success and outcome.status == GoalStatus.STATUS_SUCCEEDED,
+                        reply.error_code,
+                        reply.message,
+                        cancelled=outcome.status == GoalStatus.STATUS_CANCELED,
+                    )
+                )
+            except Exception as error:
+                result(RobotReply(False, "DOCK_RESULT_UNKNOWN", str(error)))
+
+        def responded(future):
+            nonlocal handle
+            try:
+                handle = future.result()
+                if not handle.accepted:
+                    accepted(None, "dock goal rejected")
+                    return
+                accepted(handle, "")
+                handle.get_result_async().add_done_callback(completed)
+            except Exception as error:
+                accepted(handle, str(error))
+
+        future = client.send_goal_async(
+            DockRobot.Goal(
+                dock_id=charge.dock_id,
+                staging_pose=pose(dock.staging_pose),
+                charging_pose=pose(dock.charging_pose),
+                target_percent=float(charge.target_percent),
+            ),
+            feedback_callback=lambda message: feedback(
+                RobotFeedback(message.feedback.state, message.feedback.detail)
+            ),
+        )
+        future.add_done_callback(responded)
+
     def _resource(self, operation, request, response):
         try:
             values = self.adapter.resource(operation, request)
@@ -336,6 +410,8 @@ class FleetManagerNode(Node):
     def destroy_node(self):
         self.server.destroy()
         for client in self.actions.values():
+            client.destroy()
+        for client in self.docks.values():
             client.destroy()
         self.journal.close()
         return super().destroy_node()

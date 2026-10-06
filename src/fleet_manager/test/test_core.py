@@ -42,6 +42,63 @@ def robot(robot_id="r1", **changes):
 ESTIMATES = {"r1": CostEstimate(True, 1, 40), "r2": CostEstimate(True, 2, 40)}
 
 
+def test_charging_queue_reserves_idle_low_battery_robots_before_missions(fleet):
+    _, core, _, registry, *_ = fleet
+    policy = EnergyPolicyConfig(20, 30, 80, "dock")
+    registry.observe(robot("r2", battery_percent=20), 100)
+    registry.observe(robot("r1", battery_percent=20), 100)
+    assert hasattr(core, "queue_charging"), (
+        "FleetCore charging reservations are missing"
+    )
+    queued = core.queue_charging(policy, 100)
+    assert [item.robot_id for item in queued] == ["r1", "r2"]
+    assert [item.state for item in queued] == ["CHARGE_QUEUED", "CHARGE_QUEUED"]
+    core.submit(request(), 100)
+    assert core.assign("m1", ESTIMATES, 100).robot_id is None
+    first = queued[0]
+    core.charging_feedback(first.robot_id, first.generation, "CHARGING")
+    core.charging_result(first.robot_id, first.generation, True)
+    registry.observe(robot("r1", battery_percent=80), 100)
+    assert core.assign("m1", ESTIMATES, 100).robot_id == "r1"
+    core.charging_feedback(first.robot_id, first.generation, "CHARGING")
+    assert [item.robot_id for item in core.charging_snapshot()] == ["r2"]
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"mode": "EXECUTING"},
+        {"mode": "RECOVERY_REQUIRED"},
+        {"mode": "DOCKING"},
+        {"mode": "CHARGING"},
+        {"payload_state": "LOADED"},
+        {"payload_state": "UNKNOWN"},
+        {"mission_id": "other"},
+        {"health": "UNHEALTHY"},
+        {"fault": "drive fault"},
+        {"battery_percent": 30},
+    ],
+)
+def test_auto_charging_excludes_busy_payload_and_unhealthy_robots(fleet, changes):
+    _, core, _, registry, *_ = fleet
+    registry.observe(
+        robot("r1", battery_percent=20, **changes)
+        if "battery_percent" not in changes
+        else robot("r1", **changes),
+        100,
+    )
+    assert hasattr(core, "queue_charging"), "FleetCore charging policy is missing"
+    assert core.queue_charging(EnergyPolicyConfig(20, 30, 80, "dock"), 100) == ()
+
+
+def test_active_mission_reservation_prevents_auto_charge_on_late_idle_heartbeat(fleet):
+    _, core, _, registry, *_ = fleet
+    assigned(fleet)
+    registry.observe(robot("r1", battery_percent=20), 101)
+    assert hasattr(core, "queue_charging"), "FleetCore charging policy is missing"
+    assert core.queue_charging(EnergyPolicyConfig(20, 30, 80, "dock"), 101) == ()
+
+
 @pytest.fixture
 def fleet(tmp_path):
     api = core_api()

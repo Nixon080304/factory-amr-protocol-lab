@@ -5,7 +5,7 @@ Transport callbacks only enqueue work. The owning executor thread drains that
 work in tick(), keeping the journal and FleetCore on their creating thread.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import math
 import queue
 import time
@@ -67,6 +67,7 @@ def robot_endpoints(robot):
         "action": base + "execute_mission",
         "cost": base + "estimate_mission_cost",
         "state": base + "robot_state",
+        "dock": base + "dock_robot",
     }
 
 
@@ -144,6 +145,10 @@ class FleetAdapter:
         self._retry_at = {}
         self._path_pending_since = {}
         self._flights = {}
+        self._dock_flights = {}
+        self._dock_seen = set()
+        self._dock_restart_unsafe = set()
+        self._dock_completed = set()
         # Unknown running goals after restart are fenced before scheduling starts.
         self.core.reconcile(ReconciliationSnapshot(()), self.clock())
 
@@ -159,6 +164,31 @@ class FleetAdapter:
     def observe(self, snapshot):
         now = self.clock()
         self.registry.observe(snapshot, now)
+        if snapshot.pose is not None:
+            self._dock_seen.add(snapshot.robot_id)
+        if snapshot.robot_id not in self._dock_flights:
+            for dock_id, dock in self.config.docks.items():
+                inside = (
+                    snapshot.pose is not None
+                    and math.hypot(
+                        snapshot.pose.x - dock.charging_pose.x,
+                        snapshot.pose.y - dock.charging_pose.y,
+                    )
+                    <= 0.15
+                )
+                delayed_completion = (
+                    snapshot.robot_id in self._dock_completed
+                    and snapshot.mode in (RobotMode.DOCKING, RobotMode.CHARGING)
+                )
+                if not delayed_completion and (
+                    inside or snapshot.mode in (RobotMode.DOCKING, RobotMode.CHARGING)
+                ):
+                    # Observed former activity is evidence, never a fresh lease.
+                    # Task 14's explicit reconciliation owns clearance.
+                    self._dock_restart_unsafe.add(dock_id)
+                    if inside and snapshot.mode == RobotMode.AVAILABLE:
+                        snapshot = replace(snapshot, mode=RobotMode.RECOVERY_REQUIRED)
+                        self.registry.observe(snapshot, now)
         if snapshot.payload_state in ("LOADED", "UNKNOWN"):
             ownership = (
                 PayloadOwnership.PICKED_UP
@@ -205,6 +235,26 @@ class FleetAdapter:
                     if flight.robot_id == robot.robot_id:
                         flight.retired = True
                         del self._flights[mission_id]
+                charge = self._dock_flights.get(robot.robot_id)
+                if charge is not None:
+                    self.core.charging_result(
+                        robot.robot_id, charge.assignment_id, False
+                    )
+                    charge.retired = True
+        reserved = {flight.robot_id for flight in self._flights.values()}
+        self.core.queue_charging(self.config.energy, now, reserved)
+        previous = {}
+        for charge in self.core.charging_snapshot():
+            predecessor = previous.get(charge.dock_id)
+            if (
+                charge.robot_id not in self._dock_flights
+                and charge.state == "CHARGE_QUEUED"
+                and (predecessor is None or predecessor.state == "CHARGING")
+            ):
+                # One shared staging pose must be vacated before its next arrival.
+                # Reserving all queued robots still fences mission assignment.
+                self._start_charging(charge)
+            previous[charge.dock_id] = charge
         for record in self.journal.load_active():
             if record.state not in (MissionState.QUEUED, MissionState.REASSIGNING):
                 continue
@@ -268,6 +318,8 @@ class FleetAdapter:
                 robot.robot_id
                 for robot in self.registry.eligible(now)
                 if robot.robot_id not in reserved
+                and robot.robot_id
+                not in {charge.robot_id for charge in self.core.charging_snapshot()}
                 and (
                     not record.request.requested_robot_id
                     or record.request.requested_robot_id == robot.robot_id
@@ -297,6 +349,61 @@ class FleetAdapter:
                         round_.cleanups[robot_id] = cleanup
                 except Exception:
                     callback(None)
+
+    def _start_charging(self, charge):
+        self._dock_completed.discard(charge.robot_id)
+        flight = _Flight(charge.robot_id, charge.generation)
+        self._dock_flights[charge.robot_id] = flight
+
+        def accepted(handle, error):
+            self._enqueue(self._dock_accepted, charge, flight, handle, error)
+
+        try:
+            self.transport.send_dock_goal(
+                charge.robot_id,
+                charge,
+                lambda feedback: self._enqueue(
+                    self._dock_feedback, charge, flight, feedback
+                ),
+                lambda reply: self._enqueue(self._dock_result, charge, flight, reply),
+                accepted,
+            )
+        except Exception as error:
+            accepted(None, str(error))
+
+    def _dock_current(self, charge, flight):
+        return self._dock_flights.get(charge.robot_id) is flight and not flight.retired
+
+    def _dock_accepted(self, charge, flight, handle, error):
+        flight.handle = handle
+        if not self._dock_current(charge, flight):
+            if handle is not None:
+                self.transport.cancel(handle, lambda _: None)
+            return
+        if error or handle is None:
+            self.core.charging_result(charge.robot_id, charge.generation, False)
+            flight.retired = True
+
+    def _dock_feedback(self, charge, flight, feedback):
+        if self._dock_current(charge, flight):
+            self.core.charging_feedback(
+                charge.robot_id, charge.generation, feedback.state
+            )
+
+    def _dock_result(self, charge, flight, reply):
+        if not self._dock_current(charge, flight):
+            return
+        # Terminal dock success is emitted only after verified exit and release.
+        self.core.charging_result(
+            charge.robot_id,
+            charge.generation,
+            reply.success,
+            cancelled=reply.error_code == "CANCELLED",
+        )
+        if reply.success or reply.error_code == "CANCELLED":
+            self._dock_completed.add(charge.robot_id)
+        flight.retired = True
+        self._dock_flights.pop(charge.robot_id, None)
 
     def _estimated(self, mission_id, round_, robot_id, estimate, received_at):
         if self._rounds.get(mission_id) is not round_ or received_at >= round_.deadline:
@@ -461,6 +568,38 @@ class FleetAdapter:
             raise ValueError("resource owner is not configured")
         now = self.clock()
         identity = (request.robot_id, request.mission_id, request.resource_id)
+        if operation == "acquire" and request.resource_id in self.config.docks:
+            queue_ = [
+                charge
+                for charge in self.core.charging_snapshot()
+                if charge.dock_id == request.resource_id
+            ]
+            if not queue_:
+                return {
+                    "granted": False,
+                    "lease_id": "",
+                    "lease_ttl_sec": 0.0,
+                    "current_owner": "",
+                    "reason": "dock charging not authorized",
+                }
+            if request.resource_id in self._dock_restart_unsafe or len(
+                self._dock_seen
+            ) != len(self.config.robots):
+                return {
+                    "granted": False,
+                    "lease_id": "",
+                    "lease_ttl_sec": 0.0,
+                    "current_owner": "",
+                    "reason": "dock reconciliation required",
+                }
+            if queue_[0].robot_id != request.robot_id:
+                return {
+                    "granted": False,
+                    "lease_id": "",
+                    "lease_ttl_sec": 0.0,
+                    "current_owner": queue_[0].robot_id,
+                    "reason": "charge queued",
+                }
         if operation == "cancel_wait":
             resolution = self.resources.resolve_waiter(LeaseRequest(*identity), now)
             return {

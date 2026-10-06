@@ -57,6 +57,9 @@ class Host:
         self.services[self.resolve(name)] = callback
         return object()
 
+    def create_client(self, *args, **kwargs):
+        return object()
+
     def create_timer(self, period, callback, clock):
         self.timers.append((period, callback, clock.clock_type))
         return object()
@@ -195,6 +198,149 @@ def test_cost_timeout_is_immediate_infeasible_without_pending_service_coroutines
     assert len(paths.calls) == 1
 
 
+def test_dock_runtime_registers_action_and_requires_real_contact_before_charge(
+    monkeypatch,
+):
+    from factory_interfaces.action import DockRobot
+    from geometry_msgs.msg import PoseStamped
+    from std_msgs.msg import Bool
+    from test_docking import Wire
+
+    module = api()
+    assert hasattr(module, "DockRuntime"), "production DockRobot server seam is missing"
+    host, runtime_, _, wall = runtime("/warehouse/cart_1")
+    sensors(host)
+    registrations = []
+
+    def action_server(node, action, name, execute, **callbacks):
+        registrations.append((host.resolve(name), action, execute, callbacks))
+        return SimpleNamespace(destroy=lambda: None)
+
+    wire = Wire()
+    docking = module.DockRuntime(
+        host,
+        runtime_.adapter,
+        wire,
+        "charger",
+        (2, 0, 0),
+        (3, 0, 0),
+        server_factory=action_server,
+    )
+    assert registrations[0][:2] == ("/warehouse/cart_1/factory/dock_robot", DockRobot)
+    assert "/warehouse/cart_1/factory/dock_contact" in host.subscriptions
+
+    def pose(x):
+        message = PoseStamped()
+        message.header.frame_id = "floor/cart_1/map"
+        message.pose.position.x = float(x)
+        message.pose.orientation.w = 1.0
+        return message
+
+    goal = DockRobot.Goal(
+        dock_id="charger",
+        staging_pose=pose(2),
+        charging_pose=pose(3),
+        target_percent=80.0,
+    )
+    callbacks = registrations[0][3]
+    assert callbacks["goal_callback"](goal) == module.GoalResponse.ACCEPT
+    assert callbacks["goal_callback"](goal) == module.GoalResponse.REJECT
+    feedback, status, finished = [], [], []
+    handle = SimpleNamespace(
+        request=goal,
+        publish_feedback=feedback.append,
+        execute=lambda: finished.append(True),
+        is_cancel_requested=False,
+        succeed=lambda: status.append("succeeded"),
+        abort=lambda: status.append("aborted"),
+        canceled=lambda: status.append("cancelled"),
+    )
+    callbacks["handle_accepted_callback"](handle)
+    runtime_.adapter.localization(2, 2, 0, 0, "floor/cart_1/map")
+    wire.moves[0][2](True, "")
+    wire.reply(granted=True, lease_id="real-lease", lease_ttl_sec=10.0)
+    runtime_.adapter.localization(3, 3, 0, 0, "floor/cart_1/map")
+    wire.moves[1][2](True, "")
+    runtime_.heartbeat()
+    assert runtime_.adapter.mode == "DOCKING"
+    assert (
+        host.publishers[host.resolve("battery_state")][1]
+        .messages[-1]
+        .power_supply_status
+        == BatteryState.POWER_SUPPLY_STATUS_DISCHARGING
+    )
+    runtime_.adapter.energy.battery_percent = 79.95
+    host.subscriptions[host.resolve("factory/dock_contact")](Bool(data=True))
+    assert runtime_.adapter.mode == "CHARGING"
+    runtime_.heartbeat()
+    assert (
+        host.publishers[host.resolve("battery_state")][1]
+        .messages[-1]
+        .power_supply_status
+        == BatteryState.POWER_SUPPLY_STATUS_CHARGING
+    )
+    wall[0] += 0.1
+    docking.controller.tick()
+    runtime_.adapter.localization(4, 2, 0, 0, "floor/cart_1/map")
+    wire.moves[2][2](True, "")
+    wire.reply(released=True)
+    assert finished == [True]
+    reply = registrations[0][2](handle)
+    assert reply.success and status == ["succeeded"]
+
+
+def test_nav2_dock_transport_cancels_goal_accepted_after_cancel():
+    from rclpy.task import Future
+
+    module = api()
+    assert hasattr(module, "DockTransport"), "production docking transport is missing"
+    host = Host("/cart_1")
+    goal_reply, result_reply, cancel_reply = Future(), Future(), Future()
+    goals, results, cancellations = [], [], []
+
+    def send(goal):
+        goals.append(goal)
+        return goal_reply
+
+    client = SimpleNamespace(server_is_ready=lambda: True, send_goal_async=send)
+    transport = module.DockTransport(host, client, {})
+    cancel = transport.navigate(
+        (2, 3, 0), "floor/cart_1/map", lambda *reply: results.append(reply)
+    )
+    cancel()
+
+    def cancel_goal():
+        cancellations.append(True)
+        return cancel_reply
+
+    goal_reply.set_result(
+        SimpleNamespace(
+            accepted=True,
+            cancel_goal_async=cancel_goal,
+            get_result_async=lambda: result_reply,
+        )
+    )
+    assert cancellations == [True] and results == []
+    result_reply.set_result(SimpleNamespace(status=5))
+    assert results == [(False, "navigation cancelled")]
+    assert goals[0].pose.header.frame_id == "floor/cart_1/map"
+
+
+def test_missing_cancel_wait_service_is_not_ownership_clearance():
+    from robot_agent.docking import DockKey
+
+    replies = []
+    host = Host("/cart_1")
+    module = api()
+    transport = module.DockTransport(
+        host, None, {"cancel_wait": SimpleNamespace(service_is_ready=lambda: False)}
+    )
+    transport.resource(
+        "cancel_wait", DockKey("cart_1", "dock-1", "charger"), replies.append
+    )
+    assert replies[0].reconciliation_required is True
+
+
 def test_actual_demo_parameters_construct_namespaced_agent_with_unprefixed_frames(
     monkeypatch,
 ):
@@ -232,6 +378,7 @@ def test_actual_demo_parameters_construct_namespaced_agent_with_unprefixed_frame
         "create_publisher",
         "create_subscription",
         "create_service",
+        "create_client",
         "create_timer",
         "get_clock",
     ):
@@ -246,6 +393,17 @@ def test_actual_demo_parameters_construct_namespaced_agent_with_unprefixed_frame
         ),
     )
     monkeypatch.setattr(module, "ActionClient", lambda *args: object())
+    monkeypatch.setattr(
+        module,
+        "ActionServer",
+        lambda *args, **kwargs: SimpleNamespace(destroy=lambda: None),
+    )
+    original = module.DockRuntime
+    monkeypatch.setattr(
+        module,
+        "DockRuntime",
+        lambda *args: original(*args, server_factory=module.ActionServer),
+    )
     node = module.RobotAgentNode(namespace=launch_node.expanded_node_namespace)
     assert node.runtime.adapter.frame_prefix == ""
     assert node.namespace + "/factory/robot_state" in node.publishers
@@ -490,4 +648,52 @@ def test_real_ros_agent_paused_clock_battery_and_namespace(namespace):
         executor.shutdown()
         if agent is not None:
             agent.destroy_node()
+        context.try_shutdown()
+
+
+def test_real_ros_dock_action_is_namespaced_and_rejects_unhealthy_goal():
+    import rclpy
+    from factory_interfaces.action import DockRobot
+    from rclpy.action import ActionClient
+    from rclpy.context import Context
+    from rclpy.executors import SingleThreadedExecutor
+    from rclpy.parameter import Parameter
+    import time
+
+    context = Context()
+    context.init()
+    executor = SingleThreadedExecutor(context=context)
+    nodes, client = [], None
+    try:
+        agent = api().RobotAgentNode(
+            namespace="/warehouse/cart_1",
+            context=context,
+            parameter_overrides=[
+                Parameter("robot_id", value="cart_1"),
+                Parameter("frame_prefix", value="floor/cart_1/"),
+            ],
+        )
+        nodes.append(agent)
+        peer = rclpy.create_node("dock_observer", context=context)
+        nodes.append(peer)
+        for node in nodes:
+            executor.add_node(node)
+        client = ActionClient(peer, DockRobot, "/warehouse/cart_1/factory/dock_robot")
+        deadline = time.monotonic() + 5
+        while not client.server_is_ready() and time.monotonic() < deadline:
+            executor.spin_once(timeout_sec=0.02)
+        assert client.server_is_ready()
+        future = client.send_goal_async(
+            DockRobot.Goal(dock_id="dock_01", target_percent=80.0)
+        )
+        while not future.done() and time.monotonic() < deadline:
+            executor.spin_once(timeout_sec=0.02)
+        assert future.done() and not future.result().accepted
+        assert not agent.docking.controller.active
+    finally:
+        executor.shutdown()
+        if client is not None:
+            client.destroy()
+        for node in reversed(nodes):
+            node.destroy_node()
         context.try_shutdown()

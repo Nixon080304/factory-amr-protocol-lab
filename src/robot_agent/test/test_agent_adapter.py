@@ -375,10 +375,15 @@ def test_odometry_becoming_stale_during_path_estimate_rejects_success():
 
 
 def test_charge_authorization_expiry_and_mode_transition_split_wall_elapsed():
+    from robot_agent.docking import DockKey
+
     agent, _, wall = rig()
     ready(agent)
+    key = DockKey("cart_1", "charge", "charger", "lease")
+    agent.configure_dock("charger", (0, -3, 0), 0.15, 0.2)
+    agent.begin_docking(key)
     agent.mode = "CHARGING"
-    agent.set_charge_authorization(lease_until=101, contact=True)
+    agent.set_charge_authorization(lease_until=101, contact=True, lease_key=key)
     wall[0] = 102
     assert agent.heartbeat().battery_percent == pytest.approx(80.998)
     agent.mode = "AVAILABLE"
@@ -424,11 +429,16 @@ def test_cancellation_exception_still_completes_cost_response():
 
 
 def test_new_charge_authorization_cannot_apply_to_elapsed_time_before_grant():
+    from robot_agent.docking import DockKey
+
     agent, _, wall = rig()
     ready(agent)
+    key = DockKey("cart_1", "charge", "charger", "lease")
+    agent.configure_dock("charger", (0, -3, 0), 0.15, 0.2)
+    agent.begin_docking(key)
     agent.mode = "CHARGING"
     wall[0] = 102
-    agent.set_charge_authorization(lease_until=103, contact=True)
+    agent.set_charge_authorization(lease_until=103, contact=True, lease_key=key)
     assert agent.heartbeat().battery_percent == pytest.approx(79.998)
     wall[0] = 103
     assert agent.heartbeat().battery_percent == pytest.approx(80.997)

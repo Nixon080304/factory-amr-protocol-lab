@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Durable, ROS-free orchestration of fleet missions."""
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 import math
@@ -21,6 +21,7 @@ from fleet_manager.models import (
     MissionRequest,
     RobotHealth,
     RobotSnapshot,
+    robot_is_ready,
 )
 from fleet_manager.registry import RobotRegistry
 from fleet_manager.resources import ResourceManager
@@ -51,6 +52,15 @@ class RobotCancellationAck:
     robot_id: str
     assignment_id: int
     accepted: bool
+
+
+@dataclass(frozen=True)
+class ChargingRequest:
+    robot_id: str
+    dock_id: str
+    target_percent: float
+    generation: int
+    state: str = "CHARGE_QUEUED"
 
 
 @dataclass(frozen=True)
@@ -119,6 +129,66 @@ class FleetCore:
         self._registry = registry
         self._resources = resources
         self._journal = journal
+        self._charging = {}
+        self._charge_generation = 0
+
+    def charging_snapshot(self):
+        return tuple(self._charging.values())
+
+    def queue_charging(self, policy, now, reserved=()):
+        """Reserve low idle robots before any mission assignment in this tick.
+
+        CHARGE_QUEUED is a central scheduling state, not a public RobotMode.
+        Fresh DOCKING/CHARGING observations after restart remain ineligible;
+        this process never reuses their former dock authority.
+        """
+        _time(now)
+        occupied = set(reserved) | {
+            record.assigned_robot_id
+            for record in self._journal.load_active()
+            if record.assigned_robot_id is not None
+        }
+        queued = []
+        from fleet_manager.energy import EnergyPolicy
+
+        energy = EnergyPolicy(policy)
+        for robot in sorted(
+            self._registry.eligible(now), key=lambda item: item.robot_id
+        ):
+            if (
+                robot.robot_id in occupied
+                or robot.robot_id in self._charging
+                or not robot_is_ready(robot)
+                or robot.payload_state != "EMPTY"
+                or robot.mission_id
+                or not energy.should_charge(robot)
+            ):
+                continue
+            self._charge_generation += 1
+            request = ChargingRequest(
+                robot.robot_id,
+                policy.dock_id,
+                policy.charge_until_percent,
+                self._charge_generation,
+            )
+            self._charging[robot.robot_id] = request
+            queued.append(request)
+        return tuple(queued)
+
+    def charging_feedback(self, robot_id, generation, state):
+        current = self._charging.get(robot_id)
+        if current is not None and current.generation == generation:
+            mode = "CHARGING" if state == "CHARGING" else "DOCKING"
+            if current.state != "RECOVERY_REQUIRED":
+                self._charging[robot_id] = replace(current, state=mode)
+
+    def charging_result(self, robot_id, generation, success, *, cancelled=False):
+        current = self._charging.get(robot_id)
+        if current is not None and current.generation == generation:
+            if success or cancelled:
+                del self._charging[robot_id]
+            else:
+                self._charging[robot_id] = replace(current, state="RECOVERY_REQUIRED")
 
     def submit(self, request: MissionRequest, now: float) -> MissionRecord:
         _time(now)
@@ -143,7 +213,7 @@ class FleetCore:
         robots = tuple(
             robot
             for robot in self._registry.eligible(now)
-            if robot.robot_id not in reserved
+            if robot.robot_id not in reserved and robot.robot_id not in self._charging
         )
         decision = self._dispatcher.choose(record.request, robots, estimates)
         if decision.robot_id is None:
