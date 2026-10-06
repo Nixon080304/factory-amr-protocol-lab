@@ -220,7 +220,7 @@ class AgentAdapter:
             detail,
         )
 
-    def mission_state(self, state):
+    def mission_state(self, state, *, correlated=False):
         if self._terminal:
             return False
         active = (
@@ -243,7 +243,11 @@ class AgentAdapter:
             ):
                 return False
             self.mode = "EXECUTING"
-            if state in ("LOADING", "UNLOADING") and state != self._phase:
+            if (
+                state in ("LOADING", "UNLOADING")
+                and state != self._phase
+                and (correlated or not self.mission_id)
+            ):
                 confirmed = (
                     self._transfer
                     and self._transfer[0] == self.mission_id
@@ -251,7 +255,9 @@ class AgentAdapter:
                 )
                 if not confirmed:
                     self.payload_state = "UNKNOWN"
-            if state != "RECOVERING":
+            # The local String topic has no mission identity. It can report
+            # activity, but cannot advance a correlated mission's payload/phase.
+            if correlated and state != "RECOVERING":
                 self._phase = state
         else:
             return False
@@ -282,10 +288,18 @@ class AgentAdapter:
             if self.mission_id and self.mission_id != message.mission_id:
                 return False
             if self._terminal:
-                return False
+                if (
+                    self.mode != "AVAILABLE"
+                    or self.mission_id
+                    or self.payload_state != "EMPTY"
+                ):
+                    return False
+                # A valid, non-retired correlated identity is the only evidence
+                # that can reopen the terminal fence for another mission.
+                self._terminal = False
             if not self.mission_id:
                 self.mission_id = message.mission_id
-            return self.mission_state(message.detail)
+            return self.mission_state(message.detail, correlated=True)
         if (
             message.event == "mission_finished"
             and message.mission_id == self.mission_id
@@ -299,7 +313,6 @@ class AgentAdapter:
             else:
                 self.mode = "AVAILABLE"
                 self.mission_id = ""
-                self._terminal = False
                 self._transfer = None
                 self._phase = ""
             return True

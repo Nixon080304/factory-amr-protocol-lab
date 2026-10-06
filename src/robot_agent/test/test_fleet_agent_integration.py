@@ -145,3 +145,28 @@ def test_cancelling_pending_pin_clears_bounded_wait_state(integrated):
     observe()
     fleet.tick()
     assert journal.get("pinned").state == "CANCELLED" and not transport.goals
+
+
+@pytest.mark.parametrize(
+    "mode,health,pose,payload",
+    [
+        ("AVAILABLE", "OFFLINE", Pose2D(0, 0, 0), "EMPTY"),
+        ("AVAILABLE", "UNHEALTHY", Pose2D(0, 0, 0), "EMPTY"),
+        ("EXECUTING", "ONLINE", Pose2D(0, 0, 0), "EMPTY"),
+        ("AVAILABLE", "ONLINE", None, "EMPTY"),
+        ("AVAILABLE", "ONLINE", Pose2D(0, 0, 0), "UNKNOWN"),
+    ],
+)
+def test_pending_response_cannot_override_current_pinned_robot_unavailability(
+    integrated, mode, health, pose, payload
+):
+    fleet, journal, transport, _, _, _, _ = integrated
+    fleet.submit(MissionRequest("pinned", "assembly", "inspection", "motor", "amr_01"))
+    fleet.tick()  # Production agent responds path pending, callback awaits decision.
+    fleet.observe(RobotSnapshot("amr_01", mode, pose, 80, payload, health=health))
+    fleet.tick()
+    record = journal.get("pinned")
+    assert record.state == "FAILED"
+    assert record.result["error_code"] == "REQUESTED_ROBOT_UNAVAILABLE"
+    assert not transport.goals
+    assert fleet._path_pending_since == {} and fleet._retry_at == {}

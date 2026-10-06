@@ -744,3 +744,92 @@ def test_full_cache_protects_fresh_results_until_fleet_can_consume_them():
     assert agent.cached_estimate(a).feasible
     assert agent.cached_estimate(c).reason == "path pending"
     assert agent.cached_estimate(b).feasible
+
+
+def completed_transfer_mission(agent, outcome="COMPLETED"):
+    for phase in ("RECEIVED", "NAVIGATING_TO_PICKUP", "VERIFYING_PICKUP", "LOADING"):
+        assert agent.protocol(event("state_changed", phase))
+    assert agent.payload(
+        json.dumps(
+            dict(
+                robot_id="cart_1",
+                mission_id="m1",
+                state="IN_TRANSIT",
+                transfer_kind="LOADING",
+                cycle_counter=1,
+            )
+        )
+    )
+    for phase in ("NAVIGATING_TO_DROPOFF", "VERIFYING_DROPOFF", "UNLOADING"):
+        assert agent.protocol(event("state_changed", phase))
+    assert agent.payload(
+        json.dumps(
+            dict(
+                robot_id="cart_1",
+                mission_id="m1",
+                state="AT_INSPECTION",
+                transfer_kind="UNLOADING",
+                cycle_counter=2,
+            )
+        )
+    )
+    assert agent.protocol(event("mission_finished", outcome=outcome))
+
+
+@pytest.mark.parametrize(
+    "phase", ["RECEIVED", "LOADING", "UNLOADING", "WAITING_FOR_RESOURCE", "RECOVERING"]
+)
+@pytest.mark.parametrize("outcome", ["COMPLETED", "FAILED"])
+def test_terminal_before_delayed_local_phase_keeps_confirmed_empty(phase, outcome):
+    agent, _, _ = rig()
+    ready(agent)
+    completed_transfer_mission(agent, outcome)
+    before = agent.heartbeat()
+    assert (before.mode, before.payload_state, before.mission_id) == (
+        "AVAILABLE",
+        "EMPTY",
+        "",
+    )
+    assert agent.mission_state(phase) is False
+    after = agent.heartbeat()
+    assert (after.mode, after.payload_state, after.mission_id) == (
+        "AVAILABLE",
+        "EMPTY",
+        "",
+    )
+    assert agent.cached_estimate(mission("m2")).reason == "path pending"
+
+
+def test_new_correlated_identity_reopens_terminal_fence_not_local_payload_authority():
+    agent, _, _ = rig()
+    ready(agent)
+    completed_transfer_mission(agent)
+    assert not agent.protocol(event("state_changed", "UNLOADING"))  # retired m1
+    assert agent.protocol(event("state_changed", "RECEIVED", mission_id="m2"))
+    assert agent.heartbeat().mission_id == "m2"
+    agent.mission_state("UNLOADING")  # uncorrelated old topic arrival
+    assert agent.heartbeat().payload_state == "EMPTY"
+    assert agent.protocol(event("state_changed", "LOADING", mission_id="m2"))
+    assert agent.heartbeat().payload_state == "UNKNOWN"
+    assert agent.payload(
+        json.dumps(
+            dict(
+                robot_id="cart_1",
+                mission_id="m2",
+                state="IN_TRANSIT",
+                transfer_kind="LOADING",
+                cycle_counter=3,
+            )
+        )
+    )
+    assert agent.heartbeat().payload_state == "LOADED"
+
+
+def test_pre_identity_local_phase_cannot_block_first_correlated_received():
+    agent, _, _ = rig()
+    ready(agent)
+    agent.mission_state("LOADING")
+    assert agent.heartbeat().payload_state == "UNKNOWN"
+    assert agent.protocol(event("state_changed", "RECEIVED"))
+    assert agent.protocol(event("state_changed", "LOADING"))
+    assert agent.heartbeat().mission_id == "m1"

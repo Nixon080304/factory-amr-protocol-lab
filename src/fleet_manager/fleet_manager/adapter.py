@@ -21,7 +21,7 @@ from fleet_manager.config import Pose2D
 from fleet_manager.dispatcher import Dispatcher
 from fleet_manager.energy import EnergyPolicy
 from fleet_manager.journal import MissionState, PayloadOwnership
-from fleet_manager.models import RobotHealth, RobotMode, RobotSnapshot
+from fleet_manager.models import RobotHealth, RobotMode, RobotSnapshot, robot_is_ready
 from fleet_manager.registry import RobotRegistry
 from fleet_manager.resources import LeaseKey, LeaseRequest, ResourceManager
 
@@ -228,6 +228,7 @@ class FleetAdapter:
                                 estimate is not None
                                 and not estimate.feasible
                                 and estimate.reason == "path pending"
+                                and robot_is_ready(self.registry.get(pin, now))
                             )
                             if (
                                 pending
