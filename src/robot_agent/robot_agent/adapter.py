@@ -2,6 +2,7 @@
 """Robot policy driven by wall receipts and asynchronous production paths."""
 
 from dataclasses import dataclass
+from collections import OrderedDict, deque
 import json
 import math
 import re
@@ -37,7 +38,7 @@ class AgentState:
 
 
 class AgentAdapter:
-    """One current estimate with generation fences and fail-closed ownership.
+    """Serialized planning with generation fences and fail-closed ownership.
 
     Odometry supplies distance only. Localization supplies map coordinates only.
     ROS stamps are ordering fences, never health or battery clocks.
@@ -58,6 +59,8 @@ class AgentAdapter:
         max_odom_step_m=10.0,
         cache_max_age_sec=2.0,
         cache_move_tolerance_m=0.1,
+        localization_move_tolerance_m=0.5,
+        cache_max_entries=16,
     ):
         if not isinstance(robot_id, str) or not re.fullmatch(
             r"[A-Za-z_][A-Za-z0-9_]*", robot_id
@@ -81,12 +84,18 @@ class AgentAdapter:
         self.cache_movement = nonnegative(
             cache_move_tolerance_m, "cache_move_tolerance_m"
         )
+        self.localization_movement = nonnegative(
+            localization_move_tolerance_m, "localization_move_tolerance_m"
+        )
         if not self.stale_sec or not 0 < self.timeout < 1 or not self.max_step:
             raise ValueError(
                 "health and path bounds must be positive; estimate timeout must be below 1 s"
             )
         if self.cache_age <= 1.0:
             raise ValueError("cache_max_age_sec must exceed the fleet's 1 s retry")
+        if type(cache_max_entries) is not int or not 2 <= cache_max_entries <= 256:
+            raise ValueError("cache_max_entries must be an integer from 2 to 256")
+        self.cache_limit = cache_max_entries
         self.energy = EnergyModel(battery_percent, energy_config)
         self.cost = CostModel(self.energy.config)
         self.mode, self.payload_state, self.mission_id = "AVAILABLE", "UNKNOWN", ""
@@ -95,21 +104,20 @@ class AgentAdapter:
         self._pose_receipt = self._odom_receipt = None
         self._odom = None
         self._distance = 0.0
+        self._localized_distance = 0.0
         self._wall = self.clock()
         self._generation = 0
         self._estimate = None
+        self._queued_estimates = deque()
+        self._pumping = False
+        self._closed = False
         self._transfer = None
         self._terminal = False
         self._retired_missions = set()
         self._phase = ""
         self._lease_until = 0.0
         self._dock_contact = False
-        self._cache = None
-        self._cache_generation = 0
-        self._cache_pending_key = None
-        self._cache_started = 0.0
-        self._cache_distance = 0.0
-        self._cache_pose = None
+        self._cache = OrderedDict()
 
     def set_charge_authorization(self, *, lease_until, contact):
         deadline = nonnegative(lease_until, "lease_until")
@@ -173,6 +181,7 @@ class AgentAdapter:
         self._pose_stamp = stamp
         self.pose = (float(x), float(y), float(yaw))
         self._pose_receipt = self.clock()
+        self._localized_distance = self._distance
         return True
 
     def _health(self, now):
@@ -185,6 +194,13 @@ class AgentAdapter:
                 errors.append(f"unknown {name}")
             elif name == "odometry" and now - receipt >= self.stale_sec:
                 errors.append(f"stale {name}")
+            elif (
+                name == "localization"
+                and now - receipt >= self.stale_sec
+                and self._distance - self._localized_distance
+                > self.localization_movement
+            ):
+                errors.append("stale localization after movement")
         return "; ".join(errors)
 
     def heartbeat(self):
@@ -228,7 +244,13 @@ class AgentAdapter:
                 return False
             self.mode = "EXECUTING"
             if state in ("LOADING", "UNLOADING") and state != self._phase:
-                self.payload_state = "UNKNOWN"
+                confirmed = (
+                    self._transfer
+                    and self._transfer[0] == self.mission_id
+                    and (self._transfer[1] == state or self._transfer[1] == "UNLOADING")
+                )
+                if not confirmed:
+                    self.payload_state = "UNKNOWN"
             if state != "RECOVERING":
                 self._phase = state
         else:
@@ -341,34 +363,61 @@ class AgentAdapter:
                 # has no physical effect; generation fencing still drops replies.
                 pass
         pending["callback"](estimate)
+        self._pump()
 
     def estimate(self, mission, callback):
         now = self._advance()
-        if self._estimate is not None:
-            self._finish(
-                self._generation, CostEstimate(False, reason="superseded request")
-            )
         self._generation += 1
         generation = self._generation
-        reason = self._mission_reason(mission, now)
+        reason = (
+            "agent shutdown" if self._closed else self._mission_reason(mission, now)
+        )
+        if len(self._queued_estimates) + bool(self._estimate) >= self.cache_limit:
+            reason = "planning capacity exceeded"
         if reason:
             callback(CostEstimate(False, reason=reason))
-            return
+            return generation
         pending = {
             "generation": generation,
             "deadline": now + self.timeout,
             "lengths": {},
             "cancels": [],
             "callback": callback,
+            "mission": mission,
+            "leg": -1,
         }
-        self._estimate = pending
+        self._queued_estimates.append(pending)
+        self._pump()
+        return generation
+
+    def _pump(self):
+        if self._pumping or self._closed:
+            return
+        self._pumping = True
+        try:
+            while self._estimate is None and self._queued_estimates:
+                pending = self._queued_estimates.popleft()
+                reason = self._mission_reason(pending["mission"], self.clock())
+                if self.clock() >= pending["deadline"]:
+                    reason = "path timeout"
+                if reason:
+                    pending["callback"](CostEstimate(False, reason=reason))
+                    continue
+                self._estimate = pending
+                self._send_leg(pending, 0)
+        finally:
+            self._pumping = False
+
+    def _send_leg(self, pending, index):
+        generation, mission = pending["generation"], pending["mission"]
         pickup, dropoff = (
             self.stations[mission.pickup_station],
             self.stations[mission.dropoff_station],
         )
+        pending["leg"] = index
 
-        def received(index, length, reason):
-            if self._estimate is not pending:
+        def received(length, reason):
+            if self._estimate is not pending or pending["leg"] != index:
                 return
             if self.clock() >= pending["deadline"]:
                 self._finish(generation, CostEstimate(False, reason="path timeout"))
@@ -393,32 +442,49 @@ class AgentAdapter:
                         self.energy.battery_percent,
                     )
                     self._finish(generation, result)
+                else:
+                    # Humble Nav2 has one current planner goal. Only dispatch the
+                    # next leg after successful completion of the previous goal.
+                    self._send_leg(pending, 1)
             except ValueError as error:
                 self._finish(generation, CostEstimate(False, reason=str(error)))
 
         # Nav2 obtains its current map pose for the first leg. An idle AMCL
         # publisher need not republish a static pose; odometry receipts prove
         # sensor liveness without treating odom coordinates as map coordinates.
-        for index, (start, goal) in enumerate(((None, pickup), (pickup, dropoff))):
-            if self._estimate is not pending:
-                break
-            try:
-                cancel = self.paths.compute(
-                    start,
-                    goal,
-                    self.frame_prefix + "map",
-                    lambda length, reason="", index=index: received(
-                        index, length, reason
-                    ),
-                )
-                if self._estimate is pending:
-                    pending["cancels"].append(cancel)
-                elif cancel:
-                    cancel()
-            except Exception as error:
-                self._finish(
-                    generation, CostEstimate(False, reason=f"path unavailable: {error}")
-                )
+        start, goal = (None, pickup) if index == 0 else (pickup, dropoff)
+        try:
+            cancel = self.paths.compute(
+                start, goal, self.frame_prefix + "map", received
+            )
+            if self._estimate is pending:
+                pending["cancels"].append(cancel)
+            elif cancel:
+                cancel()
+        except Exception as error:
+            self._finish(
+                generation, CostEstimate(False, reason=f"path unavailable: {error}")
+            )
+
+    def _cancel_estimate(self, generation, reason):
+        if self._estimate and self._estimate["generation"] == generation:
+            self._finish(generation, CostEstimate(False, reason=reason))
+        else:
+            for pending in tuple(self._queued_estimates):
+                if pending["generation"] == generation:
+                    self._queued_estimates.remove(pending)
+                    pending["callback"](CostEstimate(False, reason=reason))
+                    break
+
+    def shutdown(self):
+        self._closed = True
+        for pending in tuple(self._queued_estimates):
+            self._cancel_estimate(pending["generation"], "agent shutdown")
+        if self._estimate:
+            self._finish(
+                self._estimate["generation"],
+                CostEstimate(False, reason="agent shutdown"),
+            )
 
     def _mission_reason(self, mission, now):
         if (
@@ -434,8 +500,20 @@ class AgentAdapter:
             return health or "robot unavailable"
         return ""
 
+    def _cache_fresh(self, entry, now):
+        return entry is not None and (
+            now - entry["started"] < self.cache_age
+            and self._distance - entry["distance"] <= self.cache_movement
+            and entry["pose"] is not None
+            and math.hypot(
+                self.pose[0] - entry["pose"][0], self.pose[1] - entry["pose"][1]
+            )
+            <= self.cache_movement
+            and abs(math.remainder(self.pose[2] - entry["pose"][2], 2 * math.pi)) <= 0.1
+        )
+
     def cached_estimate(self, mission):
-        """Return immediately; external planning callbacks fill one bounded cache.
+        """Return immediately; external planning callbacks fill a bounded LRU.
 
         The fleet retries pending candidates. No service callback waits for Nav2,
         and each successful read recomputes energy against the current battery.
@@ -446,46 +524,60 @@ class AgentAdapter:
         if reason:
             return CostEstimate(False, reason=reason)
         key = (mission.pickup_station, mission.dropoff_station, mission.part)
-        fresh = (
-            now - self._cache_started < self.cache_age
-            and self._distance - self._cache_distance <= self.cache_movement
-            and self._cache_pose is not None
-            and math.hypot(
-                self.pose[0] - self._cache_pose[0], self.pose[1] - self._cache_pose[1]
-            )
-            <= self.cache_movement
-            and abs(math.remainder(self.pose[2] - self._cache_pose[2], 2 * math.pi))
-            <= 0.1
-        )
-        if self._cache is not None and self._cache[0] == key and fresh:
-            result = self._cache[1]
+        entry = self._cache.get(key)
+        if self._cache_fresh(entry, now):
+            self._cache.move_to_end(key)
+            result = entry["result"]
+            if result is None:
+                return CostEstimate(False, reason="path pending")
+            entry["consumed"] = True
             return (
                 self.cost.estimate(result.path_lengths, self.energy.battery_percent)
                 if result.path_lengths
                 else result
             )
-        if self._cache_pending_key == key and self._estimate is not None and fresh:
-            return CostEstimate(False, reason="path pending")
-        self._cache_generation += 1
-        token = self._cache_generation
-        self._cache, self._cache_pending_key = None, key
-        self._cache_started, self._cache_distance = now, self._distance
-        self._cache_pose = self.pose
-        started_distance = self._distance
+        if entry:
+            del self._cache[key]
+            self._cancel_estimate(entry["generation"], "stale route snapshot")
+        if len(self._cache) >= self.cache_limit:
+            # Do not discard a fresh result before its waiting fleet request has
+            # read it. Overflow fails explicitly instead of causing cache churn.
+            victim = next(
+                (
+                    k
+                    for k, v in self._cache.items()
+                    if v["result"] is not None
+                    and (v["consumed"] or not self._cache_fresh(v, now))
+                ),
+                None,
+            )
+            if victim is None:
+                return CostEstimate(False, reason="planning capacity exceeded")
+            del self._cache[victim]
+        entry = dict(
+            started=now,
+            distance=self._distance,
+            pose=self.pose,
+            result=None,
+            generation=None,
+            consumed=False,
+        )
+        self._cache[key] = entry
 
         def completed(result):
-            if token != self._cache_generation:
+            if self._cache.get(key) is not entry:
                 return
-            self._cache_pending_key = None
-            if self._distance - started_distance <= self.cache_movement:
-                self._cache = (key, result)
+            entry["result"] = result
 
-        self.estimate(mission, completed)
-        if self._cache is not None:
-            return self._cache[1]
-        return CostEstimate(False, reason="path pending")
+        entry["generation"] = self.estimate(mission, completed)
+        return entry["result"] or CostEstimate(False, reason="path pending")
 
     def tick(self):
         self._advance()
+        for pending in tuple(self._queued_estimates):
+            if self.clock() >= pending["deadline"]:
+                self._cancel_estimate(pending["generation"], "path timeout")
         if self._estimate and self.clock() >= self._estimate["deadline"]:
-            self._finish(self._generation, CostEstimate(False, reason="path timeout"))
+            self._finish(
+                self._estimate["generation"], CostEstimate(False, reason="path timeout")
+            )

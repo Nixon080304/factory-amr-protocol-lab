@@ -185,14 +185,73 @@ def test_cost_timeout_is_immediate_infeasible_without_pending_service_coroutines
     first = callback(request, EstimateMissionCost.Response())
     second = callback(request, EstimateMissionCost.Response())
     assert not first.feasible and not second.feasible
-    assert len(paths.calls) == 2
+    assert len(paths.calls) == 1
     wall[0] += 0.8
     next(t for p, t, _ in host.timers if p == 0.02)()
     third = callback(request, EstimateMissionCost.Response())
     assert not third.feasible and "timeout" in third.reason
     paths.finish(0, 1)
-    paths.finish(1, 1)
-    assert sorted(paths.cancelled) == [0, 1]
+    assert sorted(paths.cancelled) == [0]
+    assert len(paths.calls) == 1
+
+
+def test_actual_demo_parameters_construct_namespaced_agent_with_unprefixed_frames(
+    monkeypatch,
+):
+    from launch import LaunchContext
+    from launch_ros.actions import Node as LaunchNode
+    from launch_ros.utilities import evaluate_parameters
+
+    root = Path(__file__).resolve().parents[2]
+    spec = importlib.util.spec_from_file_location(
+        "demo_constructor", root / "factory_bringup/launch/demo.launch.py"
+    )
+    demo = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(demo)
+    monkeypatch.setattr(
+        demo, "get_package_share_directory", lambda name: str(root / name)
+    )
+    description = demo.generate_launch_description()
+    launch_node = next(
+        n
+        for n in description.entities
+        if isinstance(n, LaunchNode) and n.node_package == "robot_agent"
+    )
+    context = LaunchContext()
+    launch_node._perform_substitutions(context)
+    parameters = evaluate_parameters(context, launch_node._Node__parameters)[0]
+    module = api()
+    for name in ("publishers", "subscriptions", "services", "timers"):
+        monkeypatch.setattr(module.Node, name, None)
+    monkeypatch.setattr(
+        module.Node,
+        "__init__",
+        lambda self, *args, **kwargs: Host.__init__(self, kwargs["namespace"]),
+    )
+    for name in (
+        "create_publisher",
+        "create_subscription",
+        "create_service",
+        "create_timer",
+        "get_clock",
+    ):
+        monkeypatch.setattr(module.Node, name, getattr(Host, name))
+    monkeypatch.setattr(module.Node, "get_namespace", lambda self: self.namespace)
+    monkeypatch.setattr(module.Node, "resolve", Host.resolve, raising=False)
+    monkeypatch.setattr(
+        module.Node,
+        "declare_parameter",
+        lambda self, name, default, *args: SimpleNamespace(
+            value=parameters.get(name, default)
+        ),
+    )
+    monkeypatch.setattr(module, "ActionClient", lambda *args: object())
+    node = module.RobotAgentNode(namespace=launch_node.expanded_node_namespace)
+    assert node.runtime.adapter.frame_prefix == ""
+    assert node.namespace + "/factory/robot_state" in node.publishers
+    parameters.pop("legacy_unprefixed_frames", None)
+    with pytest.raises(ValueError, match="namespaced robots require frame_prefix"):
+        module.RobotAgentNode(namespace=node.namespace)
 
 
 @pytest.mark.parametrize(
@@ -242,7 +301,7 @@ def test_real_ros_agent_cost_with_robot_local_nav2_action(scenario):
             start.header.frame_id = message.header.frame_id
             start.pose.orientation.w = 1.0
             message.poses = [start, handle.request.goal]
-            if scenario == "failed":
+            if scenario == "failed" or handle in preempted:
                 handle.abort()
             else:
                 handle.succeed()
@@ -250,10 +309,19 @@ def test_real_ros_agent_cost_with_robot_local_nav2_action(scenario):
 
         # A never-completed action execute callback is deferred rather than blocking.
         handles = []
+        waiting, preempted = [], []
 
         def accepted(handle):
+            # Model Humble's single current goal rather than independent goals.
+            preempted.extend(previous for previous in handles if previous.is_active)
             handles.append(handle)
-            if scenario != "timeout":
+            waiting.append(handle)
+
+        def run_planner():
+            if scenario == "timeout":
+                return
+            for handle in tuple(waiting):
+                waiting.remove(handle)
                 handle.execute()
 
         server = ActionServer(
@@ -266,6 +334,9 @@ def test_real_ros_agent_cost_with_robot_local_nav2_action(scenario):
             ),
             handle_accepted_callback=accepted,
             callback_group=ReentrantCallbackGroup(),
+        )
+        peer.create_timer(
+            0.04, run_planner, clock=Clock(clock_type=ClockType.STEADY_TIME)
         )
         odom_pub = peer.create_publisher(Odometry, "odom", 10)
         pose_pub = peer.create_publisher(PoseWithCovarianceStamped, "amcl_pose", 10)
@@ -359,6 +430,7 @@ def test_real_ros_agent_cost_with_robot_local_nav2_action(scenario):
                 response = future.result()
         assert response.feasible is (scenario == "success")
         if scenario == "success":
+            assert preempted == []
             assert len(goals) == 2 and {g.goal.header.frame_id for g in goals} == {
                 "floor/cart_1/map"
             }

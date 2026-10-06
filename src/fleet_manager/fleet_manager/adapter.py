@@ -25,6 +25,8 @@ from fleet_manager.models import RobotHealth, RobotMode, RobotSnapshot
 from fleet_manager.registry import RobotRegistry
 from fleet_manager.resources import LeaseKey, LeaseRequest, ResourceManager
 
+PATH_PENDING_GRACE_SEC = 3.0
+
 
 @dataclass(frozen=True)
 class RobotFeedback:
@@ -140,6 +142,7 @@ class FleetAdapter:
         self._callbacks = queue.SimpleQueue()
         self._rounds = {}
         self._retry_at = {}
+        self._path_pending_since = {}
         self._flights = {}
         # Unknown running goals after restart are fenced before scheduling starts.
         self.core.reconcile(ReconciliationSnapshot(()), self.clock())
@@ -219,6 +222,26 @@ class FleetAdapter:
                     decision = self.core.assign(mission_id, estimates, now)
                     if decision.robot_id is None:
                         if record.request.requested_robot_id:
+                            pin = record.request.requested_robot_id
+                            estimate = estimates.get(pin)
+                            pending = (
+                                estimate is not None
+                                and not estimate.feasible
+                                and estimate.reason == "path pending"
+                            )
+                            if (
+                                pending
+                                and now
+                                - self._path_pending_since.setdefault(mission_id, now)
+                                < PATH_PENDING_GRACE_SEC
+                            ):
+                                # Only this exact transient outcome gets a retry.
+                                # Repeated replies never renew the original bound.
+                                self._retry_at[mission_id] = now + 1.0
+                                self._emit(
+                                    self.journal.get(mission_id), detail="path pending"
+                                )
+                                continue
                             rejected = self.core.reject(
                                 mission_id,
                                 "REQUESTED_ROBOT_UNAVAILABLE",
@@ -226,6 +249,7 @@ class FleetAdapter:
                                 now,
                             )
                             self._retry_at.pop(mission_id, None)
+                            self._path_pending_since.pop(mission_id, None)
                             self._remove_waiters(mission_id)
                             self._emit(rejected)
                         else:
@@ -290,6 +314,7 @@ class FleetAdapter:
 
     def _start(self, request, decision):
         self._retry_at.pop(request.mission_id, None)
+        self._path_pending_since.pop(request.mission_id, None)
         flight = _Flight(decision.robot_id, decision.assignment_id)
         self._flights[request.mission_id] = flight
         self._emit(self.journal.get(request.mission_id))
@@ -390,6 +415,7 @@ class FleetAdapter:
         record = self.core.request_cancellation(mission_id, self.clock())
         self._close_round(mission_id)
         self._retry_at.pop(mission_id, None)
+        self._path_pending_since.pop(mission_id, None)
         self._remove_waiters(mission_id)
         flight = self._flights.get(mission_id)
         if flight is not None and not flight.cancelling:

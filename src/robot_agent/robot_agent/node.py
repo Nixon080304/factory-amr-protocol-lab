@@ -27,7 +27,6 @@ from std_msgs.msg import String
 
 from robot_agent.adapter import AgentAdapter
 from robot_agent.energy_model import EnergyConfig
-from robot_agent.cost_model import CostEstimate
 from robot_agent.nav2_paths import Nav2Paths
 
 
@@ -43,6 +42,8 @@ class AgentConfig:
     max_odom_step_m: float = 10.0
     cache_max_age_sec: float = 2.0
     cache_move_tolerance_m: float = 0.1
+    localization_move_tolerance_m: float = 0.5
+    cache_max_entries: int = 16
 
 
 def stamp_seconds(stamp):
@@ -77,6 +78,8 @@ class AgentRuntime:
             max_odom_step_m=config.max_odom_step_m,
             cache_max_age_sec=config.cache_max_age_sec,
             cache_move_tolerance_m=config.cache_move_tolerance_m,
+            localization_move_tolerance_m=config.localization_move_tolerance_m,
+            cache_max_entries=config.cache_max_entries,
         )
         self.states = node.create_publisher(RobotState, "factory/robot_state", 10)
         self.batteries = node.create_publisher(BatteryState, "battery_state", 10)
@@ -205,7 +208,14 @@ class RobotAgentNode(Node):
             robot_id + "/" if self.get_namespace() != "/" else "",
             identity,
         ).value
-        if self.get_namespace() != "/" and not prefix:
+        legacy = self.declare_parameter(
+            "legacy_unprefixed_frames", False, identity
+        ).value
+        if type(legacy) is not bool or (legacy and prefix):
+            raise ValueError(
+                "legacy_unprefixed_frames requires bool and empty frame_prefix"
+            )
+        if self.get_namespace() != "/" and not prefix and not legacy:
             raise ValueError("namespaced robots require frame_prefix")
         stations = {}
         for station in self.declare_parameter(
@@ -245,6 +255,10 @@ class RobotAgentNode(Node):
             self.declare_parameter("max_odom_step_m", 10.0, identity).value,
             self.declare_parameter("cache_max_age_sec", 2.0, identity).value,
             self.declare_parameter("cache_move_tolerance_m", 0.1, identity).value,
+            self.declare_parameter(
+                "localization_move_tolerance_m", 0.5, identity
+            ).value,
+            self.declare_parameter("cache_max_entries", 16, identity).value,
         )
         self.path_client = ActionClient(self, ComputePathToPose, "compute_path_to_pose")
         self.runtime = AgentRuntime(
@@ -254,11 +268,8 @@ class RobotAgentNode(Node):
         )
 
     def destroy_node(self):
-        if hasattr(self, "runtime") and self.runtime.adapter._estimate:
-            self.runtime.adapter._finish(
-                self.runtime.adapter._generation,
-                CostEstimate(False, reason="agent shutdown"),
-            )
+        if hasattr(self, "runtime"):
+            self.runtime.adapter.shutdown()
         if hasattr(self, "path_client"):
             self.path_client.destroy()
         return super().destroy_node()

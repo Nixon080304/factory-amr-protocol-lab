@@ -31,6 +31,7 @@ def generate_launch_description():
     robot = fleet_config.robots[0]
     agent_config = agent_parameters(fleet_config, robot, stations)
     agent_config["frame_prefix"] = ""
+    agent_config["legacy_unprefixed_frames"] = True
     launches = []
     for package, filename, arguments in [
         (
