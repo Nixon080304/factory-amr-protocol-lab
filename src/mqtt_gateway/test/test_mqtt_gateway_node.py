@@ -9,12 +9,269 @@ import rclpy
 from rclpy.action import ActionClient, ActionServer, GoalResponse
 from rclpy.context import Context
 from rclpy.executors import MultiThreadedExecutor, SingleThreadedExecutor
-from factory_interfaces.action import ExecuteFactoryMission
-from factory_interfaces.msg import FaultCommand, ProtocolEvent
-from geometry_msgs.msg import PoseWithCovarianceStamped
-from nav_msgs.msg import Odometry
+from factory_interfaces.action import ExecuteFleetMission
+from factory_interfaces.msg import FaultCommand, ProtocolEvent, RobotState
 from rosgraph_msgs.msg import Clock
 from mqtt_gateway.node import MqttGatewayNode
+
+
+@pytest.fixture
+def without_dds():
+    """Use real adapter methods; replace only external broker/action boundaries."""
+    from collections import deque
+    import queue
+    from types import SimpleNamespace
+    from mqtt_gateway.mission_registry import MissionRegistry
+    from mqtt_gateway.reconnect_queue import ReconnectQueue
+    from mqtt_gateway.validator import MissionValidator
+    from rclpy.task import Future
+
+    node = object.__new__(MqttGatewayNode)
+    broker = Broker()
+    node.client, node.connected = broker, True
+    node.registry, node.validator = MissionRegistry(), MissionValidator()
+    node.reconnect = ReconnectQueue()
+    node.sequence, node.pending, node.awaiting_acceptance = {}, {}, {}
+    node.assigned_robots, node.missions, node.robot_states = {}, {}, {}
+    node.robot_ids = {"amr_01", "amr_02"}
+    node.telemetry_reconnect = {}
+    node.incoming, node.completions = queue.Queue(), queue.SimpleQueue()
+    node.current_mission_id, node.current_state = "", "IDLE"
+    node._fault_request_transport, node._fault_disconnected = False, False
+    node._pending_injections = deque()
+    node._event = lambda *args: None
+    node.get_logger = lambda: SimpleNamespace(
+        info=lambda message: None, error=lambda message: None
+    )
+    node._timestamp = lambda: "2026-10-05T00:00:00Z"
+    node.faults = SimpleNamespace(consume=lambda *args: None)
+    goals = []
+
+    def send(goal, feedback_callback):
+        goals.append((goal, feedback_callback))
+        return Future()
+
+    node.action = SimpleNamespace(send_goal_async=send, server_is_ready=lambda: True)
+    return node, broker, goals
+
+
+def test_without_dds_automatic_request_uses_empty_fleet_pin(without_dds):
+    node, _, goals = without_dds
+    node._request(
+        b'{"mission_id":"auto","pickup":"assembly","dropoff":"inspection","part":"motor"}'
+    )
+    node._drain()
+    assert goals[0][0].requested_robot_id == ""
+
+
+def test_without_dds_explicit_configured_robot_remains_pinned(without_dds):
+    node, _, goals = without_dds
+    node._request(
+        b'{"mission_id":"pin","robot_id":"amr_02","pickup":"assembly","dropoff":"inspection","part":"motor"}'
+    )
+    node._drain()
+    assert goals[0][0].requested_robot_id == "amr_02"
+
+
+def test_without_dds_unconfigured_pin_never_reaches_action(without_dds):
+    node, broker, goals = without_dds
+    node._request(
+        b'{"mission_id":"pin","robot_id":"unconfigured","pickup":"assembly","dropoff":"inspection","part":"motor"}'
+    )
+    node._drain()
+    assert goals == []
+    assert statuses(broker)[-1]["error_code"] == "INVALID_MISSION"
+
+
+def test_without_dds_status_omits_robot_until_assignment_and_keeps_it_after(
+    without_dds,
+):
+    from factory_interfaces.action import ExecuteFleetMission
+
+    node, broker, _ = without_dds
+    node.publish_status("auto", "QUEUED")
+    assert "robot_id" not in statuses(broker)[-1]
+    node._feedback(
+        "auto",
+        ExecuteFleetMission.Feedback(
+            state="ASSIGNED", assigned_robot_id="amr_02", detail="selected"
+        ),
+    )
+    node.publish_status("auto", "EXECUTING")
+    assert [payload["robot_id"] for payload in statuses(broker)[1:]] == [
+        "amr_02",
+        "amr_02",
+    ]
+
+
+def test_without_dds_terminal_result_propagates_assignment_and_error(without_dds):
+    from factory_interfaces.action import ExecuteFleetMission
+    from mqtt_gateway.models import MissionPayload
+    from rclpy.task import Future
+    from types import SimpleNamespace
+
+    node, broker, _ = without_dds
+    future = Future()
+    future.set_result(
+        SimpleNamespace(
+            result=ExecuteFleetMission.Result(
+                success=False,
+                final_state="RECOVERY_REQUIRED",
+                assigned_robot_id="amr_02",
+                error_code="PAYLOAD_UNCERTAIN",
+                message="manual recovery",
+            )
+        )
+    )
+    node._result(MissionPayload("m1", None, "assembly", "inspection", "motor"), future)
+    assert statuses(broker)[-1]["robot_id"] == "amr_02"
+    assert statuses(broker)[-1]["error_code"] == "PAYLOAD_UNCERTAIN"
+
+
+def test_without_dds_reassignment_changes_all_following_status_robot_ids(without_dds):
+    from factory_interfaces.action import ExecuteFleetMission
+
+    node, broker, _ = without_dds
+    for robot_id in ("amr_01", "amr_02"):
+        node._feedback(
+            "m1",
+            ExecuteFleetMission.Feedback(state="ASSIGNED", assigned_robot_id=robot_id),
+        )
+        node.publish_status("m1", "EXECUTING")
+    assert [s["robot_id"] for s in statuses(broker)] == [
+        "amr_01",
+        "amr_01",
+        "amr_02",
+        "amr_02",
+    ]
+
+
+def test_without_dds_telemetry_uses_each_robot_topic_and_retains_each_latest_sample(
+    without_dds,
+):
+    node, broker, _ = without_dds
+    node.connected = False
+    for robot_id, x in (("amr_01", 1.0), ("amr_02", 2.0), ("amr_01", 3.0)):
+        node.publish_telemetry({"robot_id": robot_id, "x": x})
+    node.incoming.put(("connection", True))
+    node._drain()
+    telemetry = [
+        (topic, payload["x"])
+        for topic, payload, _, _ in broker.published
+        if topic.endswith("/telemetry")
+    ]
+    assert sorted(telemetry) == [
+        ("factory/robots/amr_01/telemetry", 3.0),
+        ("factory/robots/amr_02/telemetry", 2.0),
+    ]
+
+
+def test_without_dds_vertical_automatic_mqtt_to_terminal_status(without_dds, tmp_path):
+    """Bounded vertical driver crosses real MQTT conversion and durable core."""
+    from pathlib import Path
+    from types import SimpleNamespace
+    from factory_interfaces.action import ExecuteFleetMission
+    from fleet_manager.adapter import FleetAdapter, RobotFeedback, RobotReply
+    from fleet_manager.config import Pose2D, load_fleet_config
+    from fleet_manager.journal import MissionJournal
+    from fleet_manager.models import CostEstimate, MissionRequest, RobotSnapshot
+    from rclpy.task import Future
+
+    node, broker, _ = without_dds
+    journal = MissionJournal(tmp_path / "vertical.sqlite3")
+    config = load_fleet_config(
+        Path(__file__).resolve().parents[2] / "factory_bringup/config/fleet.yaml"
+    )
+    result_future = Future()
+    feedback_sink = [None]
+    robot_goals = []
+
+    class Transport:
+        def estimate(self, robot_id, mission, callback):
+            callback(CostEstimate(True, 2 if robot_id == "amr_02" else 9, 50))
+
+        def send_goal(self, robot_id, mission, feedback, result, accepted):
+            assert journal.get(mission.mission_id).assigned_robot_id == robot_id
+            robot_goals.append((robot_id, feedback, result))
+            accepted(object(), "")
+
+        def publish(self, record, state, detail, progress):
+            assert journal.get(record.request.mission_id) == record
+            if record.state == "COMPLETED":
+                result_future.set_result(
+                    SimpleNamespace(
+                        result=ExecuteFleetMission.Result(
+                            success=True,
+                            final_state="COMPLETED",
+                            assigned_robot_id=record.assigned_robot_id,
+                            message="delivered",
+                        )
+                    )
+                )
+            else:
+                feedback_sink[0](
+                    SimpleNamespace(
+                        feedback=ExecuteFleetMission.Feedback(
+                            state=state,
+                            assigned_robot_id=record.assigned_robot_id or "",
+                            detail=detail,
+                            progress=float(progress),
+                        )
+                    )
+                )
+
+    fleet = FleetAdapter(config, journal, Transport(), clock=lambda: 100.0)
+    for robot_id in ("amr_01", "amr_02"):
+        fleet.observe(
+            RobotSnapshot(robot_id, "AVAILABLE", Pose2D(0, 0, 0), 80, "EMPTY")
+        )
+
+    def send_goal(goal, feedback_callback):
+        # Replace DDS only; keep generated ROS types and both production adapters.
+        feedback_sink[0] = feedback_callback
+        fleet.submit(
+            MissionRequest(
+                goal.mission_id,
+                goal.pickup_station,
+                goal.dropoff_station,
+                goal.part,
+                goal.requested_robot_id or None,
+            )
+        )
+        accepted = Future()
+        accepted.set_result(
+            SimpleNamespace(accepted=True, get_result_async=lambda: result_future)
+        )
+        return accepted
+
+    node.action.send_goal_async = send_goal
+    try:
+        node._request(
+            b'{"mission_id":"vertical","pickup":"assembly","dropoff":"inspection","part":"motor"}'
+        )
+        for _ in range(10):
+            node._drain()
+            fleet.tick()
+            if robot_goals:
+                break
+        assert len(robot_goals) == 1 and robot_goals[0][0] == "amr_02"
+        robot_goals[0][1](RobotFeedback("NAVIGATING_TO_DROPOFF", "loaded", 0.6))
+        robot_goals[0][2](RobotReply(True, "", "delivered"))
+        fleet.tick()
+        node._drain()
+        observed = statuses(broker)
+        assert "robot_id" not in observed[0]
+        assert any(
+            status.get("robot_id") == "amr_02" and status["state"] == "ASSIGNED"
+            for status in observed
+        )
+        assert (
+            observed[-1]["state"] == "COMPLETED"
+            and observed[-1]["robot_id"] == "amr_02"
+        )
+        assert journal.get("vertical").state == "COMPLETED"
+    finally:
+        journal.close()
 
 
 class Broker:
@@ -70,30 +327,36 @@ def rig(request):
     def execute(handle):
         executed.append(handle.request)
         handle.publish_feedback(
-            ExecuteFactoryMission.Feedback(
-                state="LOADING", station="assembly", detail="confirmed"
+            ExecuteFleetMission.Feedback(
+                state="LOADING", assigned_robot_id="amr_01", detail="confirmed"
             )
         )
         time.sleep(peer.get_parameter("execute_delay_sec").value)
         terminal = peer.get_parameter("terminal_feedback_state").value
         if terminal:
             handle.publish_feedback(
-                ExecuteFactoryMission.Feedback(
-                    state=terminal, detail="terminal feedback"
+                ExecuteFleetMission.Feedback(
+                    state=terminal,
+                    assigned_robot_id="amr_01",
+                    detail="terminal feedback",
                 )
             )
             assert peer.terminal_gate.wait(timeout=4)
         if terminal == "FAILED":
             handle.abort()
-            return ExecuteFactoryMission.Result(
+            return ExecuteFleetMission.Result(
                 success=False,
                 final_state="FAILED",
                 error_code="PLC_FAULT",
                 message="actual result",
+                assigned_robot_id="amr_01",
             )
         handle.succeed()
-        return ExecuteFactoryMission.Result(
-            success=True, final_state="COMPLETED", message="actual result"
+        return ExecuteFleetMission.Result(
+            success=True,
+            final_state="COMPLETED",
+            message="actual result",
+            assigned_robot_id="amr_01",
         )
 
     server = (
@@ -101,8 +364,8 @@ def rig(request):
         if getattr(request, "param", True) is False
         else ActionServer(
             peer,
-            ExecuteFactoryMission,
-            "/factory/execute_mission",
+            ExecuteFleetMission,
+            "/factory/execute_fleet_mission",
             execute,
             goal_callback=lambda goal: (
                 GoalResponse.REJECT if busy[0] else GoalResponse.ACCEPT
@@ -265,7 +528,7 @@ def test_real_action_conversion_status_schema_and_duplicate(rig):
     assert executed[0].pickup_station == "assembly"
     assert executed[0].dropoff_station == "inspection"
     assert all(
-        set(s)
+        set(s) | {"robot_id"}
         == {
             "mission_id",
             "robot_id",
@@ -348,7 +611,7 @@ def test_inflight_duplicate_never_overlaps_acceptance_phase(rig):
         {"part": "gear"},
         {"pickup": "inspection"},
         {"dropoff": "assembly"},
-        {"robot_id": "amr_02"},
+        {"robot_id": "not_configured"},
     ],
 )
 def test_known_id_conflicts_precede_configuration_validation(rig, changes):
@@ -411,24 +674,24 @@ def test_validation_busy_and_bounded_reconnect_replay(rig):
     ]
 
 
-def test_real_pose_odometry_conversion_and_latest_telemetry(rig):
+def test_real_robot_state_conversion_and_latest_telemetry(rig):
     broker, node, _, _, wait, peer = rig
     clock = peer.create_publisher(Clock, "/clock", 10)
-    pose_publisher = peer.create_publisher(PoseWithCovarianceStamped, "/amcl_pose", 10)
-    odom_publisher = peer.create_publisher(Odometry, "/odom", 10)
+    pose_publisher = peer.create_publisher(
+        RobotState, "/amr_01/factory/robot_state", 10
+    )
     wait(lambda: pose_publisher.get_subscription_count() > 0)
-    pose = PoseWithCovarianceStamped()
-    pose.header.frame_id = "map"
-    pose.pose.pose.orientation.w = 1.0
-    pose.pose.pose.position.x = 3.0
-    odom = Odometry()
-    odom.header.frame_id = "odom"
-    odom.pose.pose.orientation.w = 1.0
-    odom.twist.twist.linear.x = 0.2
-    odom.twist.twist.angular.z = 0.1
+    pose = RobotState(
+        robot_id="amr_01",
+        mode="AVAILABLE",
+        frame_id="map",
+        battery_percent=80.0,
+        payload_state="EMPTY",
+    )
+    pose.pose.orientation.w = 1.0
+    pose.pose.position.x = 3.0
     clock.publish(Clock(clock=rclpy.time.Time(seconds=100).to_msg()))
     pose_publisher.publish(pose)
-    odom_publisher.publish(odom)
 
     def telemetry():
         return [p for t, p, _, _ in broker.published if t.endswith("/telemetry")]
@@ -437,21 +700,21 @@ def test_real_pose_odometry_conversion_and_latest_telemetry(rig):
     sample = telemetry()[-1]
     assert sample["robot_id"] == "amr_01"
     assert sample["frame_id"] == "map" and sample["x"] == 3.0
-    assert sample["linear_velocity"] == 0.2 and sample["angular_velocity"] == 0.1
+    assert sample["battery_percent"] == 80.0 and sample["state"] == "AVAILABLE"
     assert sample["timestamp"].startswith("1970-01-01T00:01:40")
     broker.connection(False)
     wait(lambda: not node.connected)
-    pose.pose.pose.position.x = 4.0
+    pose.pose.position.x = 4.0
     pose_publisher.publish(pose)
     wait(
         lambda: (
-            node.reconnect._telemetry is not None
-            and node.reconnect._telemetry["x"] == 4.0
+            "amr_01" in node.telemetry_reconnect
+            and node.telemetry_reconnect["amr_01"]["x"] == 4.0
         )
     )
-    pose.pose.pose.position.x = 5.0
+    pose.pose.position.x = 5.0
     pose_publisher.publish(pose)
-    wait(lambda: node.reconnect._telemetry["x"] == 5.0)
+    wait(lambda: node.telemetry_reconnect["amr_01"]["x"] == 5.0)
     count = len(telemetry())
     broker.connection(True)
     wait(lambda: len(telemetry()) > count)
@@ -474,16 +737,15 @@ def test_goal_acceptance_preserves_feedback_received_before_response(rig):
 
 
 @pytest.mark.parametrize("rig", ["result-transport"], indirect=True)
-def test_feedback_before_acceptance_waits_for_received_then_preserves_order(rig):
+def test_paused_protocol_consumption_preserves_received_then_feedback_order(rig):
     broker, node, _, _, wait, peer = rig
     wait(lambda: node.connected and node.action.server_is_ready())
     node.timer.cancel()
+    peer.set_parameters([rclpy.parameter.Parameter("execute_delay_sec", value=0.15)])
     request(broker, "early-feedback")
     node._drain()
     # Poll the real ActionClient feedback while acceptance consumption is paused.
-    wait(
-        lambda: statuses(broker) or bool(node.awaiting_acceptance.get("early-feedback"))
-    )
+    wait(lambda: node.completions.qsize() >= 2)
     assert statuses(broker) == []
     assert node.registry.state_for("early-feedback") is None
     wait(lambda: not node.completions.empty())
@@ -533,8 +795,8 @@ def test_destroyed_result_client_finishes_acceptance_exactly_once(rig):
     # Restore an owned real client for normal node teardown and executor polling.
     node.action = ActionClient(
         node,
-        ExecuteFactoryMission,
-        "/factory/execute_mission",
+        ExecuteFleetMission,
+        "/factory/execute_fleet_mission",
         callback_group=node.protocol_group,
     )
     node.events.publish(ProtocolEvent(event="test_delivery_barrier"))

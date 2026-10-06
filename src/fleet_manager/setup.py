@@ -16,4 +16,5 @@ setup(
     maintainer_email="nixonedwardwinata2004@gmail.com",
     description="Validated fleet configuration and global coordination.",
     license="Apache-2.0",
+    entry_points={"console_scripts": ["fleet_manager = fleet_manager.main:main"]},
 )

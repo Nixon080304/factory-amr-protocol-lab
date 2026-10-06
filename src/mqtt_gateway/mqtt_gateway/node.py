@@ -7,7 +7,9 @@ import math
 import queue
 import time
 from dataclasses import asdict, dataclass
+from pathlib import Path
 
+from ament_index_python.packages import get_package_share_directory
 import rclpy
 from rclpy.impl.implementation_singleton import rclpy_implementation
 from rclpy.action import ActionClient
@@ -16,10 +18,10 @@ from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
-from geometry_msgs.msg import PoseWithCovarianceStamped
-from nav_msgs.msg import Odometry
-from factory_interfaces.action import ExecuteFactoryMission
-from factory_interfaces.msg import ProtocolEvent
+from factory_interfaces.action import ExecuteFleetMission
+from factory_interfaces.msg import ProtocolEvent, RobotState
+from fleet_manager.adapter import robot_endpoints
+from fleet_manager.config import load_fleet_config
 from .client import MqttClient, FAULT_REQUEST_TOPIC
 from .validator import MissionValidator, MissionValidationError
 from .mission_registry import MissionRegistry, MissionConflictError
@@ -41,11 +43,20 @@ class MqttGatewayNode(Node):
         self.set_parameters([Parameter("use_sim_time", value=True)])
         host = self.declare_parameter("broker_host", "127.0.0.1").value
         port = self.declare_parameter("broker_port", 1883).value
+        fleet_file = self.declare_parameter(
+            "fleet_file",
+            str(
+                Path(get_package_share_directory("factory_bringup"))
+                / "config/fleet.yaml"
+            ),
+        ).value
+        fleet = load_fleet_config(fleet_file)
+        self.robot_ids = {robot.robot_id for robot in fleet.robots}
         self.protocol_group = MutuallyExclusiveCallbackGroup()
         self.action = ActionClient(
             self,
-            ExecuteFactoryMission,
-            "/factory/execute_mission",
+            ExecuteFleetMission,
+            "/factory/execute_fleet_mission",
             callback_group=self.protocol_group,
         )
         self.events = self.create_publisher(
@@ -53,23 +64,21 @@ class MqttGatewayNode(Node):
             "/factory/protocol_events",
             QoSProfile(depth=100, reliability=ReliabilityPolicy.RELIABLE),
         )
-        self.localization = self.create_subscription(
-            PoseWithCovarianceStamped,
-            "/amcl_pose",
-            self._localization,
-            qos_profile_sensor_data,
-            callback_group=self.protocol_group,
-        )
-        self.odometry = self.create_subscription(
-            Odometry,
-            "/odom",
-            self._odometry,
-            qos_profile_sensor_data,
-            callback_group=self.protocol_group,
-        )
-        self.pose = None
-        self.odom_pose = None
-        self.velocity = (0.0, 0.0)
+        self.robot_subscriptions = [
+            self.create_subscription(
+                RobotState,
+                robot_endpoints(robot)["state"],
+                lambda message, robot_id=robot.robot_id: self._robot_state(
+                    robot_id, message
+                ),
+                qos_profile_sensor_data,
+                callback_group=self.protocol_group,
+            )
+            for robot in fleet.robots
+        ]
+        self.robot_states = {}
+        self.telemetry_reconnect = {}
+        self.assigned_robots, self.missions = {}, {}
         self.current_mission_id, self.current_state = "", "IDLE"
         self.validator, self.registry, self.reconnect = (
             MissionValidator(),
@@ -175,12 +184,11 @@ class MqttGatewayNode(Node):
         remember=True,
     ):
         self.get_logger().info(
-            f"mission_id={mission_id} robot_id=amr_01 station={station} state={state} error_code={error_code}"
+            f"mission_id={mission_id} robot_id={self.assigned_robots.get(mission_id, '')} station={station} state={state} error_code={error_code}"
         )
         self.sequence[mission_id] = self.sequence.get(mission_id, 0) + 1
         payload = dict(
             mission_id=mission_id,
-            robot_id="amr_01",
             state=state,
             station=station,
             timestamp=self._timestamp(),
@@ -188,6 +196,8 @@ class MqttGatewayNode(Node):
             detail=detail,
             error_code=error_code,
         )
+        if mission_id in self.assigned_robots:
+            payload["robot_id"] = self.assigned_robots[mission_id]
         if remember:
             try:
                 self.registry.update_state(mission_id, payload)
@@ -201,13 +211,15 @@ class MqttGatewayNode(Node):
         if self.connected:
             try:
                 if self.client.publish(
-                    "factory/robots/amr_01/telemetry", json.dumps(payload), qos=0
+                    f"factory/robots/{payload['robot_id']}/telemetry",
+                    json.dumps(payload),
+                    qos=0,
                 ):
                     return
             except Exception as error:
                 self.get_logger().error(f"MQTT telemetry failed: {error}")
             self.connected = False
-        self.reconnect.set_telemetry(payload)
+        self.telemetry_reconnect[payload["robot_id"]] = dict(payload)
 
     @staticmethod
     def _pose_sample(pose, frame_id):
@@ -220,30 +232,24 @@ class MqttGatewayNode(Node):
         yaw = math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
         return dict(frame_id=frame_id, x=pose.position.x, y=pose.position.y, yaw=yaw)
 
-    def _localization(self, message):
-        self.pose = self._pose_sample(message.pose.pose, message.header.frame_id)
-
-    def _odometry(self, message):
-        self.odom_pose = self._pose_sample(message.pose.pose, message.header.frame_id)
-        velocity = (message.twist.twist.linear.x, message.twist.twist.angular.z)
-        if all(math.isfinite(value) for value in velocity):
-            self.velocity = velocity
+    def _robot_state(self, robot_id, message):
+        if message.robot_id != robot_id:
+            return
+        pose = self._pose_sample(message.pose, message.frame_id)
+        if pose is None or not math.isfinite(message.battery_percent):
+            return
+        self.robot_states[robot_id] = dict(
+            robot_id=robot_id,
+            mission_id=message.mission_id,
+            state=message.mode,
+            battery_percent=message.battery_percent,
+            payload_state=message.payload_state,
+            **pose,
+        )
 
     def _sample_telemetry(self):
-        pose = self.pose or self.odom_pose
-        if pose is None:
-            return
-        self.publish_telemetry(
-            dict(
-                robot_id="amr_01",
-                mission_id=self.current_mission_id,
-                state=self.current_state,
-                **pose,
-                linear_velocity=self.velocity[0],
-                angular_velocity=self.velocity[1],
-                timestamp=self._timestamp(),
-            )
-        )
+        for payload in self.robot_states.values():
+            self.publish_telemetry(dict(payload, timestamp=self._timestamp()))
 
     def _drain(self):
         if self._fault_request_transport:
@@ -257,7 +263,9 @@ class MqttGatewayNode(Node):
                 kind, mission, future = self.completions.get_nowait()
             except queue.Empty:
                 break
-            if kind == "accepted":
+            if kind == "feedback":
+                self._feedback(mission, future)
+            elif kind == "accepted":
                 self._accepted(mission, future)
             else:
                 self._result(mission, future)
@@ -271,7 +279,7 @@ class MqttGatewayNode(Node):
                 if value:
                     try:
                         self.client.publish(
-                            "factory/robots/amr_01/availability",
+                            "factory/fleet/availability",
                             "online",
                             qos=1,
                             retain=True,
@@ -283,8 +291,9 @@ class MqttGatewayNode(Node):
                         self.connected = False
                     for payload in self.reconnect.drain_states():
                         self._send_status(payload)
-                    telemetry = self.reconnect.pop_telemetry()
-                    if telemetry is not None:
+                    telemetry_samples = list(self.telemetry_reconnect.values())
+                    self.telemetry_reconnect.clear()
+                    for telemetry in telemetry_samples:
                         self.publish_telemetry(telemetry)
             elif kind == "fault_subscription":
                 generation, ready = value
@@ -330,6 +339,11 @@ class MqttGatewayNode(Node):
             mission_id = mission.mission_id
             if self.registry.payload_for(mission_id) is None:
                 self.validator.validate_configuration(mission)
+                if (
+                    mission.robot_id is not None
+                    and mission.robot_id not in self.robot_ids
+                ):
+                    raise MissionValidationError("robot_id is not configured")
         except MissionValidationError as error:
             self._event(mission_id, "mqtt_acceptance_started")
             self._event(
@@ -364,6 +378,7 @@ class MqttGatewayNode(Node):
                 self._inject_request_faults(mission)
             return
         self._event(mission_id, "mqtt_acceptance_started")
+        self.missions[mission_id] = mission
         self.pending[mission_id] = mission
         if not generated:
             self._inject_request_faults(mission)
@@ -454,9 +469,9 @@ class MqttGatewayNode(Node):
         return lambda: self.connected
 
     def _dispatch(self, mission):
-        request = ExecuteFactoryMission.Goal(
+        request = ExecuteFleetMission.Goal(
             mission_id=mission.mission_id,
-            robot_id=mission.robot_id,
+            requested_robot_id=mission.robot_id or "",
             pickup_station=mission.pickup,
             dropoff_station=mission.dropoff,
             part=mission.part,
@@ -465,8 +480,8 @@ class MqttGatewayNode(Node):
             self.awaiting_acceptance[mission.mission_id] = deque(maxlen=100)
             future = self.action.send_goal_async(
                 request,
-                feedback_callback=lambda feedback: self._feedback(
-                    mission.mission_id, feedback.feedback
+                feedback_callback=lambda feedback: self.completions.put(
+                    ("feedback", mission.mission_id, feedback.feedback)
                 ),
             )
             future.add_done_callback(
@@ -493,16 +508,25 @@ class MqttGatewayNode(Node):
     def _feedback(self, mission_id, feedback):
         # The action result owns terminal status and its final error code.
         # Terminal feedback can precede that authoritative result on DDS.
-        if feedback.state in ("COMPLETED", "FAILED"):
+        if feedback.state in ("COMPLETED", "FAILED", "CANCELLED", "RECOVERY_REQUIRED"):
             return
         buffered = self.awaiting_acceptance.get(mission_id)
         if buffered is not None:
             # Keep observed feedback ordered after confirmed acceptance; bound memory.
             buffered.append(feedback)
             return
-        self.publish_status(
-            mission_id, feedback.state, feedback.station, feedback.detail
-        )
+        if feedback.assigned_robot_id:
+            self.assigned_robots[mission_id] = feedback.assigned_robot_id
+        mission = self.missions.get(mission_id)
+        station = ""
+        if mission is not None:
+            station = (
+                mission.dropoff
+                if feedback.state
+                in ("NAVIGATING_TO_DROPOFF", "VERIFYING_DROPOFF", "UNLOADING")
+                else mission.pickup
+            )
+        self.publish_status(mission_id, feedback.state, station, feedback.detail)
 
     def _accepted(self, mission, future):
         try:
@@ -518,7 +542,7 @@ class MqttGatewayNode(Node):
                 self.publish_status(
                     mission.mission_id,
                     "FAILED",
-                    detail="Robot rejected valid mission",
+                    detail="Fleet rejected mission",
                     error_code="ROBOT_BUSY",
                 )
                 return
@@ -560,6 +584,8 @@ class MqttGatewayNode(Node):
     def _result(self, mission, future):
         try:
             result = future.result().result
+            if result.assigned_robot_id:
+                self.assigned_robots[mission.mission_id] = result.assigned_robot_id
             self.publish_status(
                 mission.mission_id,
                 result.final_state,

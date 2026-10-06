@@ -22,6 +22,9 @@ def generate_launch_description():
         for name, values in stations.items()
     }
     system = yaml.safe_load((bringup / "config/factory_system.yaml").read_text())
+    fleet_file = bringup / "config/fleet.yaml"
+    fleet = yaml.safe_load(fleet_file.read_text())
+    robot_namespace = fleet["robots"][0]["namespace"]
     launches = []
     for package, filename, arguments in [
         (
@@ -49,6 +52,9 @@ def generate_launch_description():
             DeclareLaunchArgument("broker_port", default_value="1883"),
             DeclareLaunchArgument("plc_port", default_value="1502"),
             DeclareLaunchArgument("output_dir", default_value="artifacts/traces"),
+            DeclareLaunchArgument(
+                "journal_path", default_value="artifacts/fleet/missions.sqlite3"
+            ),
             *launches,
             *[
                 Node(
@@ -56,6 +62,14 @@ def generate_launch_description():
                     executable=executable,
                     name=name,
                     output="screen",
+                    remappings=[
+                        (
+                            "/factory/execute_mission",
+                            robot_namespace + "/factory/execute_mission",
+                        )
+                    ]
+                    if package == "mission_coordinator"
+                    else [],
                     parameters=[
                         system["/**"]["ros__parameters"],
                         system.get(name, {}).get("ros__parameters", {}),
@@ -63,6 +77,17 @@ def generate_launch_description():
                     ],
                 )
                 for package, executable, name, parameters in [
+                    (
+                        "fleet_manager",
+                        "fleet_manager",
+                        "fleet_manager",
+                        {
+                            "fleet_file": str(fleet_file),
+                            "journal_path": ParameterValue(
+                                LaunchConfiguration("journal_path"), value_type=str
+                            ),
+                        },
+                    ),
                     (
                         "mission_coordinator",
                         "mission_coordinator",
@@ -74,9 +99,10 @@ def generate_launch_description():
                         "mqtt_gateway",
                         "mqtt_gateway",
                         {
+                            "fleet_file": str(fleet_file),
                             "broker_port": ParameterValue(
                                 LaunchConfiguration("broker_port"), value_type=int
-                            )
+                            ),
                         },
                     ),
                     (
