@@ -18,6 +18,7 @@ from plc_simulator.server import PlcServer
 
 @asynccontextmanager
 async def station_server(**options):
+    options.setdefault("ownership_enabled", False)
     server = PlcServer(port=0, **options)
     await server.start()
     port = server.port
@@ -264,18 +265,27 @@ def test_two_correlated_station_cycles_and_foreign_cleanup_with_real_modbus():
     import json
     import struct
 
-    async def ownership(server, operation, unit, robot, mission):
+    sessions = {}
+
+    async def ownership(server, operation, unit, robot, mission, endpoint=None):
+        fields = dict(
+            operation=operation,
+            unit_id=unit,
+            robot_id=robot,
+            mission_id=mission,
+            part="motor",
+        )
+        if operation == "claim":
+            fields["endpoint"] = list(endpoint)
+        else:
+            session = sessions[unit]
+            fields.update(session=session["token"], sequence=session["sequence"] + 1)
+            if robot == session["robot"]:
+                session["sequence"] += 1
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection("127.0.0.1", server.fault_control_port), 1
         )
         try:
-            fields = dict(
-                operation=operation,
-                unit_id=unit,
-                robot_id=robot,
-                mission_id=mission,
-                part="motor",
-            )
             encoded = json.dumps(fields).encode()
             writer.write(b"\xff" + struct.pack("!H", len(encoded)) + encoded)
             await writer.drain()
@@ -283,7 +293,8 @@ def test_two_correlated_station_cycles_and_foreign_cleanup_with_real_modbus():
             assert header[:1] == b"\xff"
             return json.loads(
                 await asyncio.wait_for(
-                    reader.readexactly(struct.unpack("!H", header[1:])[0]), 1
+                    reader.readexactly(struct.unpack("!H", header[1:])[0]),
+                    1,
                 )
             )
         finally:
@@ -291,29 +302,80 @@ def test_two_correlated_station_cycles_and_foreign_cleanup_with_real_modbus():
             await writer.wait_closed()
 
     async def scenario():
-        async with station_server(cycle_delay=0.1) as server:
+        async with station_server(cycle_delay=0.1, ownership_enabled=True) as server:
             await server.start_fault_control()
-            assert (await ownership(server, "claim", 1, "amr_01", "M-1"))["accepted"]
-            assert (await ownership(server, "claim", 2, "amr_02", "M-2"))["accepted"]
-            assert not (await ownership(server, "claim", 1, "amr_02", "M-3"))[
-                "accepted"
-            ]
             client = StationClient(port=server.port)
+
+            async def transfer(unit, robot, mission):
+                async def connected(raw):
+                    endpoint = raw.ctx.transport.get_extra_info("sockname")[:2]
+                    claim = await ownership(
+                        server, "claim", unit, robot, mission, endpoint
+                    )
+                    assert claim["accepted"]
+                    sessions[unit] = dict(
+                        token=claim["session"], sequence=0, robot=robot
+                    )
+                    if unit == 1:
+                        foreign = AsyncModbusTcpClient(
+                            "127.0.0.1", port=server.port, retries=0, timeout=0.5
+                        )
+                        try:
+                            assert await foreign.connect()
+                            assert not (
+                                await ownership(
+                                    server,
+                                    "claim",
+                                    1,
+                                    "amr_02",
+                                    "M-3",
+                                    foreign.ctx.transport.get_extra_info("sockname")[
+                                        :2
+                                    ],
+                                )
+                            )["accepted"]
+                            assert (
+                                await foreign.write_coils(
+                                    1, [False, False], device_id=1
+                                )
+                            ).isError()
+                        finally:
+                            foreign.close()
+
+                async def finished(result):
+                    assert result.success
+                    status = await ownership(server, "status", unit, robot, mission)
+                    assert status["accepted"]
+                    assert status["last_completion"] == dict(
+                        robot_id=robot,
+                        mission_id=mission,
+                        part="motor",
+                        cycle_counter=1,
+                    )
+                    if unit == 1:
+                        assert not (
+                            await ownership(server, "release", 1, "amr_02", mission)
+                        )["accepted"]
+                    assert (await ownership(server, "release", unit, robot, mission))[
+                        "accepted"
+                    ]
+                    return result
+
+                return await client.transfer(
+                    unit,
+                    1,
+                    on_connected=connected,
+                    on_finished=finished,
+                    connection_bound=True,
+                )
+
             first, second = await asyncio.wait_for(
-                asyncio.gather(client.transfer(1, 1), client.transfer(2, 1)), 3
+                asyncio.gather(
+                    transfer(1, "amr_01", "M-1"),
+                    transfer(2, "amr_02", "M-2"),
+                ),
+                4,
             )
             assert first.success and second.success
-            assert not (await ownership(server, "release", 1, "amr_02", "M-1"))[
-                "accepted"
-            ]
-            for unit, robot, mission in [(1, "amr_01", "M-1"), (2, "amr_02", "M-2")]:
-                status = await ownership(server, "status", unit, robot, mission)
-                assert status["accepted"]
-                assert status["last_completion"] == dict(
-                    robot_id=robot, mission_id=mission, part="motor", cycle_counter=1
-                )
-                assert (await ownership(server, "release", unit, robot, mission))[
-                    "accepted"
-                ]
 
     asyncio.run(scenario())

@@ -23,7 +23,7 @@ def pure_gateway(monkeypatch):
     from rclpy.node import Node
     from rclpy.time import Time
 
-    events = []
+    events, acknowledgements = [], []
     monkeypatch.setattr(Node, "__init__", lambda *args, **kwargs: None)
     monkeypatch.setattr(Node, "set_parameters", lambda *args: [])
     monkeypatch.setattr(
@@ -37,14 +37,19 @@ def pure_gateway(monkeypatch):
         Node,
         "create_publisher",
         lambda self, kind, *args: SimpleNamespace(
-            publish=lambda message: events.append(message)
+            publish=lambda message: (
+                events.append(message)
+                if kind is ProtocolEvent
+                else acknowledgements.append(message)
+            )
         ),
     )
     endpoints = []
 
     class Endpoint:
-        def __init__(self, group):
+        def __init__(self, group, callback):
             self.callback_group = group
+            self.callback = callback
             group.add_entity(self)
             endpoints.append(self)
 
@@ -55,7 +60,9 @@ def pure_gateway(monkeypatch):
             pass
 
     def endpoint(*args, callback_group, **kwargs):
-        return Endpoint(callback_group)
+        return Endpoint(
+            callback_group, args[2] if isinstance(args[1], float) else args[3]
+        )
 
     monkeypatch.setattr(Node, "create_service", endpoint)
     monkeypatch.setattr(Node, "create_subscription", endpoint)
@@ -74,6 +81,7 @@ def pure_gateway(monkeypatch):
     Socket.connect_failures = 0
     node = ModbusGatewayNode()
     node.test_endpoints = endpoints
+    node.test_acknowledgements = acknowledgements
     return node, events
 
 
@@ -150,6 +158,175 @@ def test_station_fault_evidence_carries_actual_robot_operation(
     )
 
 
+def test_review_expiring_fault_keeps_activation_robot_across_other_transfer(
+    pure_gateway, monkeypatch
+):
+    node, events = pure_gateway
+    now = [0.0]
+    node.faults._clock = lambda: now[0]
+    node.faults.enable(
+        FaultRequest(
+            "modbus_delay",
+            "M-1",
+            station="assembly",
+            duration=0.2,
+            one_shot=False,
+        )
+    )
+    monkeypatch.setattr(node, "_plc_control", lambda *args: None)
+    assert transfer(node, robot="amr_01").accepted
+    now[0] = 1.0
+    assert transfer(node, mission="M-2", robot="amr_02", station="inspection").accepted
+    assert all(
+        event.robot_id == "amr_01"
+        for event in events
+        if event.protocol == "FAULT" and event.mission_id == "M-1"
+    )
+
+
+def test_review_reset_waits_for_physical_restore_without_blocking_other_station(
+    pure_gateway, monkeypatch
+):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from factory_interfaces.msg import FaultCommand
+
+    node, _ = pure_gateway
+    entered, release_transfer, release_restore = (
+        threading.Event(),
+        threading.Event(),
+        threading.Event(),
+    )
+    physical = [False]
+
+    def control(unit, fault=None):
+        if fault is None:
+            if not release_restore.is_set():
+                raise RuntimeError("physical restoration unavailable")
+            physical[0] = False
+        else:
+            physical[0] = True
+
+    class HeldSocket(Socket):
+        async def read_coils(self, *args, **kwargs):
+            if kwargs["device_id"] == 1 and not self.started:
+                entered.set()
+                deadline = asyncio.get_running_loop().time() + 3
+                while (
+                    not release_transfer.is_set()
+                    and asyncio.get_running_loop().time() < deadline
+                ):
+                    await asyncio.sleep(0.005)
+                assert release_transfer.is_set()
+            return await super().read_coils(*args, **kwargs)
+
+    monkeypatch.setattr(node, "_plc_control", control)
+    monkeypatch.setattr(
+        "modbus_gateway.station_client.AsyncModbusTcpClient", HeldSocket
+    )
+    node.faults.enable(FaultRequest("modbus_delay", "M-1", station="assembly"))
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        assembly = executor.submit(transfer, node)
+        try:
+            assert entered.wait(1) and physical[0]
+            old_reset = node._reset_controls()
+            node.fault_subscription.callback(
+                FaultCommand(
+                    reset=True,
+                    command_id=92,
+                    ack_timeout_sec=2.0,
+                )
+            )
+            assert not node.test_acknowledgements
+            assert transfer(node, "M-2", "amr_02", "inspection").accepted
+            release_restore.set()
+            node.test_endpoints[1].callback()
+            assert not physical[0]
+            assert [ack.command_id for ack in node.test_acknowledgements] == [92]
+        finally:
+            release_transfer.set()
+            release_restore.set()
+        assert assembly.result(timeout=2).accepted
+        entered.clear()
+        release_transfer.clear()
+        node.faults.enable(FaultRequest("modbus_delay", "M-3", station="assembly"))
+        next_assembly = executor.submit(transfer, node, "M-3", "amr_02")
+        try:
+            assert entered.wait(1) and physical[0]
+            # A late readiness poll for the old generation cannot erase the new
+            # station effect, even though the old generation is already restored.
+            assert old_reset()
+            assert physical[0]
+        finally:
+            release_transfer.set()
+        assert next_assembly.result(timeout=2).accepted
+        assert not physical[0]
+
+
+def test_review_explicit_v1_transfer_preserves_safe_reconnect(
+    pure_gateway, monkeypatch
+):
+    node, _ = pure_gateway
+
+    class ReconnectingSocket(Socket):
+        async def read_coils(self, *args, **kwargs):
+            result = await super().read_coils(*args, **kwargs)
+            if not getattr(self, "disconnected_once", False):
+                self.disconnected_once = True
+                self.connected = False
+            return result
+
+    monkeypatch.setattr(
+        "modbus_gateway.station_client.AsyncModbusTcpClient", ReconnectingSocket
+    )
+    assert transfer(node).accepted
+
+
+def test_review_lost_boundary_result_never_claims_not_requested(
+    pure_gateway, monkeypatch
+):
+    node, events = pure_gateway
+
+    class CloseFailureSocket(Socket):
+        def close(self):
+            raise RuntimeError("connection close failed after physical work")
+
+    monkeypatch.setattr(
+        "modbus_gateway.station_client.AsyncModbusTcpClient", CloseFailureSocket
+    )
+    result = transfer(node)
+    assert not result.accepted
+    assert result.error_code == "PLC_TIMEOUT_TRANSFER_UNKNOWN"
+    finish = next(event for event in events if event.event == "modbus_pickup_finished")
+    assert json.loads(finish.detail)["transfer_outcome"] == "UNKNOWN"
+
+
+def test_review_station_client_awaits_connection_hooks_before_close(pure_gateway):
+    node, _ = pure_gateway
+    stages = []
+
+    async def connected(client):
+        assert client.connected
+        stages.append("claimed")
+
+    async def finished(result):
+        assert result.outcome == "COMPLETED"
+        assert stages == ["claimed"]
+        stages.append("released")
+        return result
+
+    result = asyncio.run(
+        node.station.transfer(
+            1,
+            1,
+            on_connected=connected,
+            on_finished=finished,
+        )
+    )
+    assert result.success
+    assert stages == ["claimed", "released"]
+
+
 def test_different_stations_progress_concurrently_without_event_cross_talk(
     pure_gateway, monkeypatch
 ):
@@ -194,8 +371,9 @@ def test_different_stations_progress_concurrently_without_event_cross_talk(
     } == {("M-1", "amr_01"), ("M-2", "amr_02")}
 
 
+@pytest.mark.parametrize("lose_connection", [False, True])
 def test_gateway_claims_correlated_plc_cycle_and_releases_exact_owner(
-    pure_gateway, monkeypatch
+    pure_gateway, monkeypatch, lose_connection
 ):
     from plc_simulator.server import PlcServer
 
@@ -224,7 +402,10 @@ def test_gateway_claims_correlated_plc_cycle_and_releases_exact_owner(
                 reader.feed_eof()
                 await server._control_request(reader, self)
 
-            asyncio.run(handle())
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                executor.submit(asyncio.run, handle()).result(timeout=1)
 
         def write(self, data):
             self.output.extend(data)
@@ -237,38 +418,111 @@ def test_gateway_claims_correlated_plc_cycle_and_releases_exact_owner(
             del self.output[:size]
             return result
 
-    class PlcSocket(Socket):
-        async def read_coils(self, *args, **kwargs):
-            station = server.stations[kwargs["device_id"]]
-            station.advance(1)
-            return SimpleNamespace(bits=list(station.coils))
+    tcp = []
 
-        async def read_holding_registers(self, *args, **kwargs):
-            return SimpleNamespace(
-                registers=list(server.stations[kwargs["device_id"]].registers)
+    class PlcSocket:
+        def __init__(self, *args, **kwargs):
+            from plc_simulator.server import OwnershipModbusServer
+
+            if not tcp:
+                tcp.append(OwnershipModbusServer(server))
+            self.handler = tcp[0].callback_new_connection()
+            self.handler.transport = SimpleNamespace(
+                get_extra_info=lambda name: ("127.0.0.1", 20101)
+            )
+            self.ctx = SimpleNamespace(transport=self.handler.transport)
+            self.connected = False
+            self.sequence = 0
+
+        async def connect(self):
+            self.handler.callback_connected()
+            self.connected = True
+            return True
+
+        async def raw(self, pdu):
+            self.sequence += 1
+            pdu.transaction_id = self.sequence
+            self.handler.last_pdu = pdu
+            output = []
+            self.handler.server_send = lambda response, address: output.append(response)
+            await self.handler.handle_request()
+            return output[-1]
+
+        async def read_coils(self, address, *, count, device_id):
+            from pymodbus.pdu.bit_message import ReadCoilsRequest
+
+            return await self.raw(
+                ReadCoilsRequest(dev_id=device_id, address=address, count=count)
             )
 
-        async def write_register(self, address, value, **kwargs):
-            server.stations[kwargs["device_id"]].write_register(address, value)
-            return True
+        async def read_holding_registers(self, address, *, count, device_id):
+            from pymodbus.pdu.register_message import ReadHoldingRegistersRequest
 
-        async def write_coil(self, address, value, **kwargs):
-            server.stations[kwargs["device_id"]].write_coil(address, value, now=0)
-            return True
-
-        async def write_coils(self, address, values, **kwargs):
-            for offset, value in enumerate(values):
-                server.stations[kwargs["device_id"]].write_coil(
-                    address + offset, value, now=1
+            return await self.raw(
+                ReadHoldingRegistersRequest(
+                    dev_id=device_id, address=address, count=count
                 )
-            return True
+            )
+
+        async def write_register(self, address, value, *, device_id):
+            from pymodbus.pdu.register_message import WriteSingleRegisterRequest
+
+            return await self.raw(
+                WriteSingleRegisterRequest(
+                    dev_id=device_id, address=address, registers=[value]
+                )
+            )
+
+        async def write_coil(self, address, value, *, device_id):
+            from pymodbus.pdu.bit_message import WriteSingleCoilRequest
+
+            response = await self.raw(
+                WriteSingleCoilRequest(dev_id=device_id, address=address, bits=[value])
+            )
+            if lose_connection and address == 2 and value:
+                self.connected = False
+                self.handler.callback_disconnected(None)
+            return response
+
+        async def write_coils(self, address, values, *, device_id):
+            from pymodbus.pdu.bit_message import WriteMultipleCoilsRequest
+
+            return await self.raw(
+                WriteMultipleCoilsRequest(
+                    dev_id=device_id, address=address, bits=values
+                )
+            )
+
+        def close(self):
+            if self.connected:
+                self.connected = False
+                self.handler.callback_disconnected(None)
 
     monkeypatch.setattr(
         "modbus_gateway.node.socket.create_connection",
         lambda *args, **kwargs: ControlSocket(),
     )
     monkeypatch.setattr("modbus_gateway.station_client.AsyncModbusTcpClient", PlcSocket)
-    assert transfer(node, robot="amr_02").accepted
+    response = transfer(node, robot="amr_02")
+    if lose_connection:
+        assert not response.accepted
+        assert response.error_code == "PLC_TIMEOUT_TRANSFER_UNKNOWN"
+        assert [operation["operation"] for operation in operations] == [
+            "claim",
+            "release",
+        ]
+        assert server.stations[1].owner == ("amr_02", "M-1", "motor")
+        # A zero-delay PLC can complete before disconnect, but the gateway has
+        # no matching observation and must retain UNKNOWN and the station owner.
+        assert server.stations[1].last_completion == dict(
+            robot_id="amr_02", mission_id="M-1", part="motor", cycle_counter=1
+        )
+        assert server.stations[1].coils[1:3] == [True, True]
+        assert not server._sessions
+        assert not server._connections
+        assert len(tcp) == 1
+        return
+    assert response.accepted
     assert [operation["operation"] for operation in operations] == [
         "claim",
         "status",

@@ -46,7 +46,9 @@ class FaultRequest:
             or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", self.robot_id)
         ):
             raise ValueError("invalid robot ID")
-        if self.name == "mqtt_disconnect" and self.robot_id is not None:
+        if self.name == "mqtt_disconnect" and (
+            self.robot_id is not None or self.station is not None
+        ):
             raise ValueError(
                 "mqtt_disconnect affects the shared broker transport and requires global scope"
             )

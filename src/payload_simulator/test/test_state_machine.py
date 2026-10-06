@@ -24,7 +24,12 @@ def complete(
 ):
     if detail is None:
         detail = json.dumps(
-            {"station_id": "assembly", "transfer_kind": "LOADING", "cycle_counter": 1}
+            {
+                "station_id": "assembly",
+                "transfer_kind": "LOADING",
+                "cycle_counter": 1,
+                "part": "motor",
+            }
         )
     return machine.apply_protocol_event(
         mission_id, protocol, event, outcome, detail, robot_id=robot_id
@@ -34,11 +39,15 @@ def complete(
 def test_successful_load_then_unload_moves_one_part_once():
     machine = PayloadStateMachine()
     assert machine.state == PayloadState.AT_ASSEMBLY
-    loaded = machine.apply_transfer("mission_1", "LOADING", 65535, robot_id="amr_01")
+    loaded = machine.apply_transfer(
+        "mission_1", "LOADING", 65535, robot_id="amr_01", part="motor"
+    )
     assert loaded.applied
     assert loaded.previous_state == PayloadState.AT_ASSEMBLY
     assert loaded.state == machine.state == PayloadState.IN_TRANSIT
-    unloaded = machine.apply_transfer("mission_1", "UNLOADING", 0, robot_id="amr_01")
+    unloaded = machine.apply_transfer(
+        "mission_1", "UNLOADING", 0, robot_id="amr_01", part="motor"
+    )
     assert unloaded.applied
     assert unloaded.previous_state == PayloadState.IN_TRANSIT
     assert unloaded.state == machine.state == PayloadState.AT_INSPECTION
@@ -47,51 +56,55 @@ def test_successful_load_then_unload_moves_one_part_once():
 def test_unload_before_load_does_not_consume_completion():
     machine = PayloadStateMachine()
     assert not machine.apply_transfer(
-        "mission_1", "UNLOADING", 7, robot_id="amr_01"
+        "mission_1", "UNLOADING", 7, robot_id="amr_01", part="motor"
     ).applied
     assert machine.state == PayloadState.AT_ASSEMBLY
-    assert machine.apply_transfer("mission_1", "LOADING", 6, robot_id="amr_01").applied
     assert machine.apply_transfer(
-        "mission_1", "UNLOADING", 7, robot_id="amr_01"
+        "mission_1", "LOADING", 6, robot_id="amr_01", part="motor"
+    ).applied
+    assert machine.apply_transfer(
+        "mission_1", "UNLOADING", 7, robot_id="amr_01", part="motor"
     ).applied
 
 
 def test_duplicate_completion_never_replays_transition():
     machine = PayloadStateMachine()
-    machine.apply_transfer("mission_1", "LOADING", 1, robot_id="amr_01")
-    replay = machine.apply_transfer("mission_1", "LOADING", 1, robot_id="amr_01")
+    machine.apply_transfer("mission_1", "LOADING", 1, robot_id="amr_01", part="motor")
+    replay = machine.apply_transfer(
+        "mission_1", "LOADING", 1, robot_id="amr_01", part="motor"
+    )
     assert not replay.applied
     assert replay.reason == "duplicate"
     assert machine.state == PayloadState.IN_TRANSIT
-    machine.apply_transfer("mission_1", "UNLOADING", 1, robot_id="amr_01")
+    machine.apply_transfer("mission_1", "UNLOADING", 1, robot_id="amr_01", part="motor")
     assert not machine.apply_transfer(
-        "mission_1", "UNLOADING", 1, robot_id="amr_01"
+        "mission_1", "UNLOADING", 1, robot_id="amr_01", part="motor"
     ).applied
     assert not machine.apply_transfer(
-        "mission_1", "LOADING", 1, robot_id="amr_01"
+        "mission_1", "LOADING", 1, robot_id="amr_01", part="motor"
     ).applied
     assert machine.state == PayloadState.AT_INSPECTION
 
 
 def test_changed_mission_cannot_unload_part_in_transit():
     machine = PayloadStateMachine()
-    machine.apply_transfer("mission_1", "LOADING", 1, robot_id="amr_01")
+    machine.apply_transfer("mission_1", "LOADING", 1, robot_id="amr_01", part="motor")
     assert not machine.apply_transfer(
-        "mission_2", "UNLOADING", 2, robot_id="amr_01"
+        "mission_2", "UNLOADING", 2, robot_id="amr_01", part="motor"
     ).applied
     assert machine.mission_id == "mission_1"
     assert machine.state == PayloadState.IN_TRANSIT
     assert machine.apply_transfer(
-        "mission_1", "UNLOADING", 2, robot_id="amr_01"
+        "mission_1", "UNLOADING", 2, robot_id="amr_01", part="motor"
     ).applied
 
 
 def test_single_part_does_not_reset_for_next_mission():
     machine = PayloadStateMachine()
-    machine.apply_transfer("mission_1", "LOADING", 1, robot_id="amr_01")
-    machine.apply_transfer("mission_1", "UNLOADING", 2, robot_id="amr_01")
+    machine.apply_transfer("mission_1", "LOADING", 1, robot_id="amr_01", part="motor")
+    machine.apply_transfer("mission_1", "UNLOADING", 2, robot_id="amr_01", part="motor")
     assert not machine.apply_transfer(
-        "mission_2", "LOADING", 3, robot_id="amr_01"
+        "mission_2", "LOADING", 3, robot_id="amr_01", part="motor"
     ).applied
     assert machine.state == PayloadState.AT_INSPECTION
 
@@ -112,12 +125,14 @@ def test_single_part_does_not_reset_for_next_mission():
         {"detail": "null"},
         {"detail": "[" * 1100 + "0" + "]" * 1100},
         {
-            "detail": '{"station_id":"inspection","transfer_kind":"LOADING","cycle_counter":1}'
+            "detail": '{"station_id":"inspection","transfer_kind":"LOADING","cycle_counter":1,"part":"motor"}'
         },
         {
-            "detail": '{"station_id":"assembly","transfer_kind":"UNLOADING","cycle_counter":1}'
+            "detail": '{"station_id":"assembly","transfer_kind":"UNLOADING","cycle_counter":1,"part":"motor"}'
         },
-        {"detail": '{"station_id":"assembly","transfer_kind":"LOADING"}'},
+        {
+            "detail": '{"station_id":"assembly","transfer_kind":"LOADING","part":"motor"}'
+        },
     ],
 )
 def test_failed_or_malformed_event_leaves_state_unchanged(overrides):
@@ -132,11 +147,16 @@ def test_failed_or_malformed_event_leaves_state_unchanged(overrides):
 def test_cycle_counter_requires_uint16_integer(counter):
     machine = PayloadStateMachine()
     detail = json.dumps(
-        {"station_id": "assembly", "transfer_kind": "LOADING", "cycle_counter": counter}
+        {
+            "station_id": "assembly",
+            "transfer_kind": "LOADING",
+            "part": "motor",
+            "cycle_counter": counter,
+        }
     )
     assert not complete(machine, detail=detail).applied
     assert not machine.apply_transfer(
-        "mission_1", "LOADING", counter, robot_id="amr_01"
+        "mission_1", "LOADING", counter, robot_id="amr_01", part="motor"
     ).applied
     assert machine.state == PayloadState.AT_ASSEMBLY
 
@@ -144,7 +164,7 @@ def test_cycle_counter_requires_uint16_integer(counter):
 def test_success_event_validates_inspection_unload():
     machine = PayloadStateMachine()
     assert complete(machine).applied
-    detail = '{"station_id":"inspection","transfer_kind":"UNLOADING","cycle_counter":8}'
+    detail = '{"station_id":"inspection","transfer_kind":"UNLOADING","cycle_counter":8,"part":"motor"}'
     assert complete(machine, event="modbus_dropoff_finished", detail=detail).applied
     assert machine.state == PayloadState.AT_INSPECTION
 
@@ -159,6 +179,7 @@ def test_cleanup_failure_moves_only_confirmed_physical_cycle(physical_outcome, m
             "station_id": "assembly",
             "transfer_kind": "LOADING",
             "cycle_counter": 1,
+            "part": "motor",
             "transfer_outcome": physical_outcome,
             "error_code": "PLC_TIMEOUT_TRANSFER_" + physical_outcome,
             "message": "cleanup acknowledgment lost",
@@ -174,28 +195,90 @@ def test_cleanup_failure_moves_only_confirmed_physical_cycle(physical_outcome, m
 
 def test_interleaved_payloads_remain_owned_by_exact_robot_and_mission():
     machine = PayloadStateMachine()
-    assert machine.apply_transfer("M-1", "LOADING", 1, robot_id="amr_01").applied
-    assert machine.apply_transfer("M-2", "LOADING", 2, robot_id="amr_02").applied
-    assert not machine.apply_transfer("M-1", "UNLOADING", 3, robot_id="amr_02").applied
-    assert not machine.apply_transfer("M-2", "UNLOADING", 3, robot_id="amr_01").applied
-    assert machine.apply_transfer("M-1", "UNLOADING", 3, robot_id="amr_01").applied
+    assert machine.apply_transfer(
+        "M-1", "LOADING", 1, robot_id="amr_01", part="motor"
+    ).applied
+    assert machine.apply_transfer(
+        "M-2", "LOADING", 2, robot_id="amr_02", part="motor"
+    ).applied
+    assert not machine.apply_transfer(
+        "M-1", "UNLOADING", 3, robot_id="amr_02", part="motor"
+    ).applied
+    assert not machine.apply_transfer(
+        "M-2", "UNLOADING", 3, robot_id="amr_01", part="motor"
+    ).applied
+    assert machine.apply_transfer(
+        "M-1", "UNLOADING", 3, robot_id="amr_01", part="motor"
+    ).applied
     assert machine.state_for("amr_02", "M-2") == PayloadState.IN_TRANSIT
-    assert not machine.apply_transfer("M-1", "LOADING", 1, robot_id="amr_01").applied
-    assert machine.apply_transfer("M-2", "UNLOADING", 4, robot_id="amr_02").applied
+    assert not machine.apply_transfer(
+        "M-1", "LOADING", 1, robot_id="amr_01", part="motor"
+    ).applied
+    assert machine.apply_transfer(
+        "M-2", "UNLOADING", 4, robot_id="amr_02", part="motor"
+    ).applied
     assert machine.state_for("amr_01", "M-1") == PayloadState.AT_INSPECTION
 
 
 @pytest.mark.parametrize("robot_id", [None, "", "bad/id", "x" * 65])
 def test_missing_or_invalid_robot_cannot_attach_payload(robot_id):
     machine = PayloadStateMachine()
-    assert not machine.apply_transfer("M-1", "LOADING", 1, robot_id=robot_id).applied
+    assert not machine.apply_transfer(
+        "M-1", "LOADING", 1, robot_id=robot_id, part="motor"
+    ).applied
 
 
 def test_confirmed_mission_payload_cannot_reattach_after_robot_reassignment():
     machine = PayloadStateMachine()
-    assert machine.apply_transfer("M-1", "LOADING", 1, robot_id="amr_01").applied
-    assert not machine.apply_transfer("M-1", "LOADING", 2, robot_id="amr_02").applied
-    assert not machine.apply_transfer("M-1", "UNLOADING", 3, robot_id="amr_02").applied
+    assert machine.apply_transfer(
+        "M-1", "LOADING", 1, robot_id="amr_01", part="motor"
+    ).applied
+    assert not machine.apply_transfer(
+        "M-1", "LOADING", 2, robot_id="amr_02", part="motor"
+    ).applied
+    assert not machine.apply_transfer(
+        "M-1", "UNLOADING", 3, robot_id="amr_02", part="motor"
+    ).applied
     assert machine.state_for("amr_01", "M-1") == PayloadState.IN_TRANSIT
-    assert machine.apply_transfer("M-1", "UNLOADING", 3, robot_id="amr_01").applied
-    assert not machine.apply_transfer("M-1", "LOADING", 4, robot_id="amr_02").applied
+    assert machine.apply_transfer(
+        "M-1", "UNLOADING", 3, robot_id="amr_01", part="motor"
+    ).applied
+    assert not machine.apply_transfer(
+        "M-1", "LOADING", 4, robot_id="amr_02", part="motor"
+    ).applied
+
+
+@pytest.mark.parametrize("part", [None, "gear", ""])
+@pytest.mark.parametrize("kind", ["LOADING", "UNLOADING"])
+def test_review_missing_or_conflicting_part_cannot_move_payload(part, kind):
+    machine = PayloadStateMachine()
+    if kind == "UNLOADING":
+        assert complete(
+            machine,
+            detail=json.dumps(
+                dict(
+                    station_id="assembly",
+                    transfer_kind="LOADING",
+                    cycle_counter=1,
+                    part="motor",
+                )
+            ),
+        ).applied
+    fields = dict(
+        station_id="assembly" if kind == "LOADING" else "inspection",
+        transfer_kind=kind,
+        cycle_counter=2,
+    )
+    if part is not None:
+        fields["part"] = part
+    transition = complete(
+        machine,
+        event="modbus_pickup_finished"
+        if kind == "LOADING"
+        else "modbus_dropoff_finished",
+        detail=json.dumps(fields),
+    )
+    assert not transition.applied
+    assert machine.state == (
+        PayloadState.AT_ASSEMBLY if kind == "LOADING" else PayloadState.IN_TRANSIT
+    )

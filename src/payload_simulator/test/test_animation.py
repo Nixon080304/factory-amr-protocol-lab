@@ -143,6 +143,7 @@ def test_interleaved_node_events_publish_and_animate_only_correct_robot(monkeypa
                         station_id="assembly" if kind == "LOADING" else "inspection",
                         transfer_kind=kind,
                         cycle_counter=counter,
+                        part="motor",
                     )
                 ),
             )
@@ -206,7 +207,7 @@ def test_missing_robot_event_cannot_publish_or_queue_visual(monkeypatch):
             protocol="MODBUS",
             event="modbus_pickup_finished",
             outcome="SUCCEEDED",
-            detail='{"station_id":"assembly","transfer_kind":"LOADING","cycle_counter":1}',
+            detail='{"station_id":"assembly","transfer_kind":"LOADING","cycle_counter":1,"part":"motor"}',
         )
     )
     assert not node._animations

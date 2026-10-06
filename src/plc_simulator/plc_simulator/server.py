@@ -2,16 +2,118 @@
 
 import argparse
 import asyncio
+from collections import deque
+from contextvars import ContextVar
 import json
 import math
+import secrets
 import signal
 import struct
+import time
 
 from pymodbus.constants import ExcCodes
+from pymodbus.exceptions import NoSuchIdException
 from pymodbus.server import ModbusTcpServer
+from pymodbus.server.requesthandler import ServerRequestHandler
+from pymodbus.pdu import ExceptionResponse
 from pymodbus.simulator import DataType, SimData, SimDevice
 
 from .station_cycle import StationCycle
+
+_CURRENT_SESSION = object()
+
+
+class OwnershipRequestHandler(ServerRequestHandler):
+    """Bind datastore authorization to this actual TCP protocol instance."""
+
+    def __init__(self, *args):
+        self._requests = deque()
+        self._transactions = set()
+        super().__init__(*args)
+
+    def callback_data(self, data, addr=None):
+        used = super().callback_data(data, addr)
+        if self.last_pdu is not None:
+            self._requests.append(
+                (
+                    self.last_pdu,
+                    self.last_addr,
+                    self.server.plc._sessions.get(self.last_pdu.dev_id),
+                )
+            )
+        return used
+
+    def callback_connected(self):
+        super().callback_connected()
+        self.endpoint = tuple(self.transport.get_extra_info("peername")[:2])
+        self.server.plc._connections[self.endpoint] = self
+
+    def callback_disconnected(self, exc):
+        self.server.plc._disconnect(self)
+        super().callback_disconnected(exc)
+
+    def handle_later(self):
+        # Capture before another packet can replace PyModbus's last_pdu field.
+        pdu, address, session = self._requests.popleft()
+        asyncio.run_coroutine_threadsafe(
+            self.handle_request(pdu, address, session), self.loop
+        )
+
+    async def handle_request(self, pdu=None, address=None, session=_CURRENT_SESSION):
+        pdu = pdu or self.last_pdu
+        if pdu is None:
+            return
+        plc = self.server.plc
+        if session is _CURRENT_SESSION:
+            session = plc._sessions.get(pdu.dev_id)
+        authorization = None
+        if session is not None and session["connection"] is self:
+            if (
+                plc._clock() >= session["expires"]
+                or pdu.transaction_id in session["transactions"]
+            ):
+                self.server_send(
+                    ExceptionResponse(
+                        pdu.function_code,
+                        ExcCodes.ILLEGAL_FUNCTION,
+                        device_id=pdu.dev_id,
+                        transaction=pdu.transaction_id,
+                    ),
+                    address,
+                )
+                return
+            session["transactions"].add(pdu.transaction_id)
+            authorization = (pdu.dev_id, session, self)
+        token = plc._raw_authorization.set(authorization)
+        try:
+            try:
+                response = await pdu.datastore_update(self.server.context, pdu.dev_id)
+            except NoSuchIdException:
+                if self.server.ignore_missing_devices:
+                    return
+                response = ExceptionResponse(
+                    pdu.function_code, ExcCodes.GATEWAY_NO_RESPONSE
+                )
+            except Exception:
+                response = ExceptionResponse(pdu.function_code, ExcCodes.DEVICE_FAILURE)
+            response.transaction_id = pdu.transaction_id
+            response.dev_id = pdu.dev_id
+            self.server_send(response, address)
+        finally:
+            plc._raw_authorization.reset(token)
+
+
+class OwnershipModbusServer(ModbusTcpServer):
+    """Use PyModbus's connection factory; no global transport monkey-patching."""
+
+    def __init__(self, plc):
+        self.plc = plc
+        super().__init__([plc._device(1), plc._device(2)], address=(plc.host, plc.port))
+
+    def callback_new_connection(self):
+        return OwnershipRequestHandler(
+            self, self.trace_packet, self.trace_pdu, self.trace_connect
+        )
 
 
 class PlcServer:
@@ -27,6 +129,8 @@ class PlcServer:
         response_delay=0.0,
         request_response_delay=0.0,
         fault_control_port=0,
+        ownership_enabled=True,
+        clock=time.monotonic,
     ):
         if any(
             not math.isfinite(value) or value < 0
@@ -52,6 +156,21 @@ class PlcServer:
         self._control_server = None
         self._effects = {}
         self._control_tasks = set()
+        if type(ownership_enabled) is not bool:
+            raise ValueError("ownership_enabled must be boolean")
+        self.ownership_enabled = ownership_enabled
+        self._clock = clock
+        self._connections = {}
+        self._sessions = {}
+        self._raw_authorization = ContextVar("plc_raw_authorization", default=None)
+
+    def _disconnect(self, connection):
+        endpoint = getattr(connection, "endpoint", None)
+        if self._connections.get(endpoint) is connection:
+            del self._connections[endpoint]
+        for unit, session in tuple(self._sessions.items()):
+            if session["connection"] is connection:
+                del self._sessions[unit]
 
     def _reset_effects(self, unit):
         effects = self._effects.pop(unit, None)
@@ -63,6 +182,49 @@ class PlcServer:
             if not station.stale_completion:
                 station.coils[3] = False
             effects["timer"].cancel()
+
+    def _station_fault(self, unit, name, duration, code):
+        if not name:
+            self._reset_effects(unit)
+            return
+        if (
+            name
+            not in (
+                "modbus_delay",
+                "modbus_timeout",
+                "modbus_stale_completion",
+                "plc_fault",
+            )
+            or type(duration) not in (float, int)
+            or not math.isfinite(duration)
+            or duration <= 0
+            or type(code) is not int
+            or not 1 <= code <= 65535
+        ):
+            raise ValueError("invalid authorized station fault")
+        self._reset_effects(unit)
+        station = self.stations[unit]
+        original = (
+            station.timeout,
+            station.stale_completion,
+            station.coils[4],
+            station.registers[3],
+        )
+        if name == "modbus_timeout":
+            station.timeout = True
+        elif name == "modbus_stale_completion":
+            station.stale_completion = True
+            station.coils[3] = True
+        elif name == "plc_fault":
+            station.coils[4], station.registers[3] = True, code
+        timer = asyncio.get_running_loop().call_later(
+            duration, self._reset_effects, unit
+        )
+        self._effects[unit] = dict(
+            original=original,
+            timer=timer,
+            delay=duration if name == "modbus_delay" else 0.0,
+        )
 
     async def _control(self, reader, writer):
         task = asyncio.current_task()
@@ -91,6 +253,10 @@ class PlcServer:
             )
             if unit not in (1, 2):
                 raise ValueError("unit_id must be 1 or 2")
+            if self.ownership_enabled:
+                raise ValueError(
+                    "ownership mode requires authorized station fault control"
+                )
             if operation == 0:
                 self._reset_effects(unit)
             else:
@@ -135,29 +301,78 @@ class PlcServer:
             if not 1 <= size <= 1024:
                 raise ValueError("ownership frame exceeds 1024 bytes")
             fields = json.loads(await asyncio.wait_for(reader.readexactly(size), 1.0))
-            if not isinstance(fields, dict) or set(fields) != {
-                "operation",
-                "unit_id",
-                "robot_id",
-                "mission_id",
-                "part",
-            }:
+            if not isinstance(fields, dict):
                 raise ValueError("invalid ownership fields")
+            base = {"operation", "unit_id", "robot_id", "mission_id", "part"}
+            operation = fields.get("operation")
+            extra = {"endpoint"} if operation == "claim" else {"session", "sequence"}
+            if operation == "fault":
+                extra |= {"name", "duration", "fault_code"}
+            if set(fields) != base | extra or not self.ownership_enabled:
+                raise ValueError("invalid ownership fields or disabled ownership mode")
             unit = fields["unit_id"]
             if type(unit) is not int or unit not in self.stations:
                 raise ValueError("invalid ownership unit")
             station = self.stations[unit]
             identity = (fields["robot_id"], fields["mission_id"], fields["part"])
-            operation = fields["operation"]
+            session = self._sessions.get(unit)
             if operation == "claim":
-                accepted = station.claim(*identity)
-            elif operation == "release":
-                accepted = station.release(*identity)
-            elif operation == "status":
-                accepted = station.owner == identity
+                endpoint = fields["endpoint"]
+                if (
+                    not isinstance(endpoint, list)
+                    or len(endpoint) != 2
+                    or not isinstance(endpoint[0], str)
+                    or type(endpoint[1]) is not int
+                ):
+                    raise ValueError("invalid Modbus endpoint")
+                connection = self._connections.get(tuple(endpoint))
+                accepted = (
+                    connection is not None and session is None and station.owner is None
+                )
+                if accepted:
+                    accepted = station.claim(*identity)
+                if accepted:
+                    session = dict(
+                        connection=connection,
+                        identity=identity,
+                        token=secrets.token_urlsafe(24),
+                        sequence=0,
+                        transactions=connection._transactions,
+                        expires=self._clock() + 30.0,
+                    )
+                    self._sessions[unit] = session
             else:
-                raise ValueError("invalid ownership operation")
+                accepted = (
+                    session is not None
+                    and station.owner == identity
+                    and session["identity"] == identity
+                    and self._connections.get(
+                        getattr(session["connection"], "endpoint", None)
+                    )
+                    is session["connection"]
+                    and self._clock() < session["expires"]
+                    and fields["session"] == session["token"]
+                    and type(fields["sequence"]) is int
+                    and fields["sequence"] == session["sequence"] + 1
+                )
+                if accepted:
+                    session["sequence"] = fields["sequence"]
+                    if operation == "release":
+                        accepted = station.release(*identity)
+                        if accepted:
+                            del self._sessions[unit]
+                    elif operation == "fault":
+                        self._station_fault(
+                            unit,
+                            fields["name"],
+                            fields["duration"],
+                            fields["fault_code"],
+                        )
+                    elif operation != "status":
+                        raise ValueError("invalid ownership operation")
             reply = dict(accepted=accepted, **station.status())
+            if accepted and operation == "claim":
+                reply["session"] = session["token"]
         except (
             ValueError,
             TypeError,
@@ -187,8 +402,22 @@ class PlcServer:
             function_code, start_address, address, count, current_registers, set_values
         ):
             now = asyncio.get_running_loop().time()
-            if station.owner is not None:
-                station.complete(*station.owner[:2], now=now)
+            authorization = self._raw_authorization.get()
+            authorized = (
+                authorization is not None
+                and authorization[0] == unit
+                and self._sessions.get(unit) is authorization[1]
+                and authorization[1]["connection"] is authorization[2]
+                and self._connections.get(getattr(authorization[2], "endpoint", None))
+                is authorization[2]
+                and station.owner == authorization[1]["identity"]
+                and self._clock() < authorization[1]["expires"]
+            )
+            if self.ownership_enabled and not authorized:
+                if set_values is not None:
+                    return ExcCodes.ILLEGAL_FUNCTION
+            elif self.ownership_enabled:
+                station.complete(*authorization[1]["identity"][:2], now=now)
             else:
                 station.advance(now)
             request_started = False
@@ -235,9 +464,7 @@ class PlcServer:
     async def start(self):
         if self._server is not None:
             raise RuntimeError("PLC server is already started")
-        self._server = ModbusTcpServer(
-            [self._device(1), self._device(2)], address=(self.host, self.port)
-        )
+        self._server = OwnershipModbusServer(self)
         try:
             await self._server.serve_forever(background=True)
         except BaseException:
@@ -296,6 +523,12 @@ def main():
     )
     parser.add_argument("--stale-completion", action="store_true")
     parser.add_argument("--fault-code", type=int, default=0)
+    parser.add_argument(
+        "--disable-ownership",
+        dest="ownership_enabled",
+        action="store_false",
+        help="Explicit V1 mode: allow the legacy uncorrelated raw handshake",
+    )
     parser.add_argument(
         "--fault-control-port",
         type=int,

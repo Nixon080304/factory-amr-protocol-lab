@@ -17,13 +17,11 @@ from factory_interfaces.msg import FaultCommand, ProtocolEvent
 from factory_interfaces.srv import SetFault
 from std_srvs.srv import Trigger
 
-from .controller import FaultController
+from .controller import FaultController, FaultEffect
 from .models import FaultRequest
 
 
-def attach_controls(
-    node, *, owner, callback_group=None, on_reset=None, on_enable=None, robot_id=None
-):
+def attach_controls(node, *, owner, callback_group=None, on_reset=None, on_enable=None):
     """Use the owner's callback group to serialize fault configuration callbacks."""
 
     def event(name, request):
@@ -31,13 +29,18 @@ def attach_controls(
             ProtocolEvent(
                 stamp=node.get_clock().now().to_msg(),
                 mission_id=request.mission_id,
-                robot_id=request.robot_id
-                or (robot_id(request) if robot_id is not None else ""),
+                robot_id=request.activation_robot_id
+                if isinstance(request, FaultEffect)
+                else request.robot_id or "",
                 protocol="FAULT",
                 direction="INTERNAL",
                 event=name,
                 outcome="SUCCEEDED",
-                detail=json.dumps(asdict(request)),
+                detail=json.dumps(
+                    asdict(
+                        request.request if isinstance(request, FaultEffect) else request
+                    )
+                ),
             )
         )
 
@@ -438,7 +441,9 @@ class SimulationFaults:
                 ProtocolEvent(
                     stamp=self.node.get_clock().now().to_msg(),
                     mission_id=active[0].mission_id if active is not None else "",
-                    robot_id=active[0].robot_id or "" if active is not None else "",
+                    robot_id=active[0].activation_robot_id
+                    if active is not None
+                    else "",
                     protocol="SIMULATION",
                     direction="INTERNAL",
                     event="wrong_marker_pose_restored",

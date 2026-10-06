@@ -3,6 +3,7 @@
 import asyncio
 from dataclasses import dataclass, replace
 import math
+import inspect
 
 from pymodbus.client import AsyncModbusTcpClient
 from pymodbus.exceptions import ModbusException
@@ -100,15 +101,27 @@ class StationClient:
         )
         raise NetworkFailure(message) from last_error
 
-    async def transfer(self, unit_id: int, part_code: int) -> TransferResult:
+    async def transfer(
+        self,
+        unit_id: int,
+        part_code: int,
+        *,
+        on_connected=None,
+        on_finished=None,
+        connection_bound=False,
+    ) -> TransferResult:
         if type(unit_id) is not int or unit_id not in (1, 2):
             raise ValueError("unit_id must be 1 or 2")
         if type(part_code) is not int or not 0 <= part_code <= 65535:
             raise ValueError("part_code must be a uint16")
         async with self._locks[unit_id]:
-            return await self._transfer(unit_id, part_code)
+            return await self._transfer(
+                unit_id, part_code, on_connected, on_finished, connection_bound
+            )
 
-    async def _transfer(self, unit_id, part_code):
+    async def _transfer(
+        self, unit_id, part_code, on_connected, on_finished, connection_bound
+    ):
         client = AsyncModbusTcpClient(
             self.host,
             port=self.port,
@@ -130,6 +143,8 @@ class StationClient:
             async def operation():
                 nonlocal outcome
                 if not client.connected:
+                    if connection_bound:
+                        raise NetworkFailure("Authorized Modbus connection was lost")
                     if not await client.connect():
                         raise NetworkFailure("PLC connection failed")
                 if physical_request:
@@ -165,6 +180,10 @@ class StationClient:
         try:
             await self._network(client.connect)
             connected_once = True
+            if on_connected is not None:
+                ready = on_connected(client)
+                if inspect.isawaitable(ready):
+                    await ready
             coils, registers = await state()
             counter = registers[address.CYCLE_COUNTER]
             if coils[address.STATION_FAULT]:
@@ -249,11 +268,18 @@ class StationClient:
                         message,
                         result.cycle_counter,
                     )
-            client.close()
-        return replace(
-            result,
-            outcome=outcome,
-            cycle_counter=completed_counter
-            if completed_counter is not None
-            else result.cycle_counter,
-        )
+            result = replace(
+                result,
+                outcome=outcome,
+                cycle_counter=completed_counter
+                if completed_counter is not None
+                else result.cycle_counter,
+            )
+            try:
+                if on_finished is not None:
+                    result = on_finished(result)
+                    if inspect.isawaitable(result):
+                        result = await result
+            finally:
+                client.close()
+        return result

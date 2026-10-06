@@ -547,7 +547,7 @@ def test_reset_restores_disconnected_transport_before_duration(rig):
 
 def test_control_listener_disabled_by_default_and_shutdown_closes_pending_client():
     async def scenario():
-        server = PlcServer(port=0)
+        server = PlcServer(port=0, ownership_enabled=False)
         await server.start()
         assert server._control_server is None
         await server.start_fault_control()

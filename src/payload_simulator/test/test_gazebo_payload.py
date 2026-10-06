@@ -110,6 +110,7 @@ def event(
             "station_id": "assembly" if kind == "LOADING" else "inspection",
             "transfer_kind": kind,
             "cycle_counter": counter,
+            "part": "motor",
         }
     )
     return message

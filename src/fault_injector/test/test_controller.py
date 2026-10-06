@@ -159,6 +159,68 @@ def test_shared_physical_effect_rejects_robot_scope_instead_of_affecting_fleet(n
         FaultRequest(name, "M-1", robot_id="amr_02")
 
 
+@pytest.mark.parametrize("station", ["assembly", "inspection"])
+def test_shared_disconnect_rejects_station_scope(station):
+    with pytest.raises(ValueError, match="global"):
+        FaultRequest("mqtt_disconnect", "M-1", station=station)
+
+
+def test_review_mqtt_and_marker_effect_events_keep_original_trigger_robot():
+    from concurrent.futures import Future
+    from types import SimpleNamespace
+    from rclpy.time import Time
+    from factory_interfaces.msg import ProtocolEvent
+    from fault_injector.node import attach_controls, SimulationFaults
+
+    events = []
+    node = SimpleNamespace(
+        ack_group=None,
+        events=SimpleNamespace(publish=events.append),
+        get_clock=lambda: SimpleNamespace(now=lambda: Time(seconds=1)),
+        get_logger=lambda: SimpleNamespace(error=lambda *args: None),
+        create_publisher=lambda *args: SimpleNamespace(publish=lambda *args: None),
+        create_subscription=lambda *args, **kwargs: None,
+        create_timer=lambda *args, **kwargs: SimpleNamespace(cancel=lambda: None),
+    )
+    controller, _ = attach_controls(node, owner="mqtt_gateway")
+    controller.enable(
+        FaultRequest("mqtt_duplicate", "M-mqtt", activation_point="request")
+    )
+    effect = controller.consume(
+        "mqtt_duplicate", "M-mqtt", "assembly", "request", robot_id="amr_02"
+    )
+    controller.finish(effect)
+    assert [event.robot_id for event in events] == ["amr_02"] * 3
+
+    def send(request):
+        future = Future()
+        future.set_result(SimpleNamespace(success=True))
+        return future
+
+    node.create_client = lambda *args, **kwargs: SimpleNamespace(
+        service_is_ready=lambda: True,
+        call_async=send,
+    )
+    simulation = SimulationFaults(node)
+    simulation.controller.enable(
+        FaultRequest(
+            "wrong_marker",
+            "M-marker",
+            activation_point="navigation_start",
+        )
+    )
+    simulation.observe(
+        ProtocolEvent(
+            mission_id="M-marker",
+            robot_id="amr_01",
+            event="navigation_pickup_started",
+        )
+    )
+    assert simulation.reset()()
+    marker = [event for event in events if event.mission_id == "M-marker"]
+    assert all(event.robot_id == "amr_01" for event in marker)
+
+
 def test_fault_service_preserves_explicit_robot_target_at_ros_boundary():
     import asyncio
     import json

@@ -2,6 +2,7 @@
 
 import asyncio
 from contextvars import ContextVar
+from dataclasses import replace
 import json
 import re
 import socket
@@ -39,6 +40,10 @@ class ModbusGatewayNode(Node):
         ):
             raise ValueError("robot_ids must contain valid configured robot IDs")
         self._request = ContextVar("transfer_request", default=None)
+        self._session = ContextVar("transfer_session", default=None)
+        self._effect_locks = {unit: threading.RLock() for unit in (1, 2)}
+        self._physical_lock = threading.RLock()
+        self._physical_effects = {}
         self._station_locks = {
             station: threading.Lock() for station in ("assembly", "inspection")
         }
@@ -71,12 +76,53 @@ class ModbusGatewayNode(Node):
             self,
             owner="modbus_gateway",
             callback_group=self.fault_group,
-            robot_id=lambda fault: (
-                self._request.get().robot_id if self._request.get() is not None else ""
-            ),
+            on_reset=self._reset_controls,
         )
 
+    def _reset_controls(self):
+        with self._physical_lock:
+            effects = tuple(self._physical_effects.values())
+
+        def ready():
+            restored = [self._restore_effect(effect) for effect in effects]
+            return all(restored)
+
+        return ready
+
+    def _restore_effect(self, effect, *, wait=False):
+        lock = self._effect_locks[effect["unit_id"]]
+        if not lock.acquire(blocking=wait):
+            return False
+        try:
+            if effect["restored"]:
+                return True
+            request_token = self._request.set(effect["request"])
+            session_token = self._session.set(effect["session"])
+            try:
+                self._plc_control(effect["unit_id"])
+            except Exception as error:
+                effect["error"] = str(error)
+                return False
+            finally:
+                self._session.reset(session_token)
+                self._request.reset(request_token)
+            effect["restored"] = True
+            with self._physical_lock:
+                if self._physical_effects.get(effect["unit_id"]) is effect:
+                    del self._physical_effects[effect["unit_id"]]
+            for fault in effect["faults"]:
+                self.faults.finish(fault)
+            return True
+        finally:
+            lock.release()
+
     def _plc_control(self, unit_id, fault=None):
+        if self._session.get() is not None:
+            if not self._plc_ownership(
+                unit_id, "fault", self._request.get(), fault=fault
+            )["accepted"]:
+                raise RuntimeError("Authorized PLC fault control rejected")
+            return
         if not self.fault_control_port:
             raise RuntimeError("PLC fault control listener is not configured")
         with socket.create_connection(
@@ -124,7 +170,9 @@ class ModbusGatewayNode(Node):
             )
         )
 
-    def _plc_ownership(self, unit_id, operation, request):
+    def _plc_ownership(
+        self, unit_id, operation, request, *, endpoint=None, session=None, fault=None
+    ):
         fields = dict(
             operation=operation,
             unit_id=unit_id,
@@ -132,6 +180,24 @@ class ModbusGatewayNode(Node):
             mission_id=request.mission_id,
             part=request.part,
         )
+        if operation == "claim":
+            fields["endpoint"] = list(endpoint)
+            return self._plc_exchange(fields)
+        session = session or self._session.get()
+        if session is None:
+            raise RuntimeError("PLC ownership session is unavailable")
+        with session["lock"]:
+            session["sequence"] += 1
+            fields.update(session=session["token"], sequence=session["sequence"])
+            if operation == "fault":
+                fields.update(
+                    name=fault.name if fault is not None else "",
+                    duration=fault.duration if fault is not None else 0.0,
+                    fault_code=fault.fault_code if fault is not None else 0,
+                )
+            return self._plc_exchange(fields)
+
+    def _plc_exchange(self, fields):
         encoded = json.dumps(fields, allow_nan=False).encode()
         with socket.create_connection(
             ("127.0.0.1", self.fault_control_port), timeout=1.0
@@ -210,6 +276,13 @@ class ModbusGatewayNode(Node):
                 response.error_code = "STATION_BUSY"
                 response.message = "Station transfer is in progress"
                 return response
+            unit = 1 if request.station_id == "assembly" else 2
+            with self._physical_lock:
+                if unit in self._physical_effects:
+                    lock.release()
+                    response.error_code = "STATION_BUSY"
+                    response.message = "Station physical fault restoration is pending"
+                    return response
             self._requests[key] = (identity, None)
         token = self._request.set(request)
         try:
@@ -225,21 +298,37 @@ class ModbusGatewayNode(Node):
 
     def _execute_transfer(self, request, response):
         pickup = request.station_id == "assembly"
+        unit_id = 1 if pickup else 2
         phase = "modbus_pickup" if pickup else "modbus_dropoff"
         self.get_logger().info(
             f"mission_id={request.mission_id} robot_id={request.robot_id} station={request.station_id} state={'LOADING' if pickup else 'UNLOADING'}"
         )
         self._event(phase + "_started")
-        active = []
         outcome = "NOT_REQUESTED"
         result = None
         claimed = False
-        unit_id = 1 if pickup else 2
-        try:
+        session = None
+        physical_effect = None
+
+        def connected(client):
+            nonlocal claimed, session, physical_effect
             if self.fault_control_port:
-                if not self._plc_ownership(unit_id, "claim", request)["accepted"]:
+                endpoint = client.ctx.transport.get_extra_info("sockname")[:2]
+                ownership = self._plc_ownership(
+                    unit_id, "claim", request, endpoint=endpoint
+                )
+                if not ownership["accepted"]:
                     response.error_code = "STATION_BUSY"
-                    raise RuntimeError("PLC station has another owner")
+                    raise RuntimeError(
+                        "PLC station or Modbus connection cannot be claimed"
+                    )
+                token = ownership.get("session")
+                if not isinstance(token, str) or not re.fullmatch(
+                    r"[A-Za-z0-9_-]{32,64}", token
+                ):
+                    raise RuntimeError("PLC claim lacks a valid connection session")
+                session = dict(token=token, sequence=0, lock=threading.RLock())
+                self._session.set(session)
                 claimed = True
             for name in (
                 "modbus_delay",
@@ -247,43 +336,98 @@ class ModbusGatewayNode(Node):
                 "modbus_stale_completion",
                 "plc_fault",
             ):
-                fault = self.faults.consume(
-                    name,
-                    request.mission_id,
-                    request.station_id,
-                    "transfer_start",
-                    robot_id=request.robot_id,
+                with self._effect_locks[unit_id]:
+                    fault = self.faults.consume(
+                        name,
+                        request.mission_id,
+                        request.station_id,
+                        "transfer_start",
+                        robot_id=request.robot_id,
+                    )
+                    if fault is not None:
+                        if physical_effect is None or physical_effect["restored"]:
+                            physical_effect = dict(
+                                unit_id=unit_id,
+                                request=request,
+                                session=session,
+                                faults=[],
+                                restored=False,
+                                error="",
+                            )
+                            with self._physical_lock:
+                                self._physical_effects[unit_id] = physical_effect
+                        physical_effect["faults"].append(fault)
+                        self._plc_control(unit_id, fault)
+
+        def finished(transfer_result):
+            # The actual Modbus connection is still open here, after raw cleanup.
+            # Never use a replacement connection to authorize ambiguous work.
+            if claimed and transfer_result.outcome == "COMPLETED":
+                try:
+                    ownership = self._plc_ownership(
+                        unit_id, "status", request, session=session
+                    )
+                    expected = dict(
+                        robot_id=request.robot_id,
+                        mission_id=request.mission_id,
+                        part=request.part,
+                        cycle_counter=transfer_result.cycle_counter,
+                    )
+                    if (
+                        not ownership["accepted"]
+                        or ownership.get("last_completion") != expected
+                    ):
+                        raise RuntimeError(
+                            "PLC completion does not match transfer connection owner"
+                        )
+                except Exception as error:
+                    transfer_result = replace(
+                        transfer_result,
+                        success=False,
+                        error_code="PLC_TIMEOUT",
+                        message=str(error),
+                        outcome="UNKNOWN",
+                    )
+            restored = physical_effect is None or self._restore_effect(
+                physical_effect, wait=True
+            )
+            if not restored:
+                transfer_result = replace(
+                    transfer_result,
+                    success=False,
+                    error_code="PLC_TIMEOUT",
+                    message=f"{transfer_result.message}; fault cleanup failed: {physical_effect['error']}",
                 )
-                if fault is not None:
-                    active.append(fault)
-                    self._plc_control(1 if pickup else 2, fault)
-            # If the transfer boundary itself raises, pickup cannot be excluded.
-            # A returned result supplies the precise pre/post-request outcome.
+            if claimed and restored:
+                try:
+                    if not self._plc_ownership(
+                        unit_id, "release", request, session=session
+                    )["accepted"]:
+                        raise RuntimeError("PLC connection ownership cleanup rejected")
+                except Exception as error:
+                    transfer_result = replace(
+                        transfer_result,
+                        success=False,
+                        error_code=transfer_result.error_code or "PLC_TIMEOUT",
+                        message=f"{transfer_result.message}; ownership cleanup failed: {error}",
+                    )
+            return transfer_result
+
+        try:
             outcome = "UNKNOWN"
             result = asyncio.run(
-                self.station.transfer(1 if pickup else 2, self.motor_code)
+                self.station.transfer(
+                    unit_id,
+                    self.motor_code,
+                    on_connected=connected,
+                    on_finished=finished,
+                    connection_bound=bool(self.fault_control_port),
+                )
             )
             outcome = result.outcome
-            if claimed and outcome == "COMPLETED":
-                outcome = "UNKNOWN"
-                ownership = self._plc_ownership(unit_id, "status", request)
-                expected = dict(
-                    robot_id=request.robot_id,
-                    mission_id=request.mission_id,
-                    part=request.part,
-                    cycle_counter=result.cycle_counter,
-                )
-                if (
-                    not ownership["accepted"]
-                    or ownership.get("last_completion") != expected
-                ):
-                    raise RuntimeError("PLC completion does not match transfer owner")
-                outcome = "COMPLETED"
-            response.accepted, response.error_code, response.message = (
-                result.success,
-                result.error_code,
-                result.message,
-            )
+            response.accepted = result.success
+            response.error_code = response.error_code or result.error_code
+            response.message = result.message
             detail = (
                 json.dumps(
                     dict(
@@ -303,30 +447,6 @@ class ModbusGatewayNode(Node):
             self.get_logger().error(
                 f"Mission {request.mission_id}: PLC boundary failed: {error}"
             )
-        finally:
-            if active:
-                try:
-                    self._plc_control(1 if pickup else 2)
-                except Exception as error:
-                    response.accepted = False
-                    response.error_code = "PLC_TIMEOUT"
-                    response.message = (
-                        f"{response.message}; fault cleanup failed: {error}"
-                    )
-                    detail = response.message
-                for fault in active:
-                    self.faults.finish(fault)
-            if claimed:
-                try:
-                    if not self._plc_ownership(unit_id, "release", request)["accepted"]:
-                        raise RuntimeError("PLC station ownership cleanup rejected")
-                except Exception as error:
-                    response.accepted = False
-                    response.error_code = response.error_code or "PLC_TIMEOUT"
-                    response.message = (
-                        f"{response.message}; ownership cleanup failed: {error}"
-                    )
-                    detail = response.message
         if not response.accepted and outcome != "NOT_REQUESTED":
             response.error_code += "_TRANSFER_" + outcome
             detail = json.dumps(

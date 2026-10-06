@@ -84,7 +84,9 @@ class PayloadSimulatorNode(Node):
                 "payload mappings must have unique robot IDs and part entities with matching nonempty robot entities"
             )
         self._entities = dict(zip(robot_ids, zip(part_entities, robot_entities)))
-        self._machine = PayloadStateMachine(robot_ids)
+        self._machine = PayloadStateMachine(
+            robot_ids, expected_part=self.declare_parameter("part_name", "motor").value
+        )
         qos = QoSProfile(
             depth=len(robot_ids),
             reliability=ReliabilityPolicy.RELIABLE,

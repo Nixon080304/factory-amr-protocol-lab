@@ -8,4 +8,4 @@ COPY src/plc_simulator /opt/plc-simulator
 RUN python -m pip install --no-build-isolation /opt/plc-simulator
 EXPOSE 1502
 USER 65534:65534
-CMD ["plc-simulator", "--host", "0.0.0.0", "--port", "1502"]
+CMD ["plc-simulator", "--host", "0.0.0.0", "--port", "1502", "--disable-ownership"]

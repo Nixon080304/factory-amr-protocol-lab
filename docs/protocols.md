@@ -162,14 +162,26 @@ Observed changed counters survive a later station fault or cleanup exception.
 | Nav2 failure | Clear costmaps and retry once per navigation leg |
 | Compose readiness | Wait at most 60 seconds after startup in the documented command |
 
-The standalone CLI has no ROS dependency:
+The standalone CLI has no ROS dependency. Ownership is enabled by default:
+the gateway connects over real Modbus/TCP, then claims that exact TCP connection
+through the loopback control listener before any raw mutation. The listener
+issues an expiring session token; control operations require that token and a
+strictly increasing sequence. Raw mutations require the claimed live connection,
+and repeated Modbus transaction IDs are rejected. Disconnect revokes the session
+without releasing an uncleared station cycle. The raw address map is unchanged.
+Enable the loopback listener with `--fault-control-port` and configure the
+gateway's matching `fault_control_port` for fleet operation.
+
+The following V1 diagnostic commands explicitly disable ownership. The current
+V1 PLC container also passes `--disable-ownership`; these examples and that
+container do not provide fleet ownership protection:
 
 ```bash
-plc-simulator --host 127.0.0.1 --port 1502
-plc-simulator --timeout
-plc-simulator --stale-completion
-plc-simulator --fault-code 7
-plc-simulator --response-delay 0.5 --request-response-delay 0.5
+plc-simulator --disable-ownership --host 127.0.0.1 --port 1502
+plc-simulator --disable-ownership --timeout
+plc-simulator --disable-ownership --stale-completion
+plc-simulator --disable-ownership --fault-code 7
+plc-simulator --disable-ownership --response-delay 0.5 --request-response-delay 0.5
 ```
 
 `--cycle-delay` controls cycle duration; `--timeout` prevents completion;

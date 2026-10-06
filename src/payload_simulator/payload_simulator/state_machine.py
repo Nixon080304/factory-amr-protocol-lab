@@ -23,16 +23,23 @@ class PayloadTransition:
     transfer_kind: str = ""
     cycle_counter: int | None = None
     robot_id: str = ""
+    part: str = ""
 
 
 class PayloadStateMachine:
     """Accept one load/unload pair per robot; no implicit per-mission resets."""
 
-    def __init__(self, robot_ids=None):
+    def __init__(self, robot_ids=None, *, expected_part="motor"):
+        if not isinstance(expected_part, str) or not re.fullmatch(
+            r"[A-Za-z0-9_-]{1,64}", expected_part
+        ):
+            raise ValueError("invalid expected payload part")
+        self.expected_part = expected_part
         self.state = PayloadState.AT_ASSEMBLY
         self.mission_id = ""
         self.robot_ids = None if robot_ids is None else frozenset(robot_ids)
         self.states = {}
+        self.parts = {}
         self._missions = {}
         self._robots = {}
         self._completed = set()
@@ -44,7 +51,7 @@ class PayloadStateMachine:
         return PayloadTransition(self.state, self.state, False, reason, self.mission_id)
 
     def apply_transfer(
-        self, mission_id, transfer_kind, cycle_counter, *, robot_id=None
+        self, mission_id, transfer_kind, cycle_counter, *, robot_id=None, part=None
     ) -> PayloadTransition:
         if (
             not isinstance(mission_id, str)
@@ -55,6 +62,7 @@ class PayloadStateMachine:
             or not isinstance(robot_id, str)
             or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", robot_id) is None
             or (self.robot_ids is not None and robot_id not in self.robot_ids)
+            or part != self.expected_part
         ):
             return self._rejected("invalid_transfer")
         key = (robot_id, mission_id, transfer_kind, cycle_counter)
@@ -67,7 +75,11 @@ class PayloadStateMachine:
         state = self.state_for(robot_id, mission_id)
         if transfer_kind == "LOADING" and state == PayloadState.AT_ASSEMBLY:
             target = PayloadState.IN_TRANSIT
-        elif transfer_kind == "UNLOADING" and state == PayloadState.IN_TRANSIT:
+        elif (
+            transfer_kind == "UNLOADING"
+            and state == PayloadState.IN_TRANSIT
+            and part == self.parts.get((robot_id, mission_id))
+        ):
             target = PayloadState.AT_INSPECTION
         else:
             return self._rejected("invalid_sequence")
@@ -75,6 +87,7 @@ class PayloadStateMachine:
         self.state = target
         self.mission_id = mission_id
         self.states[(robot_id, mission_id)] = target
+        self.parts[(robot_id, mission_id)] = part
         self._missions[robot_id] = mission_id
         self._robots[mission_id] = robot_id
         self._completed.add(key)
@@ -87,6 +100,7 @@ class PayloadStateMachine:
             transfer_kind,
             cycle_counter,
             robot_id,
+            part,
         )
 
     def apply_protocol_event(
@@ -116,4 +130,5 @@ class PayloadStateMachine:
             fields["transfer_kind"],
             fields.get("cycle_counter"),
             robot_id=robot_id,
+            part=fields.get("part"),
         )
