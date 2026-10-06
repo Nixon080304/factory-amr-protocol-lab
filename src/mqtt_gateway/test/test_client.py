@@ -79,3 +79,47 @@ def test_fault_topic_is_explicit_and_suback_is_generation_scoped(monkeypatch):
     assert ordinary == generated == [b"{}"]
     transport.disable_fault_requests()
     assert unsubscribed == [FAULT_REQUEST_TOPIC, FAULT_REQUEST_TOPIC]
+
+
+def test_connect_will_and_shutdown_packets_share_retained_fleet_offline_topic(
+    monkeypatch,
+):
+    transport = MqttClient()
+    packets = []
+
+    def wire(command, packet, mid, qos, *args, **kwargs):
+        packets.append(bytes(packet))
+        return mqtt.MQTT_ERR_SUCCESS
+
+    monkeypatch.setattr(transport.client, "_packet_queue", wire)
+    transport.client._send_connect(30)
+
+    def start(packet):
+        cursor = 1
+        while packet[cursor] & 0x80:
+            cursor += 1
+        return cursor + 1
+
+    def text_field(packet, cursor):
+        size = int.from_bytes(packet[cursor : cursor + 2], "big")
+        return packet[cursor + 2 : cursor + 2 + size].decode(), cursor + 2 + size
+
+    connect = packets[0]
+    _, cursor = text_field(connect, start(connect))
+    flags = connect[cursor + 1]
+    identity, cursor = text_field(connect, cursor + 4)
+    topic, cursor = text_field(connect, cursor)
+    payload, _ = text_field(connect, cursor)
+    assert topic == "factory/fleet/availability" and payload == "offline"
+    assert "amr_01" not in identity
+    assert flags & 0x20 and (flags >> 3) & 3 == 1
+    # Replace only the unavailable native socket. Paho still encodes PUBLISH.
+    transport.client._sock = SimpleNamespace(close=lambda: None)
+    transport.close()
+    publish = next(packet for packet in packets if packet[0] >> 4 == 3)
+    topic, cursor = text_field(publish, start(publish))
+    assert topic == "factory/fleet/availability"
+    assert (
+        publish[cursor + 2 :] == b"offline"
+    )  # QoS 1 packet identifier precedes payload.
+    assert publish[0] & 1 and (publish[0] >> 1) & 3 == 1

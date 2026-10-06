@@ -22,7 +22,7 @@ from factory_interfaces.action import ExecuteFleetMission
 from factory_interfaces.msg import ProtocolEvent, RobotState
 from fleet_manager.adapter import robot_endpoints
 from fleet_manager.config import load_fleet_config
-from .client import MqttClient, FAULT_REQUEST_TOPIC
+from .client import MqttClient, FAULT_REQUEST_TOPIC, FLEET_AVAILABILITY_TOPIC
 from .validator import MissionValidator, MissionValidationError
 from .mission_registry import MissionRegistry, MissionConflictError
 from .reconnect_queue import ReconnectQueue
@@ -279,7 +279,7 @@ class MqttGatewayNode(Node):
                 if value:
                     try:
                         self.client.publish(
-                            "factory/fleet/availability",
+                            FLEET_AVAILABILITY_TOPIC,
                             "online",
                             qos=1,
                             retain=True,

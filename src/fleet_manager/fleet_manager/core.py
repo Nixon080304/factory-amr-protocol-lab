@@ -42,6 +42,14 @@ class RobotMissionResult:
     error_code: str = ""
     message: str = ""
     payload_ownership: PayloadOwnership | None = None
+    cancelled: bool = False
+
+
+@dataclass(frozen=True)
+class RobotCancellationAck:
+    robot_id: str
+    assignment_id: int
+    accepted: bool
 
 
 @dataclass(frozen=True)
@@ -94,8 +102,9 @@ class FleetCore:
     Only returned assignment decisions authorize sending a new robot goal.
     The event sequence is an internal goal-generation fence. Adapters attach it
     through goal callback closures; it does not require a ROS interface field.
-    Cancellation returns the committed record so adapters can cancel its former
-    robot goal. Duplicate operations return snapshots without issuing new goals.
+    Running cancellation requests and acknowledgements are durable audit events,
+    not terminal execution outcomes. Fenced robot results or offline recovery
+    finalize them. Duplicate operations return snapshots without issuing goals.
     """
 
     def __init__(
@@ -152,6 +161,7 @@ class FleetCore:
                 event
                 for event in reversed(self._journal.events(record.request.mission_id))
                 if event.state == MissionState.ASSIGNED
+                and event.previous_state != MissionState.ASSIGNED
             ),
             None,
         )
@@ -165,7 +175,9 @@ class FleetCore:
         return assignment
 
     def _matches(
-        self, record: MissionRecord, callback: RobotMissionFeedback | RobotMissionResult
+        self,
+        record: MissionRecord,
+        callback: RobotMissionFeedback | RobotMissionResult | RobotCancellationAck,
     ) -> bool:
         if (
             record.state not in _RUNNING
@@ -174,6 +186,60 @@ class FleetCore:
             return False
         assignment = self._assignment(record)
         return assignment is not None and assignment.sequence == callback.assignment_id
+
+    def _cancellation_requested(self, record: MissionRecord) -> bool:
+        return any(
+            event.detail.get("cancellation_requested") is True
+            for event in self._journal.events(record.request.mission_id)
+        )
+
+    def request_cancellation(self, mission_id: str, now: float) -> MissionRecord:
+        """Persist intent before transport cancellation, retaining payload evidence."""
+        _time(now)
+        record = self._journal.get(mission_id)
+        if record.state not in _RUNNING:
+            return self.cancel(mission_id, now)
+        if self._cancellation_requested(record):
+            return record
+        return self._journal.transition(
+            mission_id,
+            record.state,
+            record.state,
+            {"cancellation_requested": True},
+            now,
+        )
+
+    def record_cancellation_acknowledgement(
+        self, mission_id: str, acknowledgement: RobotCancellationAck, now: float
+    ) -> MissionRecord:
+        """An accepted CancelGoal request does not prove execution has stopped."""
+        _time(now)
+        record = self._journal.get(mission_id)
+        if not self._matches(
+            record, acknowledgement
+        ) or not self._cancellation_requested(record):
+            return record
+        previous = next(
+            (
+                event.detail["cancellation_acknowledged"]
+                for event in reversed(self._journal.events(mission_id))
+                if "cancellation_acknowledged" in event.detail
+                and event.detail.get("assignment_id") == acknowledgement.assignment_id
+            ),
+            None,
+        )
+        if previous is acknowledgement.accepted:
+            return record
+        return self._journal.transition(
+            mission_id,
+            record.state,
+            record.state,
+            {
+                "cancellation_acknowledged": acknowledgement.accepted,
+                "assignment_id": acknowledgement.assignment_id,
+            },
+            now,
+        )
 
     def record_robot_feedback(
         self, mission_id: str, feedback: RobotMissionFeedback, now: float
@@ -232,6 +298,11 @@ class FleetCore:
             self.handle_robot_offline(result.robot_id, now)
             return self._journal.get(mission_id)
         target = MissionState.COMPLETED if result.success else MissionState.FAILED
+        if not result.success and self._cancellation_requested(record):
+            if ownership != PayloadOwnership.NOT_PICKED_UP:
+                target = MissionState.RECOVERY_REQUIRED
+            elif result.cancelled:
+                target = MissionState.CANCELLED
         if result.success:
             ownership = PayloadOwnership.DELIVERED
         return self._journal.transition(
@@ -241,13 +312,22 @@ class FleetCore:
             {
                 "payload_ownership": ownership,
                 "result": self._result(
-                    record, target, result.success, result.error_code, result.message
+                    record,
+                    target,
+                    result.success,
+                    result.error_code or ("CANCELLED" if result.cancelled else ""),
+                    result.message,
                 ),
             },
             now,
         )
 
     def cancel(self, mission_id: str, now: float) -> MissionRecord:
+        """Finalize cancellation when no running transport outcome is outstanding.
+
+        Transport adapters use request_cancellation for a live assignment and
+        finalize it through a fenced robot result or offline recovery instead.
+        """
         _time(now)
         record = self._journal.get(mission_id)
         if record.state in _CLOSED:
@@ -269,6 +349,26 @@ class FleetCore:
             now,
         )
 
+    def reject(
+        self, mission_id: str, error_code: str, message: str, now: float
+    ) -> MissionRecord:
+        """Commit an explicit scheduling rejection before returning its result."""
+        _time(now)
+        record = self._journal.get(mission_id)
+        if record.state not in _SCHEDULABLE:
+            return record
+        return self._journal.transition(
+            mission_id,
+            record.state,
+            MissionState.FAILED,
+            {
+                "result": self._result(
+                    record, MissionState.FAILED, False, error_code, message
+                )
+            },
+            now,
+        )
+
     def handle_robot_offline(
         self, robot_id: str, now: float
     ) -> tuple[MissionRecord, ...]:
@@ -283,7 +383,20 @@ class FleetCore:
                 else MissionState.RECOVERY_REQUIRED
             )
             detail = {"reason": "robot offline"}
-            if target == MissionState.REASSIGNING:
+            if self._cancellation_requested(record):
+                # Loss cannot confirm that a pending cancellation stopped the
+                # robot or that its last empty payload observation is still true.
+                target = MissionState.RECOVERY_REQUIRED
+                if record.payload_ownership == PayloadOwnership.NOT_PICKED_UP:
+                    detail["payload_ownership"] = PayloadOwnership.UNKNOWN
+                detail["result"] = self._result(
+                    record,
+                    target,
+                    False,
+                    "ROBOT_OFFLINE",
+                    "Robot offline during cancellation",
+                )
+            elif target == MissionState.REASSIGNING:
                 detail["assigned_robot_id"] = None
             records.append(
                 self._journal.transition(

@@ -13,6 +13,7 @@ import time
 from fleet_manager.core import (
     FleetCore,
     ReconciliationSnapshot,
+    RobotCancellationAck,
     RobotMissionFeedback,
     RobotMissionResult,
 )
@@ -37,6 +38,7 @@ class RobotReply:
     success: bool
     error_code: str = ""
     message: str = ""
+    cancelled: bool = False
 
 
 @dataclass
@@ -113,7 +115,7 @@ def robot_snapshot(robot_id, message):
 
 
 class FleetAdapter:
-    """Reserve robot goals until completion, cancellation acknowledgement, or loss.
+    """Reserve robot goals until execution completion or offline recovery.
 
     The reservation remains separate from journal terminal state: cancelling a
     mission must not make its still-running robot available for another goal.
@@ -215,8 +217,21 @@ class FleetAdapter:
                     }
                     decision = self.core.assign(mission_id, estimates, now)
                     if decision.robot_id is None:
-                        self._retry_at[mission_id] = now + 1.0
-                        self._emit(self.journal.get(mission_id), detail=decision.reason)
+                        if record.request.requested_robot_id:
+                            rejected = self.core.reject(
+                                mission_id,
+                                "REQUESTED_ROBOT_UNAVAILABLE",
+                                f"Requested robot {record.request.requested_robot_id}: {decision.reason}",
+                                now,
+                            )
+                            self._retry_at.pop(mission_id, None)
+                            self._remove_waiters(mission_id)
+                            self._emit(rejected)
+                        else:
+                            self._retry_at[mission_id] = now + 1.0
+                            self._emit(
+                                self.journal.get(mission_id), detail=decision.reason
+                            )
                     else:
                         self._start(record.request, decision)
                 continue
@@ -324,7 +339,7 @@ class FleetAdapter:
             self._cancel_goal(mission_id, flight)
 
     def _feedback(self, mission_id, flight, feedback):
-        if not self._current(mission_id, flight) or flight.cancelling:
+        if not self._current(mission_id, flight):
             return
         ownership = PayloadOwnership.NOT_PICKED_UP
         if feedback.state == "LOADING":
@@ -357,20 +372,20 @@ class FleetAdapter:
                 reply.success,
                 reply.error_code,
                 reply.message,
+                cancelled=reply.cancelled,
             ),
             self.clock(),
         )
         flight.retired = True
         del self._flights[mission_id]
         self._remove_waiters(mission_id)
-        if not flight.cancelling:
-            self._emit(record)
+        self._emit(record)
 
     def cancel(self, mission_id):
         # Consume already-received pickup evidence before deciding whether a
         # cancellation is safe or requires physical payload recovery.
         self._drain_callbacks(self._callbacks.qsize())
-        record = self.core.cancel(mission_id, self.clock())
+        record = self.core.request_cancellation(mission_id, self.clock())
         self._close_round(mission_id)
         self._retry_at.pop(mission_id, None)
         self._remove_waiters(mission_id)
@@ -401,9 +416,14 @@ class FleetAdapter:
             pass  # The reservation stays until robot loss establishes recovery.
 
     def _cancelled(self, mission_id, flight, acknowledged):
-        if acknowledged and self._current(mission_id, flight):
-            flight.retired = True
-            del self._flights[mission_id]
+        if self._current(mission_id, flight):
+            self.core.record_cancellation_acknowledgement(
+                mission_id,
+                RobotCancellationAck(
+                    flight.robot_id, flight.assignment_id, acknowledged
+                ),
+                self.clock(),
+            )
 
     def resource(self, operation, request):
         if operation not in ("acquire", "renew", "release"):

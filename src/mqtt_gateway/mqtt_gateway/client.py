@@ -4,17 +4,16 @@ import paho.mqtt.client as mqtt
 import threading
 
 FAULT_REQUEST_TOPIC = "factory/faults/injected_request"
+FLEET_AVAILABILITY_TOPIC = "factory/fleet/availability"
 
 
 class MqttClient:
     def __init__(self, host="127.0.0.1", port=1883):
         self.host, self.port = host, port
         self.client = mqtt.Client(
-            mqtt.CallbackAPIVersion.VERSION2, client_id="factory_amr_01"
+            mqtt.CallbackAPIVersion.VERSION2, client_id="factory_fleet_gateway"
         )
-        self.client.will_set(
-            "factory/robots/amr_01/availability", "offline", qos=1, retain=True
-        )
+        self.client.will_set(FLEET_AVAILABILITY_TOPIC, "offline", qos=1, retain=True)
         self.client.reconnect_delay_set(min_delay=1, max_delay=30)
         self._request_subscription = None
         self._fault_subscription = None
@@ -115,8 +114,6 @@ class MqttClient:
         self.start()
 
     def close(self):
-        self.client.publish(
-            "factory/robots/amr_01/availability", "offline", qos=1, retain=True
-        )
+        self.client.publish(FLEET_AVAILABILITY_TOPIC, "offline", qos=1, retain=True)
         self.client.disconnect()
         self.client.loop_stop()

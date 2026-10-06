@@ -176,6 +176,154 @@ def test_queued_cancellation_needs_no_robot_and_is_durable(fleet):
     assert journal.load_active() == ()
 
 
+def test_running_cancellation_request_is_durable_idempotent_and_keeps_callback_fence(
+    fleet,
+):
+    api, core, journal, *_ = fleet
+    decision, _ = assigned(fleet)
+    record = core.request_cancellation("m1", 101.1)
+    assert record.state == "ASSIGNED" and record.result is None
+    assert journal.events("m1")[-1].detail["cancellation_requested"] is True
+    events = journal.events("m1")
+    assert core.request_cancellation("m1", 101.2) == record
+    assert journal.events("m1") == events
+    assert (
+        core.record_robot_feedback(
+            "m1", feedback(api, decision, "PICKED_UP"), 101.3
+        ).payload_ownership
+        == "PICKED_UP"
+    )
+
+
+@pytest.mark.parametrize(
+    "ownership,want",
+    [
+        ("NOT_PICKED_UP", "CANCELLED"),
+        ("UNKNOWN", "RECOVERY_REQUIRED"),
+        ("PICKED_UP", "RECOVERY_REQUIRED"),
+    ],
+)
+def test_pending_cancellation_finishes_from_fenced_execution_result(
+    fleet, ownership, want
+):
+    api, core, journal, *_ = fleet
+    decision, _ = assigned(fleet)
+    core.request_cancellation("m1", 101.1)
+    core.record_robot_feedback("m1", feedback(api, decision, ownership), 101.2)
+    outcome = core.record_robot_result(
+        "m1",
+        result(api, decision, False, error_code="MISSION_CANCELED", cancelled=True),
+        101.3,
+    )
+    assert outcome.state == want
+    assert outcome.result["error_code"] == "MISSION_CANCELED"
+    assert journal.get("m1") == outcome
+
+
+def test_cancellation_acknowledgement_is_durable_but_not_execution_completion(fleet):
+    api, core, journal, *_ = fleet
+    decision, _ = assigned(fleet)
+    core.request_cancellation("m1", 101.1)
+    ack = api.RobotCancellationAck(decision.robot_id, decision.assignment_id, True)
+    outcome = core.record_cancellation_acknowledgement("m1", ack, 101.2)
+    assert outcome.state == "ASSIGNED" and outcome.result is None
+    assert journal.events("m1")[-1].detail["cancellation_acknowledged"] is True
+    assert (
+        core.record_robot_feedback(
+            "m1", feedback(api, decision, "UNKNOWN"), 101.3
+        ).payload_ownership
+        == "UNKNOWN"
+    )
+
+
+def test_rejected_cancellation_does_not_relabel_unrelated_empty_robot_failure(fleet):
+    api, core, *_ = fleet
+    decision, _ = assigned(fleet)
+    core.request_cancellation("m1", 101.1)
+    core.record_cancellation_acknowledgement(
+        "m1",
+        api.RobotCancellationAck(decision.robot_id, decision.assignment_id, False),
+        101.2,
+    )
+    outcome = core.record_robot_result(
+        "m1", result(api, decision, False, error_code="DRIVE_FAULT"), 101.3
+    )
+    assert outcome.state == "FAILED" and outcome.result["error_code"] == "DRIVE_FAULT"
+
+
+def test_execution_cancelled_outcome_finalizes_empty_robot_without_error_string(fleet):
+    api, core, *_ = fleet
+    decision, _ = assigned(fleet)
+    core.request_cancellation("m1", 101.1)
+    outcome = core.record_robot_result(
+        "m1", result(api, decision, False, cancelled=True), 101.2
+    )
+    assert outcome.state == "CANCELLED" and outcome.result["error_code"] == "CANCELLED"
+
+
+@pytest.mark.parametrize("ownership", ["UNKNOWN", "PICKED_UP"])
+def test_rejected_cancellation_preserves_payload_on_eventual_fault(fleet, ownership):
+    api, core, *_ = fleet
+    decision, _ = assigned(fleet)
+    core.request_cancellation("m1", 101.1)
+    core.record_cancellation_acknowledgement(
+        "m1",
+        api.RobotCancellationAck(decision.robot_id, decision.assignment_id, False),
+        101.2,
+    )
+    core.record_robot_feedback("m1", feedback(api, decision, ownership), 101.3)
+    outcome = core.record_robot_result(
+        "m1", result(api, decision, False, error_code="DRIVE_FAULT"), 101.4
+    )
+    assert outcome.state == "RECOVERY_REQUIRED"
+    assert outcome.payload_ownership == ownership
+    assert outcome.result["error_code"] == "DRIVE_FAULT"
+
+
+def test_cancellation_acknowledgement_rejects_stale_assignment_and_duplicate(fleet):
+    api, core, journal, *_ = fleet
+    decision, _ = assigned(fleet)
+    core.request_cancellation("m1", 101.1)
+    events = journal.events("m1")
+    core.record_cancellation_acknowledgement(
+        "m1",
+        api.RobotCancellationAck(decision.robot_id, decision.assignment_id + 1, True),
+        101.2,
+    )
+    assert journal.events("m1") == events
+    ack = api.RobotCancellationAck(decision.robot_id, decision.assignment_id, True)
+    record = core.record_cancellation_acknowledgement("m1", ack, 101.3)
+    events = journal.events("m1")
+    assert core.record_cancellation_acknowledgement("m1", ack, 101.4) == record
+    assert journal.events("m1") == events
+
+
+def test_offline_during_pending_cancellation_requires_recovery_and_never_reassigns(
+    fleet,
+):
+    api, core, journal, registry, *_ = fleet
+    assigned(fleet)
+    core.request_cancellation("m1", 101.1)
+    registry.observe(robot("r1", health="OFFLINE"), 102)
+    assert core.handle_robot_offline("r1", 102)[0].state == "RECOVERY_REQUIRED"
+    assert journal.get("m1").payload_ownership == "UNKNOWN"
+    assert journal.get("m1").result["error_code"] == "ROBOT_OFFLINE"
+    assert core.assign("m1", ESTIMATES, 102).robot_id is None
+
+
+def test_reject_scheduling_request_commits_explicit_replayable_result(fleet):
+    _, core, journal, *_ = fleet
+    core.submit(request(requested_robot_id="r1"), 100)
+    rejected = core.reject(
+        "m1", "REQUESTED_ROBOT_UNAVAILABLE", "Requested robot r1 unavailable", 101
+    )
+    assert rejected.state == "FAILED"
+    assert rejected.result["error_code"] == "REQUESTED_ROBOT_UNAVAILABLE"
+    assert rejected.result["assigned_robot_id"] is None
+    assert journal.get("m1") == rejected
+    assert core.submit(request(requested_robot_id="r1"), 102) == rejected
+
+
 @pytest.mark.parametrize("ownership", ["NOT_PICKED_UP", "PICKED_UP", "UNKNOWN"])
 def test_offline_robot_reassigns_only_before_pickup_and_quarantines_resources(
     fleet, ownership

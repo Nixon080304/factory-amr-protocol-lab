@@ -4,6 +4,7 @@
 from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
+from action_msgs.msg import GoalStatus
 from factory_interfaces.action import ExecuteFactoryMission, ExecuteFleetMission
 from factory_interfaces.msg import RobotState
 from factory_interfaces.srv import (
@@ -279,8 +280,16 @@ class FleetManagerNode(Node):
 
         def completed(future):
             try:
-                reply = future.result().result
-                result(RobotReply(reply.success, reply.error_code, reply.message))
+                outcome = future.result()
+                reply = outcome.result
+                result(
+                    RobotReply(
+                        reply.success,
+                        reply.error_code,
+                        reply.message,
+                        cancelled=outcome.status == GoalStatus.STATUS_CANCELED,
+                    )
+                )
             except Exception as error:
                 accepted(handle, str(error))
 

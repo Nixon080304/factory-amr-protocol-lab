@@ -64,6 +64,15 @@ def test_without_dds_automatic_request_uses_empty_fleet_pin(without_dds):
     assert goals[0][0].requested_robot_id == ""
 
 
+def test_without_dds_gateway_online_publication_uses_fleet_availability_topic(
+    without_dds,
+):
+    node, broker, _ = without_dds
+    node.incoming.put(("connection", True))
+    node._drain()
+    assert ("factory/fleet/availability", "online", 1, True) in broker.published
+
+
 def test_without_dds_explicit_configured_robot_remains_pinned(without_dds):
     node, _, goals = without_dds
     node._request(

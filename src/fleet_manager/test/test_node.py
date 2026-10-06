@@ -124,22 +124,28 @@ def test_no_cost_keeps_mission_queued_and_retries_without_busy_loop(rig):
     assert robots.goals[0].robot_id == "amr_02"
 
 
-def test_cancel_reserves_robot_until_acknowledgement(rig):
+def test_cancel_reserves_robot_until_terminal_result(rig):
     goal = dispatch(rig, pin="amr_01")
-    _, adapter, journal, robots, now = rig
+    api, adapter, journal, robots, now = rig
     adapter.cancel("m1")
-    assert journal.get("m1").state == "CANCELLED"
+    assert journal.get("m1").state == "ASSIGNED"
     assert goal.cancel_ack is not None
-    adapter.submit(request("m2", "amr_01"))
+    robots.costs["amr_02"] = None
+    adapter.submit(request("m2"))
     adapter.tick()
     adapter.tick()
     assert len(robots.goals) == 1
     goal.cancel_ack(True)
+    adapter.tick()
+    assert journal.get("m1").result is None
+    assert len(robots.goals) == 1
+    goal.result(api.RobotReply(False, "", "stopped", cancelled=True))
     now[0] += 1.1
     adapter.tick()
     adapter.tick()
     assert len(robots.goals) == 2
     assert robots.goals[-1].request.mission_id == "m2"
+    assert journal.get("m1").state == "CANCELLED"
 
 
 def test_cancel_before_robot_acceptance_cancels_late_goal_and_waits_for_ack(rig):
@@ -158,12 +164,251 @@ def test_cancel_before_robot_acceptance_cancels_late_goal_and_waits_for_ack(rig)
     assert len(robots.goals) == 1
 
 
-def test_cancel_consumes_queued_payload_evidence_before_durable_cancellation(rig):
+def test_cancel_consumes_queued_payload_evidence_before_persisting_intent(rig):
     goal = dispatch(rig)
     api, adapter, journal, _, _ = rig
     goal.feedback(api.RobotFeedback("LOADING"))
     adapter.cancel("m1")
+    assert journal.get("m1").state == "EXECUTING"
+    assert journal.get("m1").payload_ownership == "UNKNOWN"
+    assert journal.get("m1").result is None
+    goal.result(api.RobotReply(False, "CANCELLED", cancelled=True))
+    adapter.tick()
     assert journal.get("m1").state == "RECOVERY_REQUIRED"
+
+
+@pytest.mark.parametrize("acknowledged", [False, True])
+def test_cancellation_preserves_delayed_loading_evidence_until_robot_result(
+    rig, acknowledged
+):
+    goal = dispatch(rig)
+    api, adapter, journal, robots, _ = rig
+    adapter.cancel("m1")
+    assert journal.get("m1").state == "ASSIGNED"
+    assert journal.get("m1").result is None
+    goal.feedback(api.RobotFeedback("LOADING"))
+    goal.cancel_ack(acknowledged)
+    adapter.tick()
+    assert journal.get("m1").state == "EXECUTING"
+    assert journal.get("m1").payload_ownership == "UNKNOWN"
+    goal.feedback(api.RobotFeedback("NAVIGATING_TO_DROPOFF"))
+    adapter.tick()
+    assert journal.get("m1").payload_ownership == "PICKED_UP"
+    goal.result(api.RobotReply(False, "MISSION_CANCELED", "stopped", cancelled=True))
+    adapter.tick()
+    assert journal.get("m1").state == "RECOVERY_REQUIRED"
+    assert journal.get("m1").result["error_code"] == "MISSION_CANCELED"
+    assert robots.statuses[-1][0].state == "RECOVERY_REQUIRED"
+
+
+def test_rejected_cancellation_reports_actual_success_and_delivered_payload(rig):
+    goal = dispatch(rig)
+    api, adapter, journal, robots, _ = rig
+    adapter.cancel("m1")
+    goal.feedback(api.RobotFeedback("LOADING"))
+    goal.cancel_ack(False)
+    goal.feedback(api.RobotFeedback("NAVIGATING_TO_DROPOFF"))
+    adapter.tick()
+    assert journal.get("m1").payload_ownership == "PICKED_UP"
+    goal.result(api.RobotReply(True, "", "delivered despite cancellation request"))
+    adapter.tick()
+    assert journal.get("m1").state == "COMPLETED"
+    assert journal.get("m1").payload_ownership == "DELIVERED"
+    assert journal.get("m1").result["success"]
+    assert robots.statuses[-1][0].state == "COMPLETED"
+
+
+def test_cancel_acknowledgement_does_not_release_still_executing_robot(rig):
+    goal = dispatch(rig, pin="amr_01")
+    _, adapter, journal, robots, now = rig
+    robots.costs["amr_02"] = None
+    adapter.cancel("m1")
+    goal.cancel_ack(True)
+    adapter.submit(request("m2"))
+    adapter.tick()
+    adapter.tick()
+    now[0] += 1.1
+    adapter.tick()
+    adapter.tick()
+    assert len(robots.goals) == 1
+    assert journal.get("m2").state == "QUEUED"
+    assert journal.get("m1").result is None
+
+
+@pytest.mark.parametrize("acknowledged", [False, True])
+def test_offline_during_pending_cancel_preserves_execution_uncertainty(
+    rig, acknowledged
+):
+    goal = dispatch(rig)
+    _, adapter, journal, robots, now = rig
+    adapter.cancel("m1")
+    goal.cancel_ack(acknowledged)
+    adapter.tick()
+    now[0] += 5.1
+    adapter.observe(RobotSnapshot("amr_01", "AVAILABLE", Pose2D(0, 0, 0), 80, "EMPTY"))
+    adapter.tick()
+    assert journal.get("m1").state == "RECOVERY_REQUIRED"
+    assert journal.get("m1").payload_ownership == "UNKNOWN"
+    assert journal.get("m1").result["error_code"] == "ROBOT_OFFLINE"
+    assert robots.statuses[-1][0].state == "RECOVERY_REQUIRED"
+    assert len(robots.goals) == 1
+
+
+@pytest.mark.parametrize("cost", [None, "timeout"])
+def test_pinned_missing_cost_returns_bounded_explicit_rejection(rig, cost):
+    _, adapter, journal, robots, now = rig
+    robots.costs["amr_01"] = cost
+    adapter.submit(request(pin="amr_01"))
+    adapter.tick()
+    now[0] += 1.1
+    adapter.tick()
+    assert journal.get("m1").state == "FAILED"
+    assert journal.get("m1").result["error_code"] == "REQUESTED_ROBOT_UNAVAILABLE"
+    assert "amr_01" in journal.get("m1").result["message"]
+    assert robots.goals == []
+    for _ in range(50):
+        adapter.tick()
+    assert len(robots.cost_calls) == 1
+
+
+def test_pinned_offline_robot_returns_bounded_rejection_without_fallback(rig):
+    _, adapter, journal, robots, now = rig
+    now[0] += 5.1
+    adapter.observe(RobotSnapshot("amr_02", "AVAILABLE", Pose2D(0, 0, 0), 80, "EMPTY"))
+    adapter.submit(request(pin="amr_01"))
+    adapter.tick()
+    adapter.tick()
+    assert journal.get("m1").state == "FAILED"
+    assert journal.get("m1").result["error_code"] == "REQUESTED_ROBOT_UNAVAILABLE"
+    assert robots.goals == []
+
+
+@pytest.mark.parametrize("mode", ["UNHEALTHY", "OFFLINE", "CHARGING", "EXECUTING"])
+def test_pinned_ineligible_robot_rejects_without_cost_or_fallback(rig, mode):
+    _, adapter, journal, robots, _ = rig
+    adapter.observe(RobotSnapshot("amr_01", mode, Pose2D(0, 0, 0), 80, "EMPTY"))
+    adapter.submit(request(pin="amr_01"))
+    adapter.tick()
+    adapter.tick()
+    assert journal.get("m1").state == "FAILED"
+    assert journal.get("m1").result["error_code"] == "REQUESTED_ROBOT_UNAVAILABLE"
+    assert robots.cost_calls == [] and robots.goals == []
+
+
+@pytest.mark.parametrize(
+    "cost", [CostEstimate(False, 1, 50), CostEstimate(True, 1, 19.9)]
+)
+def test_pinned_infeasible_or_low_energy_cost_rejects_without_fallback(rig, cost):
+    _, adapter, journal, robots, _ = rig
+    robots.costs["amr_01"] = cost
+    adapter.submit(request(pin="amr_01"))
+    adapter.tick()
+    adapter.tick()
+    assert journal.get("m1").state == "FAILED"
+    assert journal.get("m1").result["error_code"] == "REQUESTED_ROBOT_UNAVAILABLE"
+    assert robots.cost_calls == [("amr_01", "m1")] and robots.goals == []
+
+
+def test_pinned_missing_action_server_returns_bounded_explicit_rejection(rig):
+    from fleet_manager.node import FleetManagerNode
+    from types import SimpleNamespace
+
+    _, adapter, journal, robots, _ = rig
+    node = object.__new__(FleetManagerNode)
+    node.actions = {"amr_01": SimpleNamespace(server_is_ready=lambda: False)}
+    node.costs = {"amr_01": SimpleNamespace(service_is_ready=lambda: True)}
+    robots.estimate = node.estimate
+    adapter.submit(request(pin="amr_01"))
+    adapter.tick()
+    adapter.tick()
+    assert journal.get("m1").state == "FAILED"
+    assert journal.get("m1").result["error_code"] == "REQUESTED_ROBOT_UNAVAILABLE"
+    assert robots.goals == []
+
+
+@pytest.mark.parametrize(
+    "stage,want",
+    [
+        ("NAVIGATING_TO_PICKUP", "FAILED"),
+        ("LOADING", "RECOVERY_REQUIRED"),
+        ("NAVIGATING_TO_DROPOFF", "RECOVERY_REQUIRED"),
+    ],
+)
+def test_rejected_cancellation_reports_eventual_failure_with_payload_truth(
+    rig, stage, want
+):
+    goal = dispatch(rig)
+    api, adapter, journal, robots, _ = rig
+    adapter.cancel("m1")
+    goal.cancel_ack(False)
+    goal.feedback(api.RobotFeedback(stage))
+    adapter.tick()
+    assert journal.get("m1").result is None
+    goal.result(api.RobotReply(False, "DRIVE_FAULT", "drive stopped"))
+    adapter.tick()
+    assert journal.get("m1").state == want
+    assert journal.get("m1").result["error_code"] == "DRIVE_FAULT"
+    assert robots.statuses[-1][0].state == want
+
+
+@pytest.mark.parametrize("status,want", [(5, "CANCELLED"), (6, "FAILED")])
+def test_ros_terminal_status_preserves_typed_cancellation_outcome(rig, status, want):
+    from factory_interfaces.action import ExecuteFactoryMission
+    from fleet_manager.node import FleetManagerNode
+    from rclpy.task import Future
+    from types import SimpleNamespace
+
+    _, adapter, journal, robots, _ = rig
+    response, completed = Future(), Future()
+    sent_goals = []
+    node = object.__new__(FleetManagerNode)
+
+    def send_goal(goal, feedback_callback):
+        sent_goals.append(goal)
+        return response
+
+    node.actions = {
+        "amr_01": SimpleNamespace(
+            server_is_ready=lambda: True, send_goal_async=send_goal
+        )
+    }
+    robots.send_goal = node.send_goal
+    adapter.submit(request(pin="amr_01"))
+    adapter.tick()
+    adapter.tick()
+    assert sent_goals[0].robot_id == "amr_01"
+    response.set_result(
+        SimpleNamespace(accepted=True, get_result_async=lambda: completed)
+    )
+    adapter.tick()
+    adapter.cancel("m1")
+    completed.set_result(
+        SimpleNamespace(
+            status=status, result=ExecuteFactoryMission.Result(success=False)
+        )
+    )
+    adapter.tick()
+    assert journal.get("m1").state == want
+    assert journal.get("m1").result["error_code"] == (
+        "CANCELLED" if status == 5 else ""
+    )
+
+
+def test_cancellation_persistence_failure_sends_no_robot_cancel(rig, tmp_path):
+    import sqlite3
+
+    goal = dispatch(rig)
+    _, adapter, journal, _, _ = rig
+    with sqlite3.connect(tmp_path / "missions.sqlite3") as connection:
+        connection.execute(
+            "CREATE TRIGGER reject_cancel BEFORE INSERT ON mission_events "
+            "WHEN json_extract(NEW.detail_json, '$.cancellation_requested') = 1 "
+            "BEGIN SELECT RAISE(ABORT, 'cancel write failed'); END"
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="cancel write failed"):
+        adapter.cancel("m1")
+    assert goal.cancel_ack is None
+    assert journal.get("m1").state == "ASSIGNED"
 
 
 def test_cost_response_received_after_deadline_cannot_win_assignment(rig):
