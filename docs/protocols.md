@@ -166,8 +166,13 @@ The standalone CLI has no ROS dependency. Ownership is enabled by default:
 the gateway connects over real Modbus/TCP, then claims that exact TCP connection
 through the loopback control listener before any raw mutation. The listener
 issues an expiring session token; control operations require that token and a
-strictly increasing sequence. Raw mutations require the claimed live connection,
-and repeated Modbus transaction IDs are rejected. Disconnect revokes the session
+strictly increasing sequence. Raw mutations require the claimed live connection
+and the session present when the frame's first byte arrived. Coalesced frames
+drain immediately; a partial frame cannot inherit a later claim. Every complete
+received transaction ID is consumed, including rejected preclaim operations.
+IDs cannot be reused on that connection after claim, release, reclaim, or uint16
+wrap; reconnect before reuse. The ID ledger is bounded to 65536 entries per
+connection. Disconnect revokes the session
 without releasing an uncleared station cycle. The raw address map is unchanged.
 Enable the loopback listener with `--fault-control-port` and configure the
 gateway's matching `fault_control_port` for fleet operation.

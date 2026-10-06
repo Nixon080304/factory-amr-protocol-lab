@@ -345,18 +345,28 @@ class ModbusGatewayNode(Node):
                         robot_id=request.robot_id,
                     )
                     if fault is not None:
-                        if physical_effect is None or physical_effect["restored"]:
-                            physical_effect = dict(
-                                unit_id=unit_id,
-                                request=request,
-                                session=session,
-                                faults=[],
-                                restored=False,
-                                error="",
-                            )
-                            with self._physical_lock:
+                        with self._physical_lock:
+                            current = self.faults.is_current(fault)
+                            if current:
+                                if (
+                                    physical_effect is None
+                                    or physical_effect["restored"]
+                                ):
+                                    physical_effect = dict(
+                                        unit_id=unit_id,
+                                        request=request,
+                                        session=session,
+                                        faults=[],
+                                        restored=False,
+                                        error="",
+                                    )
                                 self._physical_effects[unit_id] = physical_effect
-                        physical_effect["faults"].append(fault)
+                                physical_effect["faults"].append(fault)
+                        if not current:
+                            # Reset has already covered this consumed control.
+                            # It must never acquire a physical effect after ACK.
+                            self.faults.finish(fault)
+                            continue
                         self._plc_control(unit_id, fault)
 
         def finished(transfer_result):

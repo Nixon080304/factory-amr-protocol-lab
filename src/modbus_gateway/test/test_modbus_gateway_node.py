@@ -282,6 +282,53 @@ def test_review_explicit_v1_transfer_preserves_safe_reconnect(
     assert transfer(node).accepted
 
 
+def test_review2_reset_fences_consumed_but_unregistered_physical_fault(
+    pure_gateway, monkeypatch
+):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from factory_interfaces.msg import FaultCommand
+
+    node, events = pure_gateway
+    consumed, resume = threading.Event(), threading.Event()
+    consume = node.faults.consume
+    applied = []
+
+    def pause_after_consume(*args, **kwargs):
+        fault = consume(*args, **kwargs)
+        if fault is not None:
+            consumed.set()
+            assert resume.wait(2)
+        return fault
+
+    def physical_control(unit, fault=None):
+        if fault is not None:
+            applied.append((unit, fault.mission_id))
+
+    monkeypatch.setattr(node.faults, "consume", pause_after_consume)
+    monkeypatch.setattr(node, "_plc_control", physical_control)
+    node.faults.enable(FaultRequest("modbus_delay", "M-1", station="assembly"))
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        assembly = executor.submit(transfer, node)
+        try:
+            assert consumed.wait(1)
+            node.fault_subscription.callback(
+                FaultCommand(reset=True, command_id=92, ack_timeout_sec=2.0)
+            )
+            acknowledged_before_resume = bool(node.test_acknowledgements)
+            assert transfer(node, "M-2", "amr_02", "inspection").accepted
+        finally:
+            resume.set()
+        assert assembly.result(timeout=2).accepted
+    assert not (acknowledged_before_resume and applied)
+    assert [ack.command_id for ack in node.test_acknowledgements] == [92]
+    assert all(
+        event.robot_id == "amr_01"
+        for event in events
+        if event.protocol == "FAULT" and event.mission_id == "M-1"
+    )
+
+
 def test_review_lost_boundary_result_never_claims_not_requested(
     pure_gateway, monkeypatch
 ):

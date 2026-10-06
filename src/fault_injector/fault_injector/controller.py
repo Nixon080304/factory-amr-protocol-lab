@@ -13,15 +13,17 @@ class FaultEffect:
 
     request: FaultRequest
     activation_robot_id: str
+    generation: int = 0
 
     def __getattr__(self, name):
         return getattr(self.request, name)
 
     def __eq__(self, other):
         if isinstance(other, FaultEffect):
-            return (self.request, self.activation_robot_id) == (
+            return (self.request, self.activation_robot_id, self.generation) == (
                 other.request,
                 other.activation_robot_id,
+                other.generation,
             )
         return self.request == other
 
@@ -33,6 +35,7 @@ class FaultController:
     def __init__(self, *, clock=time.monotonic, on_event=None):
         self._clock, self._on_event = clock, on_event
         self._entries = {}
+        self._generation = 0
         self._lock = threading.RLock()
 
     def enable(self, request: FaultRequest):
@@ -73,7 +76,9 @@ class FaultController:
                     and request.robot_id in (None, robot_id)
                     and request.activation_point == activation_point
                 ):
-                    effect = FaultEffect(request, robot_id or request.robot_id or "")
+                    effect = FaultEffect(
+                        request, robot_id or request.robot_id or "", self._generation
+                    )
                     self._event("fault_activated", effect)
                     if request.one_shot:
                         del self._entries[key]
@@ -89,10 +94,15 @@ class FaultController:
 
     def reset(self):
         with self._lock:
+            self._generation += 1
             for request, _, effects in self._entries.values():
                 for effect in effects or (request,):
                     self._event("fault_reset", effect)
             self._entries.clear()
+
+    def is_current(self, effect):
+        """Snapshot the reset fence without waiting on event publication locks."""
+        return isinstance(effect, FaultEffect) and effect.generation == self._generation
 
     def finish(self, request):
         """Report the end of a consumed effect, separately from its armed state."""

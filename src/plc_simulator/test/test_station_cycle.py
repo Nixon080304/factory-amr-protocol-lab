@@ -471,3 +471,363 @@ def test_review_explicit_v1_mode_preserves_raw_handshake():
         assert server.stations[1].coils[1:4] == [False, False, False]
 
     asyncio.run(scenario())
+
+
+class OwnershipWire:
+    """Production TCP ingress/parser/PDU execution with only external I/O fake."""
+
+    def __init__(self, server=None):
+        import asyncio
+        from types import SimpleNamespace
+        from plc_simulator.server import PlcServer, OwnershipModbusServer
+
+        self.server = server or PlcServer(cycle_delay=0)
+        self.handler = OwnershipModbusServer(self.server).callback_new_connection()
+        self.frames = []
+        self.received = asyncio.Event()
+
+        def write(frame):
+            self.frames.append(frame)
+            self.received.set()
+
+        self.handler.transport = SimpleNamespace(
+            get_extra_info=lambda name: ("127.0.0.1", 20201),
+            write=write,
+            close=lambda: None,
+        )
+        self.handler.callback_connected()
+
+    def send(self, *pdus):
+        self.handler.data_received(
+            b"".join(self.handler.framer.buildFrame(pdu) for pdu in pdus)
+        )
+
+    async def wait(self, count):
+        import asyncio
+
+        while len(self.frames) < count:
+            self.received.clear()
+            await asyncio.wait_for(self.received.wait(), 1)
+
+    async def claim(self, operation="claim"):
+        import asyncio
+        import json
+        import struct
+
+        fields = dict(
+            operation=operation,
+            unit_id=1,
+            robot_id="amr_01",
+            mission_id="M-1",
+            part="motor",
+        )
+        if operation == "claim":
+            fields["endpoint"] = ["127.0.0.1", 20201]
+        else:
+            fields.update(session=self.session, sequence=self.sequence + 1)
+        encoded = json.dumps(fields).encode()
+        reader = asyncio.StreamReader()
+        reader.feed_data(b"\xff" + struct.pack("!H", len(encoded)) + encoded)
+        reader.feed_eof()
+        output = bytearray()
+
+        class Writer:
+            def write(self, frame):
+                output.extend(frame)
+
+            async def drain(self):
+                pass
+
+        await self.server._control_request(reader, Writer())
+        result = json.loads(output[3:])
+        assert result["accepted"]
+        if operation == "claim":
+            self.session, self.sequence = result["session"], 0
+        else:
+            self.sequence += 1
+
+
+def test_review2_coalesced_preclaim_frames_never_borrow_later_authorization():
+    import asyncio
+    from pymodbus.pdu.bit_message import ReadCoilsRequest
+    from pymodbus.pdu.register_message import WriteSingleRegisterRequest
+
+    async def scenario():
+        wire = OwnershipWire()
+        from types import SimpleNamespace
+
+        delayed = []
+        actual_loop = wire.handler.loop
+        wire.handler.loop = SimpleNamespace(
+            call_soon=lambda callback: delayed.append(callback)
+        )
+        wire.send(
+            ReadCoilsRequest(dev_id=1, transaction_id=99, address=0, count=5),
+            WriteSingleRegisterRequest(
+                dev_id=1, transaction_id=100, address=1, registers=[99]
+            ),
+        )
+        await wire.claim()
+        wire.send(ReadCoilsRequest(dev_id=1, transaction_id=101, address=0, count=5))
+        wire.handler.loop = actual_loop
+        for callback in delayed:
+            callback()
+        await wire.wait(2)
+        assert wire.server.stations[1].registers[1] == 0
+        await wire.wait(3)
+        assert {int.from_bytes(frame[:2], "big") for frame in wire.frames} == {
+            99,
+            100,
+            101,
+        }
+        assert next(frame for frame in wire.frames if frame[:2] == b"\x00d")[7] == 0x86
+        wire.handler.callback_disconnected(None)
+
+    asyncio.run(scenario())
+
+
+def test_review2_rejected_preclaim_packet_cannot_replay_after_claim():
+    import asyncio
+    from pymodbus.pdu.register_message import WriteSingleRegisterRequest
+
+    async def scenario():
+        wire = OwnershipWire()
+        request = WriteSingleRegisterRequest(
+            dev_id=1, transaction_id=100, address=1, registers=[99]
+        )
+        wire.send(request)
+        await wire.wait(1)
+        assert wire.frames[0][7] == 0x86
+        await wire.claim()
+        wire.send(request)
+        await wire.wait(2)
+        assert wire.server.stations[1].registers[1] == 0
+        assert wire.frames[1][7] == 0x86
+        wire.handler.callback_disconnected(None)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("split", [1, 5, 8, 11])
+def test_review2_partial_preclaim_frame_keeps_first_byte_authorization(split):
+    import asyncio
+    from pymodbus.pdu.register_message import WriteSingleRegisterRequest
+
+    async def scenario():
+        wire = OwnershipWire()
+        frame = wire.handler.framer.buildFrame(
+            WriteSingleRegisterRequest(
+                dev_id=1, transaction_id=100, address=1, registers=[99]
+            )
+        )
+        wire.handler.data_received(frame[:split])
+        await wire.claim()
+        wire.handler.data_received(frame[split:])
+        await wire.wait(1)
+        assert wire.server.stations[1].registers[1] == 0
+        assert wire.frames[0][7] == 0x86
+        wire.handler.callback_disconnected(None)
+
+    asyncio.run(scenario())
+
+
+def test_review2_coalesced_frames_drain_without_trigger_packet():
+    import asyncio
+    from pymodbus.pdu.bit_message import ReadCoilsRequest
+
+    async def scenario():
+        wire = OwnershipWire()
+        wire.send(
+            *[
+                ReadCoilsRequest(
+                    dev_id=1, transaction_id=identifier, address=0, count=5
+                )
+                for identifier in range(1, 101)
+            ]
+        )
+        await wire.wait(100)
+        assert {int.from_bytes(frame[:2], "big") for frame in wire.frames} == set(
+            range(1, 101)
+        )
+        assert all(frame[7] == 1 for frame in wire.frames)
+        wire.handler.callback_disconnected(None)
+
+    asyncio.run(scenario())
+
+
+def test_review2_response_cannot_discard_authorized_partial_frame():
+    import asyncio
+    from pymodbus.pdu.bit_message import ReadCoilsRequest
+    from pymodbus.pdu.register_message import WriteSingleRegisterRequest
+
+    async def scenario():
+        wire = OwnershipWire()
+        await wire.claim()
+        read = wire.handler.framer.buildFrame(
+            ReadCoilsRequest(dev_id=1, transaction_id=1, address=0, count=5)
+        )
+        write = wire.handler.framer.buildFrame(
+            WriteSingleRegisterRequest(
+                dev_id=1, transaction_id=2, address=1, registers=[99]
+            )
+        )
+        wire.handler.data_received(read + write[:5])
+        await wire.wait(1)
+        wire.handler.data_received(write[5:])
+        await wire.wait(2)
+        assert wire.server.stations[1].registers[1] == 99
+        assert wire.frames[1][7] == 6
+        wire.handler.callback_disconnected(None)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("split", [1, 5, 11])
+def test_review2_partial_frame_cannot_cross_release_reclaim_epoch(split):
+    import asyncio
+    from pymodbus.pdu.register_message import WriteSingleRegisterRequest
+
+    async def scenario():
+        wire = OwnershipWire()
+        await wire.claim()
+        write = wire.handler.framer.buildFrame(
+            WriteSingleRegisterRequest(
+                dev_id=1, transaction_id=100, address=1, registers=[99]
+            )
+        )
+        wire.handler.data_received(write[:split])
+        await wire.claim("release")
+        await wire.claim()
+        wire.handler.data_received(write[split:])
+        await wire.wait(1)
+        assert wire.server.stations[1].registers[1] == 0
+        assert wire.frames[0][7] == 0x86
+        wire.handler.callback_disconnected(None)
+
+    asyncio.run(scenario())
+
+
+def test_review2_rejected_ids_survive_reclaim_but_new_connection_can_use_them():
+    import asyncio
+    from pymodbus.pdu.register_message import WriteSingleRegisterRequest
+
+    async def scenario():
+        wire = OwnershipWire()
+        request = WriteSingleRegisterRequest(
+            dev_id=1, transaction_id=100, address=1, registers=[99]
+        )
+        wire.send(request)
+        await wire.wait(1)
+        for _ in range(2):
+            await wire.claim()
+            wire.send(request)
+            await wire.wait(len(wire.frames) + 1)
+            assert wire.server.stations[1].registers[1] == 0
+            assert wire.frames[-1][7] == 0x86
+            await wire.claim("release")
+        wire.handler.callback_disconnected(None)
+        fresh = OwnershipWire(wire.server)
+        await fresh.claim()
+        fresh.send(request)
+        await fresh.wait(1)
+        assert fresh.server.stations[1].registers[1] == 99
+        assert fresh.frames[0][7] == 6
+        fresh.handler.callback_disconnected(None)
+
+    asyncio.run(scenario())
+
+
+def test_review2_unknown_function_consumes_transaction_before_decode_rejection():
+    import asyncio
+    from pymodbus.pdu.register_message import WriteSingleRegisterRequest
+
+    async def scenario():
+        wire = OwnershipWire()
+        wire.handler.data_received(b"\x00d\x00\x00\x00\x02\x01\xff")
+        await wire.wait(1)
+        await wire.claim()
+        wire.send(
+            WriteSingleRegisterRequest(
+                dev_id=1, transaction_id=100, address=1, registers=[99]
+            )
+        )
+        await wire.wait(2)
+        assert wire.server.stations[1].registers[1] == 0
+        assert wire.frames[1][7] == 0x86
+        wire.handler.callback_disconnected(None)
+
+    asyncio.run(scenario())
+
+
+def test_review2_uint16_wrap_never_forgets_prior_ids():
+    import asyncio
+    from pymodbus.pdu.register_message import WriteSingleRegisterRequest
+
+    async def scenario():
+        wire = OwnershipWire()
+        await wire.claim()
+        wire.send(
+            *[
+                WriteSingleRegisterRequest(
+                    dev_id=1, transaction_id=identifier, address=1, registers=[value]
+                )
+                for identifier, value in [(65535, 1), (0, 2), (65535, 99)]
+            ]
+        )
+        await wire.wait(3)
+        assert wire.server.stations[1].registers[1] == 2
+        assert wire.frames[-1][7] == 0x86
+        wire.handler.callback_disconnected(None)
+
+    asyncio.run(scenario())
+
+
+def test_review2_duplicate_identity_is_fixed_before_async_dispatch():
+    import asyncio
+    from types import SimpleNamespace
+    from pymodbus.pdu.register_message import WriteSingleRegisterRequest
+
+    async def scenario():
+        wire = OwnershipWire()
+        await wire.claim()
+        delayed = []
+        actual_loop = wire.handler.loop
+        wire.handler.loop = SimpleNamespace(
+            call_soon=lambda callback: delayed.append(callback)
+        )
+        for value in (88, 99):
+            wire.send(
+                WriteSingleRegisterRequest(
+                    dev_id=1, transaction_id=100, address=1, registers=[value]
+                )
+            )
+        wire.handler.loop = actual_loop
+        for callback in delayed:
+            callback()
+        await wire.wait(2)
+        assert wire.server.stations[1].registers[1] == 88
+        assert wire.frames[-1][7] == 0x86
+        wire.handler.callback_disconnected(None)
+
+    asyncio.run(scenario())
+
+
+def test_review2_explicit_v1_tcp_mode_preserves_transaction_id_reuse():
+    import asyncio
+    from plc_simulator.server import PlcServer
+    from pymodbus.pdu.register_message import WriteSingleRegisterRequest
+
+    async def scenario():
+        wire = OwnershipWire(PlcServer(cycle_delay=0, ownership_enabled=False))
+        for value in (88, 99):
+            wire.send(
+                WriteSingleRegisterRequest(
+                    dev_id=1, transaction_id=100, address=1, registers=[value]
+                )
+            )
+            await wire.wait(len(wire.frames) + 1)
+        assert wire.server.stations[1].registers[1] == 99
+        assert all(frame[7] == 6 for frame in wire.frames)
+        wire.handler.callback_disconnected(None)
+
+    asyncio.run(scenario())

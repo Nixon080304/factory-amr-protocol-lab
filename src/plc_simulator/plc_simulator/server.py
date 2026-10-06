@@ -29,16 +29,56 @@ class OwnershipRequestHandler(ServerRequestHandler):
     def __init__(self, *args):
         self._requests = deque()
         self._transactions = set()
+        self._ingress = deque()
+        self._ingress_buffer = b""
+        self._frame_context = None
         super().__init__(*args)
+
+    def data_received(self, data):
+        # The upstream TCP buffer drains one PDU and send() clears that buffer.
+        # Own byte provenance here so coalesced and partial frames retain the
+        # session present at their first byte, independently of later responses.
+        if not data:
+            return
+        self._ingress.append((len(data), dict(self.server.plc._sessions)))
+        self._ingress_buffer += data
+        while self._ingress_buffer:
+            size, _, identifier, payload = self.framer.decode(self._ingress_buffer)
+            if not size or not payload:
+                if len(self._ingress_buffer) > 1024:
+                    self._ingress_buffer = b""
+                    self._ingress.clear()
+                return
+            self._frame_context = (
+                self._ingress[0][1],
+                self._receive_transaction(identifier),
+            )
+            try:
+                self.callback_data(self._ingress_buffer[:size])
+            finally:
+                self._frame_context = None
+            self._ingress_buffer = self._ingress_buffer[size:]
+            remaining = size
+            while remaining:
+                count, sessions = self._ingress.popleft()
+                if count > remaining:
+                    self._ingress.appendleft((count - remaining, sessions))
+                    break
+                remaining -= count
 
     def callback_data(self, data, addr=None):
         used = super().callback_data(data, addr)
         if self.last_pdu is not None:
+            sessions, replayed = self._frame_context or (
+                self.server.plc._sessions,
+                self._receive_transaction(self.last_pdu.transaction_id),
+            )
             self._requests.append(
                 (
                     self.last_pdu,
                     self.last_addr,
-                    self.server.plc._sessions.get(self.last_pdu.dev_id),
+                    sessions.get(self.last_pdu.dev_id),
+                    replayed,
                 )
             )
         return used
@@ -49,40 +89,54 @@ class OwnershipRequestHandler(ServerRequestHandler):
         self.server.plc._connections[self.endpoint] = self
 
     def callback_disconnected(self, exc):
+        self._ingress_buffer = b""
+        self._ingress.clear()
         self.server.plc._disconnect(self)
         super().callback_disconnected(exc)
 
     def handle_later(self):
         # Capture before another packet can replace PyModbus's last_pdu field.
-        pdu, address, session = self._requests.popleft()
+        pdu, address, session, replayed = self._requests.popleft()
         asyncio.run_coroutine_threadsafe(
-            self.handle_request(pdu, address, session), self.loop
+            self.handle_request(pdu, address, session, replayed=replayed), self.loop
         )
 
-    async def handle_request(self, pdu=None, address=None, session=_CURRENT_SESSION):
+    def _receive_transaction(self, identifier):
+        if not self.server.plc.ownership_enabled:
+            return False
+        # MBAP IDs are uint16: memory is bounded to 65536 entries. Never forget
+        # received IDs on a live connection; wrap/reuse requires a new connection.
+        if type(identifier) is not int or not 0 <= identifier <= 65535:
+            return True
+        replayed = identifier in self._transactions
+        self._transactions.add(identifier)
+        return replayed
+
+    async def handle_request(
+        self, pdu=None, address=None, session=_CURRENT_SESSION, *, replayed=None
+    ):
         pdu = pdu or self.last_pdu
         if pdu is None:
             return
         plc = self.server.plc
         if session is _CURRENT_SESSION:
             session = plc._sessions.get(pdu.dev_id)
+        if replayed is None:
+            replayed = self._receive_transaction(pdu.transaction_id)
         authorization = None
+        expired = session is not None and plc._clock() >= session["expires"]
+        if replayed or expired:
+            self.server_send(
+                ExceptionResponse(
+                    pdu.function_code,
+                    ExcCodes.ILLEGAL_FUNCTION,
+                    device_id=pdu.dev_id,
+                    transaction=pdu.transaction_id,
+                ),
+                address,
+            )
+            return
         if session is not None and session["connection"] is self:
-            if (
-                plc._clock() >= session["expires"]
-                or pdu.transaction_id in session["transactions"]
-            ):
-                self.server_send(
-                    ExceptionResponse(
-                        pdu.function_code,
-                        ExcCodes.ILLEGAL_FUNCTION,
-                        device_id=pdu.dev_id,
-                        transaction=pdu.transaction_id,
-                    ),
-                    address,
-                )
-                return
-            session["transactions"].add(pdu.transaction_id)
             authorization = (pdu.dev_id, session, self)
         token = plc._raw_authorization.set(authorization)
         try:
@@ -337,7 +391,6 @@ class PlcServer:
                         identity=identity,
                         token=secrets.token_urlsafe(24),
                         sequence=0,
-                        transactions=connection._transactions,
                         expires=self._clock() + 30.0,
                     )
                     self._sessions[unit] = session
