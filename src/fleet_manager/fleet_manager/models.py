@@ -60,6 +60,8 @@ class MissionRequest:
 class AssignmentDecision:
     robot_id: str | None
     reason: str
+    # FleetCore fills this durable callback fence after committing an assignment.
+    assignment_id: int | None = None
 
 
 def robot_is_ready(state: RobotSnapshot) -> bool:

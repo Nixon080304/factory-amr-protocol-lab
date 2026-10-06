@@ -338,5 +338,9 @@ class MissionJournal:
             for row in rows
         )
 
+    def get(self, mission_id: str) -> MissionRecord:
+        """Read the current snapshot, including terminal missions."""
+        return self._require(mission_id)
+
     def close(self) -> None:
         self._connection.close()

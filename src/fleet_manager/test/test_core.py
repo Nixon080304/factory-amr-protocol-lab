@@ -1,0 +1,452 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Mission safety and durable decisions exercise real fleet policies and SQLite."""
+
+from dataclasses import replace
+import importlib
+from pathlib import Path
+import sqlite3
+import sys
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from fleet_manager.config import EnergyPolicyConfig, Pose2D, ResourceConfig
+from fleet_manager.dispatcher import Dispatcher
+from fleet_manager.energy import EnergyPolicy
+from fleet_manager.journal import MissionConflictError, MissionJournal, MissionState
+from fleet_manager.models import CostEstimate, MissionRequest, RobotSnapshot
+from fleet_manager.registry import RobotRegistry
+from fleet_manager.resources import LeaseRequest, ResourceManager
+
+
+def core_api():
+    try:
+        return importlib.import_module("fleet_manager.core")
+    except ModuleNotFoundError:
+        pytest.fail("durable fleet mission core is not implemented")
+
+
+def request(mission_id="m1", **changes):
+    return replace(
+        MissionRequest(mission_id, "assembly", "inspection", "gear"), **changes
+    )
+
+
+def robot(robot_id="r1", **changes):
+    return replace(
+        RobotSnapshot(robot_id, "AVAILABLE", Pose2D(0, 0, 0), 80, "EMPTY"), **changes
+    )
+
+
+ESTIMATES = {"r1": CostEstimate(True, 1, 40), "r2": CostEstimate(True, 2, 40)}
+
+
+@pytest.fixture
+def fleet(tmp_path):
+    api = core_api()
+    journal = MissionJournal(tmp_path / "missions.sqlite3")
+    registry = RobotRegistry(("r1", "r2"))
+    for robot_id in ("r1", "r2"):
+        registry.observe(robot(robot_id), 100)
+    resources = ResourceManager((ResourceConfig("assembly", "station", 1),))
+    dispatcher = Dispatcher(EnergyPolicy(EnergyPolicyConfig(20, 30, 80, "dock")))
+    core = api.FleetCore(dispatcher, registry, resources, journal)
+    yield api, core, journal, registry, resources, dispatcher
+    journal.close()
+
+
+def assigned(fleet, **changes):
+    _, core, journal, *_ = fleet
+    core.submit(request(**changes), 100)
+    decision = core.assign("m1", ESTIMATES, 101)
+    return decision, journal.get("m1")
+
+
+def feedback(api, decision, ownership="NOT_PICKED_UP"):
+    return api.RobotMissionFeedback(
+        decision.robot_id, decision.assignment_id, ownership
+    )
+
+
+def result(api, decision, success=True, **changes):
+    return api.RobotMissionResult(
+        decision.robot_id, decision.assignment_id, success, **changes
+    )
+
+
+@pytest.mark.parametrize("pin,want", [(None, "r1"), ("r2", "r2")])
+def test_assignment_decision_is_durable_before_external_goal_can_start(
+    fleet, pin, want
+):
+    _, core, journal, *_ = fleet
+    decision, record = assigned(fleet, requested_robot_id=pin)
+    assert decision.robot_id == want
+    assert record.state == "ASSIGNED"
+    assert record.assigned_robot_id == want
+    assert decision.assignment_id == journal.events("m1")[-1].sequence
+    assert [event.state for event in journal.events("m1")] == [
+        "QUEUED",
+        "ASSIGNING",
+        "ASSIGNED",
+    ]
+    assert core.assign("m1", ESTIMATES, 102).robot_id is None
+
+
+def test_no_estimates_keeps_mission_schedulable_without_assignment(fleet):
+    _, core, journal, *_ = fleet
+    core.submit(request(), 100)
+    decision = core.assign("m1", {}, 101)
+    assert decision.robot_id is None
+    assert decision.reason == "no eligible robot"
+    assert journal.get("m1").state == "QUEUED"
+    assert journal.get("m1").assigned_robot_id is None
+    assert core.assign("m1", ESTIMATES, 102).robot_id == "r1"
+
+
+def test_pinned_unavailable_robot_never_dispatches_alternative(fleet):
+    _, core, journal, registry, *_ = fleet
+    core.submit(request(requested_robot_id="r2"), 100)
+    registry.observe(robot("r2", health="OFFLINE"), 101)
+    decision = core.assign("m1", ESTIMATES, 101)
+    assert decision.robot_id is None
+    assert decision.reason == "requested robot unavailable"
+    assert journal.get("m1").state == "QUEUED"
+
+
+def test_active_reservation_prevents_two_goals_on_same_available_heartbeat(fleet):
+    _, core, *_ = fleet
+    assigned(fleet)
+    core.submit(request("m2"), 100)
+    assert core.assign("m2", ESTIMATES, 101).robot_id == "r2"
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"pickup_station": "other"},
+        {"dropoff_station": "other"},
+        {"part": "other"},
+        {"requested_robot_id": "r2"},
+    ],
+)
+def test_duplicate_hash_conflicts_for_every_immutable_request_field(fleet, changes):
+    _, core, journal, *_ = fleet
+    original = core.submit(request(), 100)
+    assert core.submit(request(), 102) == original
+    with pytest.raises(MissionConflictError):
+        core.submit(request(**changes), 103)
+    assert journal.get("m1") == original
+    assert len(journal.events("m1")) == 1
+
+
+def test_hash_is_stable_across_reopen_and_includes_mission_identity(fleet, tmp_path):
+    api, core, journal, registry, resources, dispatcher = fleet
+    first = core.submit(request(), 100)
+    other = core.submit(request("m2"), 100)
+    assert first.payload_hash != other.payload_hash
+    reopened = MissionJournal(tmp_path / "missions.sqlite3")
+    try:
+        restarted = api.FleetCore(dispatcher, registry, resources, reopened)
+        assert restarted.submit(request(), 103) == first
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize("ownership", ["NOT_PICKED_UP", "PICKED_UP", "UNKNOWN"])
+def test_cancellation_respects_payload_ownership_and_is_idempotent(fleet, ownership):
+    api, core, journal, *_ = fleet
+    decision, _ = assigned(fleet)
+    core.record_robot_feedback("m1", feedback(api, decision, ownership), 101.1)
+    cancelled = core.cancel("m1", 101.2)
+    want = "CANCELLED" if ownership == "NOT_PICKED_UP" else "RECOVERY_REQUIRED"
+    assert cancelled.state == want
+    assert cancelled.result["final_state"] == want
+    events = journal.events("m1")
+    assert core.cancel("m1", 102) == cancelled
+    assert core.record_robot_result("m1", result(api, decision), 102) == cancelled
+    assert core.assign("m1", ESTIMATES, 102).robot_id is None
+    assert journal.events("m1") == events
+
+
+def test_queued_cancellation_needs_no_robot_and_is_durable(fleet):
+    _, core, journal, *_ = fleet
+    core.submit(request(), 100)
+    assert core.cancel("m1", 101).state == "CANCELLED"
+    assert journal.load_active() == ()
+
+
+@pytest.mark.parametrize("ownership", ["NOT_PICKED_UP", "PICKED_UP", "UNKNOWN"])
+def test_offline_robot_reassigns_only_before_pickup_and_quarantines_resources(
+    fleet, ownership
+):
+    api, core, journal, registry, resources, _ = fleet
+    decision, _ = assigned(fleet)
+    core.record_robot_feedback("m1", feedback(api, decision, ownership), 101.1)
+    held = resources.acquire(LeaseRequest("r1", "m1", "assembly"), 101).lease
+    registry.observe(robot("r1", health="OFFLINE"), 102)
+    records = core.handle_robot_offline("r1", 102)
+    assert len(records) == 1
+    state = records[0]
+    if ownership == "NOT_PICKED_UP":
+        assert state.state == "REASSIGNING"
+        assert state.assigned_robot_id is None
+        assert core.assign("m1", ESTIMATES, 102).robot_id == "r2"
+    else:
+        assert state.state == "RECOVERY_REQUIRED"
+        assert core.assign("m1", ESTIMATES, 102).robot_id is None
+    resource = resources.snapshot(102)[0]
+    assert resource.lease is None
+    assert resource.former_lease == held
+    assert resource.reconciliation_required
+    events = journal.events("m1")
+    assert core.handle_robot_offline("r1", 102) == ()
+    assert journal.events("m1") == events
+
+
+@pytest.mark.parametrize("reuse_same_robot", [False, True])
+def test_old_assignment_feedback_and_results_cannot_mutate_new_goal(
+    fleet, reuse_same_robot
+):
+    api, core, journal, registry, *_ = fleet
+    old, _ = assigned(fleet)
+    registry.observe(robot("r1", health="OFFLINE"), 102)
+    core.handle_robot_offline("r1", 102)
+    if reuse_same_robot:
+        registry.observe(robot("r1"), 102.1)
+    new = core.assign("m1", ESTIMATES, 102.1)
+    assert new.assignment_id != old.assignment_id
+    record = journal.get("m1")
+    events = journal.events("m1")
+    assert (
+        core.record_robot_feedback("m1", feedback(api, old, "PICKED_UP"), 102.2)
+        == record
+    )
+    assert core.record_robot_result("m1", result(api, old), 102.2) == record
+    assert journal.events("m1") == events
+
+
+def test_feedback_cannot_downgrade_confirmed_or_uncertain_payload(fleet):
+    api, core, _, *_ = fleet
+    decision, _ = assigned(fleet)
+    core.record_robot_feedback("m1", feedback(api, decision, "UNKNOWN"), 101.1)
+    assert (
+        core.record_robot_feedback(
+            "m1", feedback(api, decision), 101.2
+        ).payload_ownership
+        == "UNKNOWN"
+    )
+    core.record_robot_feedback("m1", feedback(api, decision, "PICKED_UP"), 101.3)
+    assert (
+        core.record_robot_feedback(
+            "m1", feedback(api, decision), 101.4
+        ).payload_ownership
+        == "PICKED_UP"
+    )
+
+
+@pytest.mark.parametrize("success,want", [(True, "COMPLETED"), (False, "FAILED")])
+def test_robot_result_is_terminal_and_duplicate_operations_replay(fleet, success, want):
+    api, core, journal, *_ = fleet
+    decision, _ = assigned(fleet)
+    core.record_robot_feedback("m1", feedback(api, decision, "PICKED_UP"), 101.1)
+    outcome = core.record_robot_result(
+        "m1",
+        result(api, decision, success, error_code="" if success else "DRIVE_FAULT"),
+        101.2,
+    )
+    assert outcome.state == want
+    assert outcome.result["final_state"] == want
+    assert outcome.result["success"] is success
+    assert outcome.payload_ownership == ("DELIVERED" if success else "PICKED_UP")
+    events = journal.events("m1")
+    assert (
+        core.record_robot_result("m1", result(api, decision, not success), 102)
+        == outcome
+    )
+    assert core.record_robot_feedback("m1", feedback(api, decision), 102) == outcome
+    assert core.cancel("m1", 102) == outcome
+    assert core.submit(request(), 102) == outcome
+    assert core.handle_robot_offline("r1", 102) == ()
+    assert journal.load_active() == ()
+    assert journal.events("m1") == events
+
+
+def test_offline_pre_pickup_failure_uses_specific_reassignment_rule(fleet):
+    api, core, _, registry, *_ = fleet
+    decision, _ = assigned(fleet)
+    registry.observe(robot("r1", health="OFFLINE"), 102)
+    assert (
+        core.record_robot_result(
+            "m1", result(api, decision, False, error_code="ROBOT_OFFLINE"), 102
+        ).state
+        == "REASSIGNING"
+    )
+
+
+def test_normal_failure_before_pickup_does_not_automatically_retry(fleet):
+    api, core, *_ = fleet
+    decision, _ = assigned(fleet)
+    assert (
+        core.record_robot_result(
+            "m1", result(api, decision, False, error_code="NAVIGATION_FAILED"), 102
+        ).state
+        == "FAILED"
+    )
+
+
+def test_sqlite_assignment_failure_returns_no_goal_decision(fleet, tmp_path):
+    _, core, journal, *_ = fleet
+    core.submit(request(), 100)
+    with sqlite3.connect(tmp_path / "missions.sqlite3") as connection:
+        connection.execute(
+            "CREATE TRIGGER fail_assignment BEFORE INSERT ON mission_events "
+            "WHEN NEW.state = 'ASSIGNED' "
+            "BEGIN SELECT RAISE(ABORT, 'assignment persistence failed'); END"
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="assignment persistence failed"):
+        core.assign("m1", ESTIMATES, 101)
+    assert journal.get("m1").state == "ASSIGNING"
+    assert journal.get("m1").assigned_robot_id is None
+
+
+def test_offline_persistence_failure_does_not_release_held_resources(fleet, tmp_path):
+    _, core, journal, _, resources, _ = fleet
+    assigned(fleet)
+    held = resources.acquire(LeaseRequest("r1", "m1", "assembly"), 101).lease
+    with sqlite3.connect(tmp_path / "missions.sqlite3") as connection:
+        connection.execute(
+            "CREATE TRIGGER fail_offline BEFORE INSERT ON mission_events "
+            "WHEN NEW.state = 'REASSIGNING' "
+            "BEGIN SELECT RAISE(ABORT, 'offline persistence failed'); END"
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="offline persistence failed"):
+        core.handle_robot_offline("r1", 102)
+    assert journal.get("m1").state == "ASSIGNED"
+    assert resources.snapshot(102)[0].lease == held
+
+
+@pytest.mark.parametrize("state", list(MissionState))
+def test_restart_reconciliation_never_resumes_uncertain_assignment(
+    fleet, state, tmp_path
+):
+    api, core, journal, registry, resources, dispatcher = fleet
+    core.submit(request(), 100)
+    if state != MissionState.QUEUED:
+        journal.transition("m1", MissionState.QUEUED, state, {}, 101)
+    reopened = MissionJournal(tmp_path / "missions.sqlite3")
+    try:
+        restarted = api.FleetCore(dispatcher, registry, resources, reopened)
+        decision = restarted.reconcile(api.ReconciliationSnapshot(()), 102)
+        want = {
+            "RECEIVED": "QUEUED",
+            "QUEUED": "QUEUED",
+            "ASSIGNING": "QUEUED",
+            "REASSIGNING": "REASSIGNING",
+            "ASSIGNED": "RECOVERY_REQUIRED",
+            "EXECUTING": "RECOVERY_REQUIRED",
+            "COMPLETED": "COMPLETED",
+            "FAILED": "FAILED",
+            "CANCELLED": "CANCELLED",
+            "RECOVERY_REQUIRED": "RECOVERY_REQUIRED",
+        }[state.value]
+        assert reopened.get("m1").state == want
+        assert decision.schedulable_mission_ids == (
+            ("m1",) if want in ("QUEUED", "REASSIGNING") else ()
+        )
+        events = reopened.events("m1")
+        assert restarted.reconcile(api.ReconciliationSnapshot(()), 102) == decision
+        assert reopened.events("m1") == events
+    finally:
+        reopened.close()
+
+
+def test_reconciliation_retains_execution_with_matching_robot_and_payload(fleet):
+    api, core, journal, *_ = fleet
+    decision, _ = assigned(fleet)
+    core.record_robot_feedback("m1", feedback(api, decision, "PICKED_UP"), 101.1)
+    observation = robot("r1", mission_id="m1", mode="EXECUTING", payload_state="LOADED")
+    before = journal.get("m1")
+    reconciled = core.reconcile(api.ReconciliationSnapshot((observation,)), 102)
+    assert journal.get("m1") == before
+    assert reconciled.recovery_required_mission_ids == ()
+    assert reconciled.schedulable_mission_ids == ()
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"mission_id": "other"},
+        {"payload_state": "UNKNOWN"},
+        {"payload_state": "EMPTY"},
+        {"health": "OFFLINE"},
+        {"mode": "AVAILABLE"},
+        {"fault": "DRIVE_FAULT"},
+    ],
+)
+def test_reconciliation_fences_conflicting_robot_or_payload_evidence(fleet, changes):
+    api, core, journal, *_ = fleet
+    decision, _ = assigned(fleet)
+    core.record_robot_feedback("m1", feedback(api, decision, "PICKED_UP"), 101.1)
+    observation = robot("r1", mission_id="m1", mode="EXECUTING", payload_state="LOADED")
+    reconciled = core.reconcile(
+        api.ReconciliationSnapshot((replace(observation, **changes),)), 102
+    )
+    assert journal.get("m1").state == "RECOVERY_REQUIRED"
+    assert reconciled.recovery_required_mission_ids == ("m1",)
+
+
+def test_reconciliation_requires_durable_assignment_event(fleet):
+    api, core, journal, *_ = fleet
+    core.submit(request(), 100)
+    journal.transition(
+        "m1",
+        MissionState.QUEUED,
+        MissionState.ASSIGNED,
+        {"assigned_robot_id": "r1"},
+        101,
+    )
+    # This event is syntactically ASSIGNED but lacks the expected assigning predecessor.
+    observed = robot("r1", mission_id="m1", mode="RESERVED")
+    core.reconcile(api.ReconciliationSnapshot((observed,)), 102)
+    assert journal.get("m1").state == "RECOVERY_REQUIRED"
+
+
+@pytest.mark.parametrize("state", ["QUEUED", "ASSIGNING", "REASSIGNING"])
+def test_reconciliation_fences_scheduling_state_with_uncertain_payload(fleet, state):
+    api, core, journal, *_ = fleet
+    core.submit(request(), 100)
+    journal.transition(
+        "m1",
+        MissionState.QUEUED,
+        MissionState(state),
+        {"payload_ownership": "UNKNOWN"},
+        101,
+    )
+    reconciled = core.reconcile(api.ReconciliationSnapshot(()), 102)
+    assert journal.get("m1").state == "RECOVERY_REQUIRED"
+    assert reconciled.schedulable_mission_ids == ()
+
+
+def test_reconciliation_fences_robot_claim_on_queued_mission(fleet):
+    api, core, journal, *_ = fleet
+    core.submit(request(), 100)
+    observed = robot("r1", mission_id="m1", mode="EXECUTING")
+    core.reconcile(api.ReconciliationSnapshot((observed,)), 102)
+    assert journal.get("m1").state == "RECOVERY_REQUIRED"
+
+
+def test_reconciliation_fences_duplicate_robot_observations(fleet):
+    api, core, journal, *_ = fleet
+    assigned(fleet)
+    observed = robot("r1", mission_id="m1", mode="RESERVED")
+    core.reconcile(api.ReconciliationSnapshot((observed, observed)), 102)
+    assert journal.get("m1").state == "RECOVERY_REQUIRED"
+
+
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), True, "100"])
+def test_invalid_core_clock_cannot_create_a_mission(fleet, invalid):
+    _, core, journal, *_ = fleet
+    with pytest.raises(ValueError, match="finite"):
+        core.submit(request(), invalid)
+    assert journal.load_active() == ()

@@ -1,0 +1,375 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Durable, ROS-free orchestration of fleet missions."""
+
+from dataclasses import asdict, dataclass
+import hashlib
+import json
+import math
+from typing import Mapping
+
+from fleet_manager.dispatcher import Dispatcher
+from fleet_manager.journal import (
+    MissionEvent,
+    MissionJournal,
+    MissionRecord,
+    MissionState,
+    PayloadOwnership,
+)
+from fleet_manager.models import (
+    AssignmentDecision,
+    CostEstimate,
+    MissionRequest,
+    RobotHealth,
+    RobotSnapshot,
+)
+from fleet_manager.registry import RobotRegistry
+from fleet_manager.resources import ResourceManager
+
+
+@dataclass(frozen=True)
+class RobotMissionFeedback:
+    robot_id: str
+    assignment_id: int
+    payload_ownership: PayloadOwnership = PayloadOwnership.NOT_PICKED_UP
+    stage: str = ""
+
+
+@dataclass(frozen=True)
+class RobotMissionResult:
+    robot_id: str
+    assignment_id: int
+    success: bool
+    error_code: str = ""
+    message: str = ""
+    payload_ownership: PayloadOwnership | None = None
+
+
+@dataclass(frozen=True)
+class ReconciliationSnapshot:
+    robots: tuple[RobotSnapshot, ...]
+
+
+@dataclass(frozen=True)
+class ReconcileResult:
+    records: tuple[MissionRecord, ...]
+    schedulable_mission_ids: tuple[str, ...]
+    recovery_required_mission_ids: tuple[str, ...]
+
+
+_CLOSED = frozenset(
+    (
+        MissionState.COMPLETED,
+        MissionState.FAILED,
+        MissionState.CANCELLED,
+        MissionState.RECOVERY_REQUIRED,
+    )
+)
+_RUNNING = frozenset((MissionState.ASSIGNED, MissionState.EXECUTING))
+_SCHEDULABLE = frozenset((MissionState.QUEUED, MissionState.REASSIGNING))
+
+
+def _ownership(record: MissionRecord, observed: PayloadOwnership) -> PayloadOwnership:
+    observed = PayloadOwnership(observed)
+    if record.payload_ownership in (
+        PayloadOwnership.PICKED_UP,
+        PayloadOwnership.DELIVERED,
+    ):
+        return record.payload_ownership
+    if (
+        record.payload_ownership == PayloadOwnership.UNKNOWN
+        and observed == PayloadOwnership.NOT_PICKED_UP
+    ):
+        return PayloadOwnership.UNKNOWN
+    return observed
+
+
+def _time(now: float) -> None:
+    if type(now) not in (int, float) or not math.isfinite(now):
+        raise ValueError("now must be a finite number")
+
+
+class FleetCore:
+    """Serialize calls on the journal's owning thread, including node callbacks.
+
+    Only returned assignment decisions authorize sending a new robot goal.
+    The event sequence is an internal goal-generation fence. Adapters attach it
+    through goal callback closures; it does not require a ROS interface field.
+    Cancellation returns the committed record so adapters can cancel its former
+    robot goal. Duplicate operations return snapshots without issuing new goals.
+    """
+
+    def __init__(
+        self,
+        dispatcher: Dispatcher,
+        registry: RobotRegistry,
+        resources: ResourceManager,
+        journal: MissionJournal,
+    ):
+        self._dispatcher = dispatcher
+        self._registry = registry
+        self._resources = resources
+        self._journal = journal
+
+    def submit(self, request: MissionRequest, now: float) -> MissionRecord:
+        _time(now)
+        canonical = json.dumps(
+            asdict(request), sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
+        payload_hash = hashlib.sha256(canonical).hexdigest()
+        return self._journal.register(request, payload_hash, now).record
+
+    def assign(
+        self, mission_id: str, estimates: Mapping[str, CostEstimate], now: float
+    ) -> AssignmentDecision:
+        _time(now)
+        record = self._journal.get(mission_id)
+        if record.state not in _SCHEDULABLE:
+            return AssignmentDecision(None, "mission is not schedulable")
+        reserved = {
+            active.assigned_robot_id
+            for active in self._journal.load_active()
+            if active.assigned_robot_id is not None
+        }
+        robots = tuple(
+            robot
+            for robot in self._registry.eligible(now)
+            if robot.robot_id not in reserved
+        )
+        decision = self._dispatcher.choose(record.request, robots, estimates)
+        if decision.robot_id is None:
+            return decision
+        if record.state == MissionState.QUEUED:
+            self._journal.transition(
+                mission_id, record.state, MissionState.ASSIGNING, {}, now
+            )
+        self._journal.assign(mission_id, decision.robot_id, now)
+        assignment_id = self._journal.events(mission_id)[-1].sequence
+        return AssignmentDecision(decision.robot_id, decision.reason, assignment_id)
+
+    def _assignment(self, record: MissionRecord) -> MissionEvent | None:
+        assignment = next(
+            (
+                event
+                for event in reversed(self._journal.events(record.request.mission_id))
+                if event.state == MissionState.ASSIGNED
+            ),
+            None,
+        )
+        if (
+            assignment is None
+            or assignment.previous_state
+            not in (MissionState.ASSIGNING, MissionState.REASSIGNING)
+            or assignment.detail.get("assigned_robot_id") != record.assigned_robot_id
+        ):
+            return None
+        return assignment
+
+    def _matches(
+        self, record: MissionRecord, callback: RobotMissionFeedback | RobotMissionResult
+    ) -> bool:
+        if (
+            record.state not in _RUNNING
+            or record.assigned_robot_id != callback.robot_id
+        ):
+            return False
+        assignment = self._assignment(record)
+        return assignment is not None and assignment.sequence == callback.assignment_id
+
+    def record_robot_feedback(
+        self, mission_id: str, feedback: RobotMissionFeedback, now: float
+    ) -> MissionRecord:
+        _time(now)
+        record = self._journal.get(mission_id)
+        if not self._matches(record, feedback):
+            return record
+        ownership = _ownership(record, feedback.payload_ownership)
+        if (
+            record.state == MissionState.EXECUTING
+            and ownership == record.payload_ownership
+        ):
+            return record
+        return self._journal.transition(
+            mission_id,
+            record.state,
+            MissionState.EXECUTING,
+            {"payload_ownership": ownership, "stage": feedback.stage},
+            now,
+        )
+
+    @staticmethod
+    def _result(record, target, success, error_code, message):
+        return {
+            "success": success,
+            "final_state": target.value,
+            "assigned_robot_id": record.assigned_robot_id,
+            "error_code": error_code,
+            "message": message,
+        }
+
+    def record_robot_result(
+        self, mission_id: str, result: RobotMissionResult, now: float
+    ) -> MissionRecord:
+        _time(now)
+        record = self._journal.get(mission_id)
+        if not self._matches(record, result):
+            return record
+        ownership = record.payload_ownership
+        if result.payload_ownership is not None:
+            ownership = _ownership(record, result.payload_ownership)
+        if (
+            not result.success
+            and result.error_code == "ROBOT_OFFLINE"
+            and self._registry.get(result.robot_id, now).health == RobotHealth.OFFLINE
+        ):
+            if ownership != record.payload_ownership:
+                record = self._journal.transition(
+                    mission_id,
+                    record.state,
+                    record.state,
+                    {"payload_ownership": ownership},
+                    now,
+                )
+            self.handle_robot_offline(result.robot_id, now)
+            return self._journal.get(mission_id)
+        target = MissionState.COMPLETED if result.success else MissionState.FAILED
+        if result.success:
+            ownership = PayloadOwnership.DELIVERED
+        return self._journal.transition(
+            mission_id,
+            record.state,
+            target,
+            {
+                "payload_ownership": ownership,
+                "result": self._result(
+                    record, target, result.success, result.error_code, result.message
+                ),
+            },
+            now,
+        )
+
+    def cancel(self, mission_id: str, now: float) -> MissionRecord:
+        _time(now)
+        record = self._journal.get(mission_id)
+        if record.state in _CLOSED:
+            return record
+        target = (
+            MissionState.CANCELLED
+            if record.payload_ownership == PayloadOwnership.NOT_PICKED_UP
+            else MissionState.RECOVERY_REQUIRED
+        )
+        return self._journal.transition(
+            mission_id,
+            record.state,
+            target,
+            {
+                "result": self._result(
+                    record, target, False, "CANCELLED", "Cancellation requested"
+                )
+            },
+            now,
+        )
+
+    def handle_robot_offline(
+        self, robot_id: str, now: float
+    ) -> tuple[MissionRecord, ...]:
+        _time(now)
+        records = []
+        for record in self._journal.load_active():
+            if record.assigned_robot_id != robot_id or record.state not in _RUNNING:
+                continue
+            target = (
+                MissionState.REASSIGNING
+                if record.payload_ownership == PayloadOwnership.NOT_PICKED_UP
+                else MissionState.RECOVERY_REQUIRED
+            )
+            detail = {"reason": "robot offline"}
+            if target == MissionState.REASSIGNING:
+                detail["assigned_robot_id"] = None
+            records.append(
+                self._journal.transition(
+                    record.request.mission_id, record.state, target, detail, now
+                )
+            )
+        # Journal commits precede resource cleanup. A failed write cannot emit a goal.
+        self._resources.release_owner(robot_id, now)
+        return tuple(records)
+
+    def reconcile(
+        self, observations: ReconciliationSnapshot, now: float
+    ) -> ReconcileResult:
+        _time(now)
+        robots = {robot.robot_id: robot for robot in observations.robots}
+        duplicates = {
+            robot_id
+            for robot_id in robots
+            if sum(robot.robot_id == robot_id for robot in observations.robots) > 1
+        }
+        for record in self._journal.load_active():
+            mission_id = record.request.mission_id
+            scheduling = record.state in _SCHEDULABLE or record.state in (
+                MissionState.RECEIVED,
+                MissionState.ASSIGNING,
+            )
+            claims = tuple(
+                robot for robot in observations.robots if robot.mission_id == mission_id
+            )
+            if scheduling and (
+                record.payload_ownership != PayloadOwnership.NOT_PICKED_UP
+                or record.assigned_robot_id is not None
+                or claims
+            ):
+                self._journal.transition(
+                    mission_id,
+                    record.state,
+                    MissionState.RECOVERY_REQUIRED,
+                    {"reason": "uncertain scheduling evidence"},
+                    now,
+                )
+            elif record.state in (MissionState.RECEIVED, MissionState.ASSIGNING):
+                self._journal.transition(
+                    mission_id,
+                    record.state,
+                    MissionState.QUEUED,
+                    {"assigned_robot_id": None, "reason": "interrupted scheduling"},
+                    now,
+                )
+            elif record.state in _RUNNING:
+                robot = robots.get(record.assigned_robot_id)
+                payload = {
+                    PayloadOwnership.NOT_PICKED_UP: "EMPTY",
+                    PayloadOwnership.PICKED_UP: "LOADED",
+                }.get(record.payload_ownership)
+                certain = (
+                    robot is not None
+                    and robot.health == RobotHealth.ONLINE
+                    and robot.mission_id == mission_id
+                    and robot.mode in ("RESERVED", "EXECUTING", "WAITING_FOR_RESOURCE")
+                    and payload is not None
+                    and robot.payload_state == payload
+                    and not robot.fault
+                    and robot.robot_id not in duplicates
+                    and len(claims) == 1
+                    and self._assignment(record) is not None
+                )
+                if not certain:
+                    self._journal.transition(
+                        mission_id,
+                        record.state,
+                        MissionState.RECOVERY_REQUIRED,
+                        {"reason": "uncertain restart evidence"},
+                        now,
+                    )
+        records = self._journal.load_active()
+        return ReconcileResult(
+            records,
+            tuple(
+                record.request.mission_id
+                for record in records
+                if record.state in _SCHEDULABLE
+            ),
+            tuple(
+                record.request.mission_id
+                for record in records
+                if record.state == MissionState.RECOVERY_REQUIRED
+            ),
+        )

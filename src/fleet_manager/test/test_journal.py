@@ -27,6 +27,18 @@ def request(mission_id="mission_01", requested_robot_id=None):
     )
 
 
+def test_get_reads_terminal_snapshot_and_rejects_unknown_identity(journal):
+    handle = journal()
+    api = journal_api()
+    handle.register(request(), "hash_01", 10.0)
+    completed = handle.transition(
+        "mission_01", api.MissionState.QUEUED, api.MissionState.COMPLETED, {}, 11.0
+    )
+    assert handle.get("mission_01") == completed
+    with pytest.raises(KeyError, match="missing"):
+        handle.get("missing")
+
+
 @pytest.fixture
 def database(tmp_path):
     return tmp_path / "missions.sqlite3"
