@@ -831,3 +831,162 @@ def test_review2_explicit_v1_tcp_mode_preserves_transaction_id_reuse():
         wire.handler.callback_disconnected(None)
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("ownership_enabled", [True, False])
+def test_review3_minimum_frame_does_not_consume_next_frame_first_byte(
+    ownership_enabled,
+):
+    import asyncio
+    from plc_simulator.server import PlcServer
+    from pymodbus.pdu.bit_message import ReadCoilsRequest
+    from pymodbus.pdu.other_message import ReadExceptionStatusRequest
+
+    async def scenario():
+        wire = OwnershipWire(PlcServer(ownership_enabled=ownership_enabled))
+        first = wire.handler.framer.buildFrame(
+            ReadExceptionStatusRequest(dev_id=1, transaction_id=1)
+        )
+        second = wire.handler.framer.buildFrame(
+            ReadCoilsRequest(dev_id=1, transaction_id=2, address=0, count=5)
+        )
+        wire.handler.data_received(first + second[:1])
+        await wire.wait(1)
+        wire.handler.data_received(second[1:])
+        try:
+            await wire.wait(2)
+        except TimeoutError:
+            pass
+        assert [int.from_bytes(frame[:2], "big") for frame in wire.frames] == [1, 2]
+        assert [frame[7] for frame in wire.frames] == [7, 1]
+        wire.handler.callback_disconnected(None)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("ownership_enabled", [True, False])
+@pytest.mark.parametrize(
+    "protocol_id,length", [(1, 2), (65535, 2), (0, 0), (0, 1), (0, 255), (0, 65535)]
+)
+def test_review3_invalid_mbap_header_closes_before_waiting_for_payload(
+    ownership_enabled, protocol_id, length
+):
+    import asyncio
+    import struct
+    from plc_simulator.server import PlcServer
+
+    async def scenario():
+        wire = OwnershipWire(PlcServer(ownership_enabled=ownership_enabled))
+        if ownership_enabled:
+            await wire.claim()
+        header = struct.pack("!HHH", 1, protocol_id, length)
+        wire.handler.data_received(header[:5])
+        assert wire.handler.is_active()
+        wire.handler.data_received(header[5:])
+        assert not wire.handler.is_active()
+        assert wire.frames == []
+        assert wire.server._sessions == {}
+        assert wire.server._connections == {}
+        if ownership_enabled:
+            assert wire.server.stations[1].owner is not None
+        wire.handler.callback_disconnected(None)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("ownership_enabled", [True, False])
+def test_review3_complete_oversized_frame_cannot_execute_or_resynchronize(
+    ownership_enabled,
+):
+    import asyncio
+    import struct
+    from plc_simulator.server import PlcServer
+    from pymodbus.pdu.register_message import WriteSingleRegisterRequest
+
+    async def scenario():
+        wire = OwnershipWire(PlcServer(ownership_enabled=ownership_enabled))
+        if ownership_enabled:
+            await wire.claim()
+        oversized = struct.pack("!HHH", 1, 0, 1500) + b"\x01\x07" + bytes(1498)
+        wire.handler.data_received(oversized)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert wire.frames == []
+        assert not wire.handler.is_active()
+        wire.send(
+            WriteSingleRegisterRequest(
+                dev_id=1, transaction_id=2, address=1, registers=[99]
+            )
+        )
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert wire.server.stations[1].registers[1] == 0
+        assert wire.frames == []
+        wire.handler.callback_disconnected(None)
+
+    asyncio.run(scenario())
+
+
+def test_review3_minimum_frame_partial_write_keeps_preclaim_identity():
+    import asyncio
+    from pymodbus.pdu.other_message import ReadExceptionStatusRequest
+    from pymodbus.pdu.register_message import WriteSingleRegisterRequest
+
+    async def scenario():
+        wire = OwnershipWire()
+        first = wire.handler.framer.buildFrame(
+            ReadExceptionStatusRequest(dev_id=1, transaction_id=1)
+        )
+        write = wire.handler.framer.buildFrame(
+            WriteSingleRegisterRequest(
+                dev_id=1, transaction_id=2, address=1, registers=[99]
+            )
+        )
+        wire.handler.data_received(first + write[:1])
+        await wire.wait(1)
+        await wire.claim()
+        wire.handler.data_received(write[1:])
+        await wire.wait(2)
+        assert [frame[7] for frame in wire.frames] == [7, 0x86]
+        assert wire.server.stations[1].registers[1] == 0
+        wire.handler.callback_disconnected(None)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("split", [1, 5, 6, 7, 259])
+def test_review3_maximum_mbap_frame_drains_partial_and_following_frame(split):
+    import asyncio
+    import struct
+    from pymodbus.pdu.other_message import ReadExceptionStatusRequest
+    from pymodbus.pdu.register_message import WriteSingleRegisterRequest
+
+    async def scenario():
+        wire = OwnershipWire()
+        # Largest permitted ADU, unsupported function: reject its PDU, not its
+        # valid MBAP boundary, and consume the ID even before authorization.
+        maximum = struct.pack("!HHH", 100, 0, 254) + b"\x01\xff" + bytes(252)
+        wire.handler.data_received(maximum[:split])
+        assert wire.frames == []
+        wire.handler.data_received(
+            maximum[split:]
+            + wire.handler.framer.buildFrame(
+                ReadExceptionStatusRequest(dev_id=1, transaction_id=101)
+            )
+        )
+        await wire.wait(2)
+        assert [int.from_bytes(frame[:2], "big") for frame in wire.frames] == [100, 101]
+        assert [frame[7] for frame in wire.frames] == [0xFF, 7]
+        assert wire.handler.is_active()
+        await wire.claim()
+        wire.send(
+            WriteSingleRegisterRequest(
+                dev_id=1, transaction_id=100, address=1, registers=[99]
+            )
+        )
+        await wire.wait(3)
+        assert wire.server.stations[1].registers[1] == 0
+        assert wire.frames[-1][7] == 0x86
+        wire.handler.callback_disconnected(None)
+
+    asyncio.run(scenario())

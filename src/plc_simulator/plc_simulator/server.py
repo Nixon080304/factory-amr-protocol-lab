@@ -38,22 +38,34 @@ class OwnershipRequestHandler(ServerRequestHandler):
         # The upstream TCP buffer drains one PDU and send() clears that buffer.
         # Own byte provenance here so coalesced and partial frames retain the
         # session present at their first byte, independently of later responses.
-        if not data:
+        if self.is_closing or not data:
             return
         self._ingress.append((len(data), dict(self.server.plc._sessions)))
         self._ingress_buffer += data
         while self._ingress_buffer:
-            size, _, identifier, payload = self.framer.decode(self._ingress_buffer)
-            if not size or not payload:
-                if len(self._ingress_buffer) > 1024:
-                    self._ingress_buffer = b""
-                    self._ingress.clear()
+            if len(self._ingress_buffer) < 6:
+                return
+            identifier, protocol, length = struct.unpack(
+                "!HHH", self._ingress_buffer[:6]
+            )
+            # MBAP length includes the unit byte and a 1..253-byte PDU. Reject
+            # malformed headers immediately, before buffering their payload.
+            if protocol != 0 or not 2 <= length <= 254:
+                self._ingress_buffer = b""
+                self._ingress.clear()
+                self.server.plc._disconnect(self)
+                self.close()
+                return
+            size = 6 + length
+            if len(self._ingress_buffer) < size:
                 return
             self._frame_context = (
                 self._ingress[0][1],
                 self._receive_transaction(identifier),
             )
             try:
+                # Decode only this ADU: the installed framer treats an 8-byte
+                # request plus the next frame's first byte as a 9-byte frame.
                 self.callback_data(self._ingress_buffer[:size])
             finally:
                 self._frame_context = None

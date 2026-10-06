@@ -167,7 +167,14 @@ the gateway connects over real Modbus/TCP, then claims that exact TCP connection
 through the loopback control listener before any raw mutation. The listener
 issues an expiring session token; control operations require that token and a
 strictly increasing sequence. Raw mutations require the claimed live connection
-and the session present when the frame's first byte arrived. Coalesced frames
+and the session present when the frame's first byte arrived. Frames are sliced
+by their validated MBAP header before PyModbus decoding: protocol ID
+must be zero and length must be 2..254 (unit byte plus a 1..253-byte PDU), for an
+8..260-byte ADU. Partial frames retain their original byte provenance; complete
+frames drain in order without borrowing bytes from the following frame.
+Invalid headers close the TCP connection and revoke its authorization immediately,
+while retaining station ownership for explicit recovery. These framing checks also
+apply when ownership is explicitly disabled for V1 compatibility. Coalesced frames
 drain immediately; a partial frame cannot inherit a later claim. Every complete
 received transaction ID is consumed, including rejected preclaim operations.
 IDs cannot be reused on that connection after claim, release, reclaim, or uint16
