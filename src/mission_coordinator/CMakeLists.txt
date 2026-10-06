@@ -10,7 +10,7 @@ find_package(nav2_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 
-add_library(mission_state_machine src/mission_state_machine.cpp)
+add_library(mission_state_machine src/mission_state_machine.cpp src/resource_adapter.cpp)
 target_compile_features(mission_state_machine PUBLIC cxx_std_17)
 target_include_directories(mission_state_machine PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -28,7 +28,7 @@ install(TARGETS mission_state_machine
   RUNTIME DESTINATION bin
 )
 ament_export_targets(mission_state_machine_targets HAS_LIBRARY_TARGET)
-add_library(mission_ros src/navigation_adapter.cpp src/mission_coordinator_node.cpp)
+add_library(mission_ros src/navigation_adapter.cpp src/resource_ros_transport.cpp src/mission_coordinator_node.cpp)
 target_link_libraries(mission_ros mission_state_machine)
 ament_target_dependencies(mission_ros rclcpp rclcpp_action factory_interfaces nav2_msgs geometry_msgs std_msgs)
 add_executable(mission_coordinator src/main.cpp)
@@ -37,6 +37,9 @@ install(TARGETS mission_ros mission_coordinator ARCHIVE DESTINATION lib LIBRARY 
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_resource_adapter test/test_resource_adapter.cpp)
+  target_include_directories(test_resource_adapter PRIVATE include)
+  target_link_libraries(test_resource_adapter mission_state_machine)
   ament_add_gtest(test_robot_context test/test_robot_context.cpp)
   target_include_directories(test_robot_context PRIVATE include)
   ament_target_dependencies(test_robot_context rclcpp)

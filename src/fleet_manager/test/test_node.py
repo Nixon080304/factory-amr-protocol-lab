@@ -44,6 +44,56 @@ def request(mission_id="m1", pin=None):
     return MissionRequest(mission_id, "assembly", "inspection", "motor", pin)
 
 
+def test_cancel_resource_wait_removes_only_exact_waiter_without_releasing_owner(rig):
+    from types import SimpleNamespace
+
+    _, adapter, _, _, _ = rig
+    owner = SimpleNamespace(
+        robot_id="amr_01", mission_id="m1", resource_id="central_aisle"
+    )
+    waiter = SimpleNamespace(
+        robot_id="amr_02", mission_id="m2", resource_id="central_aisle"
+    )
+    grant = adapter.resource("acquire", owner)
+    assert grant["granted"]
+    assert not adapter.resource("acquire", waiter)["granted"]
+    reply = adapter.resource("cancel_wait", waiter)
+    assert reply["cancelled"]
+    assert not adapter.resource("cancel_wait", waiter)["cancelled"]
+    assert adapter.resource("acquire", owner)["lease_id"] == grant["lease_id"]
+
+
+def test_cancel_wait_ros_handler_preserves_typed_result_and_offline_cleanup(rig):
+    from types import SimpleNamespace
+    from factory_interfaces.srv import AcquireResource, CancelResourceWait
+    from fleet_manager.node import FleetManagerNode
+
+    _, adapter, _, _, now = rig
+    adapter.resource(
+        "acquire",
+        AcquireResource.Request(
+            robot_id="amr_01", mission_id="m1", resource_id="assembly"
+        ),
+    )
+    adapter.resource(
+        "acquire",
+        AcquireResource.Request(
+            robot_id="amr_02", mission_id="m2", resource_id="assembly"
+        ),
+    )
+    now[0] += 5.1
+    response = FleetManagerNode._resource(
+        SimpleNamespace(adapter=adapter),
+        "cancel_wait",
+        CancelResourceWait.Request(
+            robot_id="amr_02", mission_id="m2", resource_id="assembly"
+        ),
+        CancelResourceWait.Response(),
+    )
+    assert response.cancelled and response.reason == "waiter cancelled"
+    assert adapter.resources.snapshot(now[0])[0].lease.robot_id == "amr_01"
+
+
 def dispatch(rig, mission_id="m1", pin=None):
     _, adapter, _, robots, _ = rig
     adapter.submit(request(mission_id, pin))
@@ -712,7 +762,16 @@ def test_wire_robot_state_reports_operational_health_without_waiting_for_timeout
 
 @pytest.mark.parametrize(
     "scenario",
-    ["automatic", "pinned", "duplicate", "missing_cost", "cancel", "offline", "mqtt"],
+    [
+        "automatic",
+        "pinned",
+        "duplicate",
+        "missing_cost",
+        "cancel",
+        "offline",
+        "mqtt",
+        "resources",
+    ],
 )
 def test_real_ros_two_robot_fleet_action(scenario, tmp_path):
     """Authored ROS contract test: do not hide blocked DDS networking with skips."""
@@ -765,6 +824,57 @@ def test_real_ros_two_robot_fleet_action(scenario, tmp_path):
                 and len(fleet.adapter.registry.eligible(time.monotonic())) == 2
             )
         )
+        if scenario == "resources":
+            from factory_interfaces.srv import (
+                AcquireResource,
+                CancelResourceWait,
+                ReleaseResource,
+            )
+
+            service_clients = [
+                peer.create_client(service, "/factory/resources/" + name)
+                for service, name in (
+                    (AcquireResource, "acquire"),
+                    (CancelResourceWait, "cancel_wait"),
+                    (ReleaseResource, "release"),
+                )
+            ]
+            for service_client in service_clients:
+                wait(service_client.service_is_ready)
+            owner = service_clients[0].call_async(
+                AcquireResource.Request(
+                    robot_id="amr_01", mission_id="owner", resource_id="central_aisle"
+                )
+            )
+            wait(owner.done)
+            assert owner.result().granted
+            waiter = service_clients[0].call_async(
+                AcquireResource.Request(
+                    robot_id="amr_02", mission_id="waiter", resource_id="central_aisle"
+                )
+            )
+            wait(waiter.done)
+            assert not waiter.result().granted
+            cancel = service_clients[1].call_async(
+                CancelResourceWait.Request(
+                    robot_id="amr_02", mission_id="waiter", resource_id="central_aisle"
+                )
+            )
+            wait(cancel.done)
+            assert cancel.result().cancelled
+            release = service_clients[2].call_async(
+                ReleaseResource.Request(
+                    robot_id="amr_01",
+                    mission_id="owner",
+                    resource_id="central_aisle",
+                    lease_id=owner.result().lease_id,
+                )
+            )
+            wait(release.done)
+            assert release.result().released
+            for service_client in service_clients:
+                peer.destroy_client(service_client)
+            return
         if scenario == "mqtt":
             from mqtt_gateway.node import MqttGatewayNode
             import json

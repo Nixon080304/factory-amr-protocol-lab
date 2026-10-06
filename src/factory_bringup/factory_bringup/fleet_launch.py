@@ -62,6 +62,41 @@ def robot_launch_specs(config: FleetConfig) -> tuple[RobotLaunchSpec, ...]:
     return tuple(robot_launch_spec(robot) for robot in config.robots)
 
 
+def coordinator_parameters(config: FleetConfig, robot: RobotConfig) -> dict:
+    """Carry validated fleet routes across the Python/C++ parameter boundary."""
+    result = {
+        "robot_id": robot.robot_id,
+        "frame_prefix": robot.frame_prefix,
+        "resource_leases_enabled": True,
+        "route_names": list(config.routes),
+    }
+    traffic = {r.resource_id for r in config.resources if r.kind == "traffic_zone"}
+    for name, resources in config.routes.items():
+        segments = config.route_segments.get(name, ())
+        if tuple(s.resource_id for s in segments) != tuple(
+            r for r in resources if r in traffic
+        ):
+            raise ValueError(
+                f"route_segments.{name}: missing traffic staging/exit geometry"
+            )
+        # Humble launch cannot evaluate an empty array. The declared C++ default
+        # is an empty string array for routes without a traffic segment.
+        if segments:
+            result[f"routes.{name}.resources"] = [s.resource_id for s in segments]
+        for segment in segments:
+            result[f"routes.{name}.{segment.resource_id}.bounds"] = list(
+                config.traffic_bounds[segment.resource_id]
+            )
+            for key in ("staging_pose", "exit_pose"):
+                pose = getattr(segment, key)
+                result[f"routes.{name}.{segment.resource_id}.{key}"] = [
+                    pose.x,
+                    pose.y,
+                    pose.yaw,
+                ]
+    return result
+
+
 def robot_launch_spec(robot: RobotConfig) -> RobotLaunchSpec:
     return RobotLaunchSpec(
         robot.robot_id,
@@ -234,6 +269,18 @@ def fleet_launch_actions(
                     or str(bringup / "config/nav2_params.yaml"),
                     "rviz": rviz,
                 }.items(),
+            )
+        )
+        robot = next(
+            robot for robot in config.robots if robot.robot_id == spec.robot_id
+        )
+        actions.append(
+            Node(
+                package="mission_coordinator",
+                executable="mission_coordinator",
+                namespace=spec.namespace,
+                output="screen",
+                parameters=[coordinator_parameters(config, robot)],
             )
         )
     return actions

@@ -108,6 +108,72 @@ def test_committed_fleet_file_loads():
     }
 
 
+def test_route_geometry_reaches_coordinator_without_changing_resource_order(
+    tmp_path, data
+):
+    # Dropping or swapping staging/exit coordinates would authorize entry at the wrong boundary.
+    data["route_segments"] = {
+        "assembly_to_inspection": [
+            {
+                "resource_id": "central_aisle",
+                "staging_pose": [-1.5, 0.8, 0],
+                "exit_pose": [1.5, 0.8, 0],
+            }
+        ]
+    }
+    data["traffic_bounds"] = {"central_aisle": [-0.8, 0.3, 0.8, 1.3]}
+    config = load_data(tmp_path, data)
+    assert config.routes["assembly_to_inspection"] == (
+        "assembly",
+        "central_aisle",
+        "inspection",
+    )
+    segment = config.route_segments["assembly_to_inspection"][0]
+    assert (segment.resource_id, segment.staging_pose.x, segment.exit_pose.x) == (
+        "central_aisle",
+        -1.5,
+        1.5,
+    )
+    assert config.traffic_bounds["central_aisle"] == (-0.8, 0.3, 0.8, 1.3)
+
+
+def test_route_exit_inside_zone_cannot_authorize_release(tmp_path, data):
+    data["traffic_bounds"] = {"central_aisle": [-0.8, 0.3, 0.8, 1.3]}
+    data["route_segments"] = {
+        "assembly_to_inspection": [
+            {
+                "resource_id": "central_aisle",
+                "staging_pose": [-1.5, 0.8, 0],
+                "exit_pose": [0.5, 0.8, 0],
+            }
+        ]
+    }
+    with pytest.raises(ValueError, match="outside traffic bounds"):
+        load_data(tmp_path, data)
+
+
+@pytest.mark.parametrize(
+    "change", ["unknown_route", "wrong_resource", "missing_exit", "nan_pose"]
+)
+def test_route_geometry_rejects_unusable_boundaries(tmp_path, data, change):
+    segment = {
+        "resource_id": "central_aisle",
+        "staging_pose": [-1.5, 0.8, 0],
+        "exit_pose": [1.5, 0.8, 0],
+    }
+    data["route_segments"] = {"assembly_to_inspection": [segment]}
+    if change == "unknown_route":
+        data["route_segments"] = {"missing": [segment]}
+    elif change == "wrong_resource":
+        segment["resource_id"] = "assembly"
+    elif change == "missing_exit":
+        del segment["exit_pose"]
+    else:
+        segment["exit_pose"][0] = float("nan")
+    with pytest.raises(ValueError, match="route_segments"):
+        load_data(tmp_path, data)
+
+
 @pytest.mark.parametrize("field", ["robot_id", "namespace", "frame_prefix", "spawn"])
 def test_duplicate_robot_identity_or_spawn_is_rejected(tmp_path, data, field):
     data["robots"][1][field] = deepcopy(data["robots"][0][field])

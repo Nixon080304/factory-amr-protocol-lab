@@ -16,6 +16,9 @@
 #include "mission_coordinator/navigation_adapter.hpp"
 #include "mission_coordinator/mission_state_machine.hpp"
 #include "mission_coordinator/robot_context.hpp"
+#include "mission_coordinator/resource_adapter.hpp"
+#include "mission_coordinator/traffic_boundary.hpp"
+#include "mission_coordinator/mission_resource_gate.hpp"
 
 namespace mission_coordinator {
 class MissionCoordinatorNode : public rclcpp::Node {
@@ -34,6 +37,10 @@ private:
   using Handle = rclcpp_action::ServerGoalHandle<Mission>;
   void transition(const TransitionResult &result);
   void navigate();
+  void navigate_target(const std::vector<double> &coordinates);
+  void navigation_arrived();
+  void wait_for_resource(const std::string &resource, std::function<void()> effect);
+  void transfer_effect();
   void verify_station();
   void detection(const factory_interfaces::msg::StationDetection &message);
   void queue_detection(const factory_interfaces::msg::StationDetection &message);
@@ -53,6 +60,20 @@ private:
   MissionStateMachine machine_;
   const RobotContext robot_;
   NavigationAdapter navigation_;
+  ResourceAdapter resources_;
+  MissionResourceGate resource_gate_;
+  struct RouteSegment {
+    std::string resource;
+    std::vector<double> staging, exit;
+    TrafficBoundary boundary;
+  };
+  std::map<std::string, std::vector<RouteSegment>> routes_;
+  std::vector<RouteSegment> active_route_;
+  size_t route_index_{0};
+  bool leases_enabled_{false}, waiting_resource_{false}, crossing_resource_{false};
+  bool finishing_{false};
+  std::string held_resource_;
+  std::vector<double> navigation_target_;
   rclcpp_action::Server<Mission>::SharedPtr server_;
   std::shared_ptr<Handle> goal_;
   rclcpp::Client<Transfer>::SharedPtr transfer_client_;

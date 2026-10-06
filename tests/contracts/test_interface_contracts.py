@@ -201,6 +201,17 @@ def interface_lines(relative_path):
                 "string reason",
             ],
         ),
+        (
+            "srv/CancelResourceWait.srv",
+            [
+                "string robot_id",
+                "string mission_id",
+                "string resource_id",
+                "---",
+                "bool cancelled",
+                "string reason",
+            ],
+        ),
     ],
 )
 def test_interface_preserves_ordered_wire_fields(relative_path, expected):
@@ -218,6 +229,7 @@ def test_interface_preserves_ordered_wire_fields(relative_path, expected):
         ("srv/AcquireResource.srv", 1),
         ("srv/RenewResource.srv", 1),
         ("srv/ReleaseResource.srv", 1),
+        ("srv/CancelResourceWait.srv", 1),
     ],
 )
 def test_interface_preserves_section_boundaries(relative_path, separator_count):

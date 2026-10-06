@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# Cancel only a queued exact request. This never releases or clears an owner.
+string robot_id
+string mission_id
+string resource_id
+---
+bool cancelled
+string reason

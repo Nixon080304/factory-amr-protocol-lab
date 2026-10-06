@@ -426,11 +426,18 @@ class FleetAdapter:
             )
 
     def resource(self, operation, request):
-        if operation not in ("acquire", "renew", "release"):
+        if operation not in ("acquire", "renew", "release", "cancel_wait"):
             raise ValueError("unsupported resource operation")
         if request.robot_id not in {robot.robot_id for robot in self.config.robots}:
             raise ValueError("resource owner is not configured")
         now = self.clock()
+        identity = (request.robot_id, request.mission_id, request.resource_id)
+        if operation == "cancel_wait":
+            cancelled = self.resources.cancel_waiter(LeaseRequest(*identity), now)
+            return {
+                "cancelled": cancelled,
+                "reason": "waiter cancelled" if cancelled else "no waiter",
+            }
         if (
             operation != "release"
             and self.registry.get(request.robot_id, now).health != RobotHealth.ONLINE
@@ -443,7 +450,6 @@ class FleetAdapter:
             if operation == "acquire":
                 response.update(lease_id="", current_owner="")
             return response
-        identity = (request.robot_id, request.mission_id, request.resource_id)
         if operation == "release":
             released = self.resources.release(
                 LeaseKey(*identity, request.lease_id), now

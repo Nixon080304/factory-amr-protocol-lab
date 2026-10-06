@@ -28,8 +28,28 @@ resources:
     capacity: 1
 
 routes:
+  to_assembly: [central_aisle, assembly]
   assembly_to_inspection: [assembly, central_aisle, inspection]
   inspection_to_assembly: [inspection, central_aisle, assembly]
+
+# Every traffic leg starts and ends outside the capacity-one aisle.
+# Arrival requires both Nav2 success and current robot localization at the exit.
+traffic_bounds:
+  central_aisle: [-0.8, -2.65, 0.8, -1.75]
+
+route_segments:
+  to_assembly:
+    - resource_id: central_aisle
+      staging_pose: [0.0, -3.5, 1.5707963267948966]
+      exit_pose: [-1.5, -2.2, 3.141592653589793]
+  assembly_to_inspection:
+    - resource_id: central_aisle
+      staging_pose: [-1.5, -2.2, 0.0]
+      exit_pose: [1.5, -2.2, 0.0]
+  inspection_to_assembly:
+    - resource_id: central_aisle
+      staging_pose: [1.5, -2.2, 3.141592653589793]
+      exit_pose: [-1.5, -2.2, 3.141592653589793]
 
 docks:
   dock_01:

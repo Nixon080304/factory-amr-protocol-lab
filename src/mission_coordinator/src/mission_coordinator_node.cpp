@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "mission_coordinator/mission_coordinator_node.hpp"
+#include "mission_coordinator/resource_ros_transport.hpp"
 #include <algorithm>
 #include <cmath>
 #include <regex>
@@ -24,7 +25,14 @@ RobotContext local_robot(rclcpp::Node *node) {
 } // namespace
 MissionCoordinatorNode::MissionCoordinatorNode(const rclcpp::NodeOptions &options)
     : Node("mission_coordinator", options), robot_(local_robot(this)),
-      navigation_(this) {
+      navigation_(this),
+      resources_(make_resource_transport(this), robot_.robot_id,
+                 [] {
+                   return std::chrono::duration<double>(
+                              std::chrono::steady_clock::now().time_since_epoch())
+                       .count();
+                 }),
+      resource_gate_(resources_, machine_) {
   if (!has_parameter("use_sim_time")) {
     declare_parameter("use_sim_time", true);
   } else {
@@ -39,6 +47,36 @@ MissionCoordinatorNode::MissionCoordinatorNode(const rclcpp::NodeOptions &option
         !std::all_of(pair.second.begin(), pair.second.end(),
                      [](double v) { return std::isfinite(v); })) {
       throw std::invalid_argument("station pose requires three finite values");
+    }
+  }
+  leases_enabled_ =
+      declare_parameter("resource_leases_enabled", std::string(get_namespace()) != "/");
+  const auto route_names = declare_parameter<std::vector<std::string>>(
+      "route_names", {"to_assembly", "assembly_to_inspection"});
+  for (const auto &name : route_names) {
+    auto ids = declare_parameter<std::vector<std::string>>(
+        "routes." + name + ".resources", std::vector<std::string>{});
+    auto &route = routes_[name];
+    for (const auto &id : ids) {
+      auto staging = declare_parameter<std::vector<double>>(
+          "routes." + name + "." + id + ".staging_pose", std::vector<double>{});
+      auto exit = declare_parameter<std::vector<double>>(
+          "routes." + name + "." + id + ".exit_pose", std::vector<double>{});
+      TrafficBoundary boundary(declare_parameter<std::vector<double>>(
+          "routes." + name + "." + id + ".bounds", std::vector<double>{}));
+      for (const auto &pose : {staging, exit}) {
+        if (pose.size() != 3 || !std::all_of(pose.begin(), pose.end(),
+                                             [](double v) { return std::isfinite(v); }))
+          throw std::invalid_argument(
+              "route staging and exit require three finite values");
+      }
+      if (id.empty() || std::hypot(staging[0] - exit[0], staging[1] - exit[1]) < 0.5)
+        throw std::invalid_argument("traffic route requires distinct staging and exit");
+      if (!boundary.outside(staging[0], staging[1], 0.60) ||
+          !boundary.outside(exit[0], exit[1], 0.60))
+        throw std::invalid_argument(
+            "traffic staging and exit must clear the zone footprint");
+      route.push_back({id, staging, exit, boundary});
     }
   }
   timeout_ = declare_parameter("perception_timeout_sec", 10.0);
@@ -114,6 +152,11 @@ MissionCoordinatorNode::MissionCoordinatorNode(const rclcpp::NodeOptions &option
           return rclcpp_action::CancelResponse::REJECT;
         }
         auto result = machine_.cancel();
+        if (waiting_resource_) {
+          resource_gate_.cancel();
+          waiting_resource_ = false;
+          deferred_error_ = "MISSION_CANCELED";
+        }
         if (result.state == MissionState::Failed) {
           navigation_.cancel();
           deferred_error_ = "MISSION_CANCELED";
@@ -137,6 +180,10 @@ MissionCoordinatorNode::MissionCoordinatorNode(const rclcpp::NodeOptions &option
           return;
         }
         goal_ = handle;
+        finishing_ = waiting_resource_ = crossing_resource_ = false;
+        held_resource_.clear();
+        active_route_.clear();
+        route_index_ = 0;
         ++mission_generation_;
         pose_valid_ = false;
         auto request = handle->get_goal();
@@ -203,6 +250,34 @@ void MissionCoordinatorNode::transition(const TransitionResult &result) {
   event("state_changed", "", state_name());
 }
 void MissionCoordinatorNode::navigate() {
+  if (leases_enabled_) {
+    const auto route_name =
+        machine_.state() == MissionState::NavigatingToPickup
+            ? "to_" + machine_.current_station()
+            : machine_.mission().pickup_station + "_to_" + machine_.current_station();
+    if (active_route_.empty() && route_index_ == 0) {
+      auto route = routes_.find(route_name);
+      if (route == routes_.end()) {
+        finish("RESOURCE_ROUTE_MISSING");
+        return;
+      }
+      active_route_ = route->second;
+    }
+    if (route_index_ < active_route_.size()) {
+      const auto &segment = active_route_[route_index_];
+      navigate_target(crossing_resource_ ? segment.exit : segment.staging);
+      return;
+    }
+  }
+  navigate_target(poses_.at(machine_.current_station()));
+}
+void MissionCoordinatorNode::navigate_target(const std::vector<double> &coordinates) {
+  if (!held_resource_.empty() &&
+      !resources_.authorized(held_resource_, machine_.mission().mission_id)) {
+    finish("RESOURCE_LEASE_LOST");
+    return;
+  }
+  navigation_target_ = coordinates;
   navigation_completed_ = false;
   pose_valid_ = false;
   stamps_.clear();
@@ -212,7 +287,6 @@ void MissionCoordinatorNode::navigate() {
   phase_started_ = now().seconds();
   event(active_phase_ + "_started");
   localization_started_ = phase_started_;
-  auto coordinates = poses_.at(machine_.current_station());
   geometry_msgs::msg::PoseStamped pose;
   pose.header.frame_id = robot_.local_frame(RobotContext::map_frame);
   pose.header.stamp = now();
@@ -237,7 +311,7 @@ void MissionCoordinatorNode::navigate() {
       navigation_completed_ = true;
       phase_started_ = now().seconds();
       if (localized()) {
-        verify_station();
+        navigation_arrived();
       }
     } else {
       auto result = machine_.navigation_failed();
@@ -277,6 +351,71 @@ void MissionCoordinatorNode::navigate() {
   } else {
     navigation_.navigate(pose, done);
   }
+}
+void MissionCoordinatorNode::wait_for_resource(const std::string &resource,
+                                               std::function<void()> effect) {
+  waiting_resource_ = true;
+  const auto generation = mission_generation_;
+  resource_gate_.acquire(resource, std::move(effect),
+                         [this, generation, resource](const ResourceNotice &notice) {
+                           if (!goal_ || generation != mission_generation_ ||
+                               finishing_)
+                             return;
+                           event("resource_lease", "", notice.reason);
+                           if (notice.state == ResourceState::Waiting) {
+                             auto feedback = std::make_shared<Mission::Feedback>();
+                             feedback->state = "WAITING_FOR_RESOURCE";
+                             feedback->station = machine_.current_station();
+                             feedback->detail = resource + ": " + notice.reason;
+                             goal_->publish_feedback(feedback);
+                             std_msgs::msg::String state;
+                             state.data = feedback->state;
+                             states_->publish(state);
+                           } else if (notice.state == ResourceState::Granted) {
+                             waiting_resource_ = false;
+                             held_resource_ = resource;
+                           } else if (notice.state == ResourceState::Lost) {
+                             navigation_.cancel();
+                             restart_required_ = true;
+                             finish("RESOURCE_LEASE_LOST");
+                           }
+                         });
+}
+void MissionCoordinatorNode::navigation_arrived() {
+  if (leases_enabled_ && route_index_ < active_route_.size()) {
+    navigation_completed_ = false;
+    auto segment = active_route_[route_index_];
+    if (!segment.boundary.outside(pose_.position.x, pose_.position.y, 0.35)) {
+      finish("RESOURCE_EXIT_UNCONFIRMED");
+      return;
+    }
+    if (!crossing_resource_) {
+      wait_for_resource(segment.resource, [this] {
+        crossing_resource_ = true;
+        navigate();
+      });
+    } else {
+      const auto generation = mission_generation_;
+      resources_.exited(segment.resource, machine_.mission().mission_id);
+      waiting_resource_ = true;
+      resources_.release(segment.resource, machine_.mission().mission_id,
+                         [this, generation](bool cleared) {
+                           if (!goal_ || generation != mission_generation_ ||
+                               finishing_)
+                             return;
+                           if (!cleared) {
+                             restart_required_ = true;
+                             finish("RESOURCE_RELEASE_FAILED");
+                             return;
+                           }
+                           held_resource_.clear();
+                           waiting_resource_ = crossing_resource_ = false;
+                           ++route_index_;
+                           navigate();
+                         });
+    }
+  } else
+    verify_station();
 }
 void MissionCoordinatorNode::fault_event(
     const std::string &name, const factory_interfaces::msg::FaultCommand &control) {
@@ -382,7 +521,9 @@ bool MissionCoordinatorNode::localized() const {
       pose_stamp_ < localization_started_) {
     return false;
   }
-  auto target = poses_.at(machine_.current_station());
+  const auto &target = navigation_target_;
+  if (target.size() != 3)
+    return false;
   double yaw = std::atan2(2 * (pose_.orientation.w * pose_.orientation.z +
                                pose_.orientation.x * pose_.orientation.y),
                           1 - 2 * (pose_.orientation.y * pose_.orientation.y +
@@ -490,6 +631,17 @@ void MissionCoordinatorNode::dispatch_transfer(
   transfer_client_->async_send_request(request, std::move(callback));
 }
 void MissionCoordinatorNode::transfer() {
+  if (leases_enabled_) {
+    wait_for_resource(machine_.current_station(), [this] { transfer_effect(); });
+  } else
+    transfer_effect();
+}
+void MissionCoordinatorNode::transfer_effect() {
+  if (leases_enabled_ && !resources_.authorized(machine_.current_station(),
+                                                machine_.mission().mission_id)) {
+    finish("RESOURCE_LEASE_LOST");
+    return;
+  }
   if (!transfer_client_->service_is_ready()) {
     transition(machine_.transfer_failed("PLC_TIMEOUT"));
     finish("PLC_TIMEOUT");
@@ -542,13 +694,44 @@ void MissionCoordinatorNode::transfer() {
         }
         result = machine_.transfer_failed("PLC_TIMEOUT");
       }
-      transition(result);
-      if (result.state == MissionState::Completed ||
-          result.state == MissionState::Failed) {
-        finish(result.error_code);
-      } else {
-        navigate();
-      }
+      auto continue_mission = [this, generation, result](bool cleared) {
+        if (!goal_ || generation != mission_generation_ || finishing_)
+          return;
+        if (!cleared) {
+          restart_required_ = true;
+          finish("RESOURCE_RELEASE_FAILED");
+          return;
+        }
+        held_resource_.clear();
+        waiting_resource_ = false;
+        transition(result);
+        if (result.state == MissionState::Completed ||
+            result.state == MissionState::Failed)
+          finish(result.error_code);
+        else {
+          active_route_.clear();
+          route_index_ = 0;
+          navigate();
+        }
+      };
+      if (leases_enabled_) {
+        // Only confirmed success proves the station transaction completed safely.
+        bool confirmed = false;
+        try {
+          confirmed = future.get()->accepted;
+        } catch (const std::exception &) {
+        }
+        if (!confirmed) {
+          restart_required_ = true;
+          finish(result.error_code);
+          return;
+        }
+        waiting_resource_ = true;
+        resources_.exited(held_resource_, machine_.mission().mission_id);
+        resources_.release(held_resource_, machine_.mission().mission_id,
+                           continue_mission);
+      } else
+        continue_mission(true);
     });
   } catch (const std::exception &error) {
     RCLCPP_ERROR(get_logger(), "Mission %s: transfer dispatch failed: %s",
@@ -562,6 +745,7 @@ void MissionCoordinatorNode::transfer() {
   }
 }
 void MissionCoordinatorNode::tick() {
+  resources_.tick();
   if (!goal_) {
     return;
   }
@@ -573,10 +757,12 @@ void MissionCoordinatorNode::tick() {
     return;
   }
   consume_detections();
+  if (waiting_resource_ || finishing_)
+    return;
   const double elapsed = now().seconds() - phase_started_;
   if (navigation_completed_) {
     if (localized()) {
-      verify_station();
+      navigation_arrived();
     } else if (elapsed >= timeout_ || elapsed < 0) {
       finish("STATION_NOT_CONFIRMED");
     }
@@ -599,6 +785,13 @@ void MissionCoordinatorNode::finish(const std::string &error) {
   if (!goal_) {
     return;
   }
+  finishing_ = true;
+  const bool safe_cleanup = resource_gate_.cancel();
+  const bool recovery =
+      leases_enabled_ && (!safe_cleanup || error == "RESOURCE_LEASE_LOST" ||
+                          error == "RESOURCE_RELEASE_FAILED");
+  if (recovery)
+    restart_required_ = true;
   if (!error.empty() && machine_.state() != MissionState::Failed) {
     auto result = (machine_.state() == MissionState::Loading ||
                    machine_.state() == MissionState::Unloading)
@@ -614,7 +807,9 @@ void MissionCoordinatorNode::finish(const std::string &error) {
   navigation_.cancel();
   auto result = std::make_shared<Mission::Result>();
   result->success = error.empty();
-  result->final_state = error.empty() ? "COMPLETED" : "FAILED";
+  result->final_state = recovery        ? "RECOVERY_REQUIRED"
+                        : error.empty() ? "COMPLETED"
+                                        : "FAILED";
   result->error_code = error;
   result->message = error.empty() ? "Mission completed" : error;
   event("mission_finished", result->final_state, error);
@@ -629,6 +824,10 @@ void MissionCoordinatorNode::finish(const std::string &error) {
   reserved_ = false;
   pose_valid_ = false;
   navigation_completed_ = false;
+  waiting_resource_ = crossing_resource_ = finishing_ = false;
+  active_route_.clear();
+  route_index_ = 0;
+  held_resource_.clear();
   stamps_.clear();
   pending_detections_.clear();
   last_stamp_ = received_stamp_ = -1;

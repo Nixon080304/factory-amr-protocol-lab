@@ -12,6 +12,9 @@
 #include <nav2_msgs/srv/clear_entire_costmap.hpp>
 #include <factory_interfaces/action/execute_factory_mission.hpp>
 #include <factory_interfaces/srv/transfer_part.hpp>
+#include <factory_interfaces/srv/acquire_resource.hpp>
+#include <factory_interfaces/srv/renew_resource.hpp>
+#include <factory_interfaces/srv/release_resource.hpp>
 #include <factory_interfaces/msg/station_detection.hpp>
 #include <factory_interfaces/msg/protocol_event.hpp>
 #include <std_msgs/msg/string.hpp>
@@ -49,6 +52,8 @@ protected:
 class CoordinatorTest : public testing::Test {
 protected:
   virtual std::string robot_id() const { return "amr_01"; }
+  virtual bool leases_enabled() const { return false; }
+  virtual std::vector<std::string> pickup_resources() const { return {}; }
   static void SetUpTestSuite() { rclcpp::init(0, nullptr); }
   static void TearDownTestSuite() { rclcpp::shutdown(); }
   void SetUp() override {
@@ -61,6 +66,14 @@ protected:
             .parameter_overrides({{"use_sim_time", true},
                                   {"robot_id", robot_id()},
                                   {"frame_prefix", robot_id() + "/"},
+                                  {"resource_leases_enabled", leases_enabled()},
+                                  {"routes.to_assembly.resources", pickup_resources()},
+                                  {"routes.to_assembly.central_aisle.staging_pose",
+                                   std::vector<double>{-1.5, -2.2, 0}},
+                                  {"routes.to_assembly.central_aisle.exit_pose",
+                                   std::vector<double>{1.5, -2.2, 0}},
+                                  {"routes.to_assembly.central_aisle.bounds",
+                                   std::vector<double>{-0.8, -2.65, 0.8, -1.75}},
                                   {"perception_timeout_sec", 2.0}}));
     peer = std::make_shared<rclcpp::Node>("mission_test_peers", "/" + robot_id());
     clock_pub = peer->create_publisher<rosgraph_msgs::msg::Clock>("/clock", 10);
@@ -284,6 +297,176 @@ protected:
   double repeated_stamp = 0;
   std::string camera_frame;
 };
+
+class LeasedCoordinatorTest : public CoordinatorTest {
+protected:
+  bool leases_enabled() const override { return true; }
+  void create_resources() {
+    acquire_service = peer->create_service<factory_interfaces::srv::AcquireResource>(
+        "/factory/resources/acquire",
+        [this](
+            std::shared_ptr<factory_interfaces::srv::AcquireResource::Request> request,
+            std::shared_ptr<factory_interfaces::srv::AcquireResource::Response>
+                response) {
+          acquired.push_back(request->resource_id);
+          auto owner = owners.find(request->resource_id);
+          response->granted = allow_station && (owner == owners.end() ||
+                                                owner->second == request->robot_id);
+          response->lease_id = response->granted ? "central-random-token" : "";
+          response->lease_ttl_sec = response->granted ? 10 : 0;
+          response->reason = response->granted ? "granted" : "owned by other robot";
+          if (response->granted)
+            owners[request->resource_id] = request->robot_id;
+        });
+    renew_service = peer->create_service<factory_interfaces::srv::RenewResource>(
+        "/factory/resources/renew",
+        [](std::shared_ptr<factory_interfaces::srv::RenewResource::Request>,
+           std::shared_ptr<factory_interfaces::srv::RenewResource::Response> response) {
+          response->renewed = true;
+          response->lease_ttl_sec = 10;
+        });
+    release_service = peer->create_service<factory_interfaces::srv::ReleaseResource>(
+        "/factory/resources/release",
+        [this](
+            std::shared_ptr<factory_interfaces::srv::ReleaseResource::Request> request,
+            std::shared_ptr<factory_interfaces::srv::ReleaseResource::Response>
+                response) {
+          released.push_back(*request);
+          response->released = request->lease_id == "central-random-token" &&
+                               owners[request->resource_id] == request->robot_id;
+          if (response->released)
+            owners.erase(request->resource_id);
+        });
+    pump(30);
+  }
+  bool allow_station{false};
+  std::map<std::string, std::string> owners;
+  std::vector<std::string> acquired;
+  std::vector<factory_interfaces::srv::ReleaseResource::Request> released;
+  rclcpp::Service<factory_interfaces::srv::AcquireResource>::SharedPtr acquire_service;
+  rclcpp::Service<factory_interfaces::srv::RenewResource>::SharedPtr renew_service;
+  rclcpp::Service<factory_interfaces::srv::ReleaseResource>::SharedPtr release_service;
+};
+class TrafficCoordinatorTest : public LeasedCoordinatorTest {
+protected:
+  std::vector<std::string> pickup_resources() const override {
+    return {"central_aisle"};
+  }
+};
+TEST_F(TrafficCoordinatorTest, TwoRobotContextsWaitUntilOwnerVerifiesExitAndRelease) {
+  create_resources();
+  allow_station = true;
+  hold_navigation = true;
+  auto first = send("first");
+  for (int i = 0; i < 100 && nav_handles.empty(); ++i)
+    pump(1, false);
+  ASSERT_EQ(nav_handles.size(), 1u); // Safe staging goal.
+  nav_handles[0]->succeed(std::make_shared<Nav::Result>());
+  for (int i = 0; i < 100 && nav_handles.size() < 2; ++i)
+    pump(1, false);
+  ASSERT_EQ(nav_handles.size(), 2u); // Owner alone enters the aisle.
+  ASSERT_EQ(owners["central_aisle"], "amr_01");
+  auto second_node = std::make_shared<mission_coordinator::MissionCoordinatorNode>(
+      rclcpp::NodeOptions()
+          .arguments({"--ros-args", "-r", "__ns:=/amr_02"})
+          .parameter_overrides({{"robot_id", "amr_02"},
+                                {"frame_prefix", "amr_02/"},
+                                {"resource_leases_enabled", true},
+                                {"routes.to_assembly.resources",
+                                 std::vector<std::string>{"central_aisle"}},
+                                {"routes.to_assembly.central_aisle.staging_pose",
+                                 std::vector<double>{-1.5, -2.2, 0}},
+                                {"routes.to_assembly.central_aisle.exit_pose",
+                                 std::vector<double>{1.5, -2.2, 0}},
+                                {"routes.to_assembly.central_aisle.bounds",
+                                 std::vector<double>{-0.8, -2.65, 0.8, -1.75}}}));
+  auto second_pose =
+      peer->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
+          "/amr_02/amcl_pose", rclcpp::SensorDataQoS());
+  std::vector<std::shared_ptr<rclcpp_action::ServerGoalHandle<Nav>>> second_goals;
+  geometry_msgs::msg::PoseStamped second_target;
+  auto second_nav = rclcpp_action::create_server<Nav>(
+      peer, "/amr_02/navigate_to_pose",
+      [](auto, auto) { return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE; },
+      [](auto) { return rclcpp_action::CancelResponse::ACCEPT; },
+      [&](auto handle) {
+        second_goals.push_back(handle);
+        second_target = handle->get_goal()->pose;
+        if (second_goals.size() == 1)
+          handle->succeed(std::make_shared<Nav::Result>());
+      });
+  auto second_client =
+      rclcpp_action::create_client<Mission>(peer, "/amr_02/factory/execute_mission");
+  executor.add_node(second_node);
+  ASSERT_TRUE(second_client->wait_for_action_server(2s));
+  Mission::Goal request;
+  request.mission_id = "second";
+  request.robot_id = "amr_02";
+  request.pickup_station = "assembly";
+  request.dropoff_station = "inspection";
+  request.part = "motor";
+  auto second = second_client->async_send_goal(request);
+  auto pump_both = [&](int count, bool first_localized) {
+    for (int i = 0; i < count; ++i) {
+      geometry_msgs::msg::PoseWithCovarianceStamped pose;
+      pose.header.stamp = rclcpp::Time(static_cast<int64_t>((sim_time + 0.05) * 1e9));
+      pose.header.frame_id = "amr_02/map";
+      pose.pose.pose = second_target.pose;
+      second_pose->publish(pose);
+      pump(1, false, first_localized);
+    }
+  };
+  pump_both(100, false);
+  ASSERT_EQ(second.wait_for(0s), std::future_status::ready);
+  ASSERT_NE(second.get(), nullptr);
+  EXPECT_EQ(second_goals.size(), 1u);
+  EXPECT_EQ(owners["central_aisle"], "amr_01");
+  nav_handles[1]->succeed(std::make_shared<Nav::Result>());
+  for (int i = 0; i < 200 && second_goals.size() < 2; ++i)
+    pump_both(1, true);
+  EXPECT_EQ(second_goals.size(), 2u);
+  EXPECT_EQ(owners["central_aisle"], "amr_02");
+  ASSERT_FALSE(released.empty());
+  EXPECT_EQ(released[0].resource_id, "central_aisle");
+  EXPECT_EQ(released[0].mission_id, "first");
+  client->async_cancel_goal(first);
+  pump_both(10, true);
+  executor.remove_node(second_node);
+}
+TEST_F(LeasedCoordinatorTest, StationWaitNeverDispatchesTransferUntilGrant) {
+  create_resources();
+  auto handle = send();
+  pump(100);
+  EXPECT_TRUE(transfers.empty());
+  ASSERT_FALSE(acquired.empty());
+  EXPECT_EQ(acquired.front(), "assembly");
+  EXPECT_NE(std::find(feedback.begin(), feedback.end(), "WAITING_FOR_RESOURCE"),
+            feedback.end());
+  allow_station = true;
+  EXPECT_TRUE(finish(handle).result->success);
+  ASSERT_EQ(released.size(), 2u);
+  EXPECT_EQ(released[0].robot_id, "amr_01");
+  EXPECT_EQ(released[0].mission_id, "test");
+  EXPECT_EQ(released[0].lease_id, "central-random-token");
+}
+TEST_F(LeasedCoordinatorTest, CanceledUnconfirmedTransferRetainsStationLease) {
+  create_resources();
+  allow_station = true;
+  hold_transfer_station = "assembly";
+  auto handle = send();
+  for (int i = 0; i < 100 && !pending_transfer; ++i)
+    pump();
+  ASSERT_NE(pending_transfer, nullptr);
+  client->async_cancel_goal(handle);
+  pump(20);
+  EXPECT_TRUE(released.empty());
+  factory_interfaces::srv::TransferPart::Response response;
+  response.accepted = true;
+  transfer->send_response(*pending_transfer, response);
+  EXPECT_EQ(finish(handle).result->error_code, "MISSION_CANCELED");
+  ASSERT_EQ(released.size(), 1u);
+  EXPECT_EQ(released[0].resource_id, "assembly");
+}
 
 TEST_F(CoordinatorTest, ValidMissionCompletesWithOrderedFeedbackAndPhases) {
   auto handle = send();

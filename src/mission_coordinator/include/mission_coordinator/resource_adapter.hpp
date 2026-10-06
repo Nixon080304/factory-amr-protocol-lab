@@ -1,0 +1,58 @@
+// SPDX-License-Identifier: Apache-2.0
+#pragma once
+#include <functional>
+#include <memory>
+#include <string>
+
+namespace mission_coordinator {
+enum class ResourceOperation { Acquire, Renew, Release, CancelWait };
+struct LeaseIdentity {
+  std::string robot_id, mission_id, resource_id, lease_id;
+};
+struct ResourceReply {
+  bool ok{false};
+  std::string lease_id;
+  double ttl{0};
+  std::string reason;
+};
+class ResourceTransport {
+public:
+  using Reply = std::function<void(ResourceReply)>;
+  using Cancel = std::function<void()>;
+  virtual ~ResourceTransport() = default;
+  virtual bool available(ResourceOperation operation) const = 0;
+  virtual Cancel send(ResourceOperation operation, const LeaseIdentity &key,
+                      Reply callback) = 0;
+};
+enum class ResourceState { Waiting, Granted, Lost, Released, Cancelled };
+struct ResourceNotice {
+  ResourceState state;
+  LeaseIdentity lease;
+  double expires_at;
+  std::string reason;
+};
+// Serialized by the caller's executor. Steady process time is independent of ROS time.
+// No method waits for service discovery or a response. The transport is async only.
+class ResourceAdapter {
+public:
+  using Notice = std::function<void(const ResourceNotice &)>;
+  ResourceAdapter(std::shared_ptr<ResourceTransport> transport, std::string robot_id,
+                  std::function<double()> clock);
+  void acquire(const std::string &resource, const std::string &mission,
+               Notice callback);
+  void tick();
+  bool authorized(const std::string &resource, const std::string &mission) const;
+  bool enter(const std::string &resource, const std::string &mission);
+  // Called only after physical exit or a confirmed station transaction.
+  void exited(const std::string &resource, const std::string &mission);
+  void release(const std::string &resource, const std::string &mission,
+               std::function<void(bool)> callback);
+  // Cancels pending acquisitions and requests cleanup only for proven-safe leases.
+  // False means physical/lease uncertainty remains and requires reconciliation.
+  bool release_all(const std::string &mission);
+
+private:
+  struct State;
+  std::shared_ptr<State> state_;
+};
+} // namespace mission_coordinator

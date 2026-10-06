@@ -24,6 +24,56 @@ def production():
     return importlib.import_module("factory_bringup.fleet_launch")
 
 
+def test_coordinator_parameters_carry_validated_routes_for_every_robot():
+    # A missing route or copied identity would leave the coordinator ungated.
+    module = production()
+    config = fleet(10)
+    for robot in config.robots:
+        params = module.coordinator_parameters(config, robot)
+        assert params["robot_id"] == robot.robot_id
+        assert params["frame_prefix"] == robot.frame_prefix
+        assert params["resource_leases_enabled"] is True
+        assert tuple(params["routes.to_assembly.resources"]) == ("central_aisle",)
+        assert params["routes.to_assembly.central_aisle.staging_pose"] == [
+            0.0,
+            -3.5,
+            1.5707963267948966,
+        ]
+        assert tuple(params["routes.assembly_to_inspection.resources"]) == (
+            "central_aisle",
+        )
+        assert params["routes.assembly_to_inspection.central_aisle.staging_pose"] == [
+            -1.5,
+            -2.2,
+            0.0,
+        ]
+        assert params["routes.assembly_to_inspection.central_aisle.exit_pose"] == [
+            1.5,
+            -2.2,
+            0.0,
+        ]
+
+
+def test_fleet_launch_passes_route_geometry_to_each_real_coordinator():
+    actions = production().fleet_launch_actions(fleet(2), gui="false", rviz="false")
+    coordinators = [
+        action
+        for action in actions
+        if isinstance(action, Node) and action.node_package == "mission_coordinator"
+    ]
+    assert len(coordinators) == 2
+    context = LaunchContext()
+    for robot, node in zip(fleet(2).robots, coordinators):
+        node._perform_substitutions(context)
+        assert node.expanded_node_namespace == robot.namespace
+        params = evaluate_parameters(context, node._Node__parameters)[0]
+        assert params["robot_id"] == robot.robot_id
+        assert params["resource_leases_enabled"] is True
+        assert tuple(params["routes.assembly_to_inspection.resources"]) == (
+            "central_aisle",
+        )
+
+
 def fleet(size):
     config = load_fleet_config(PACKAGE / "config/fleet.yaml")
     if size == 2:

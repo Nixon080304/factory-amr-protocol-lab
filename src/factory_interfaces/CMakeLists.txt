@@ -23,6 +23,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/AcquireResource.srv"
   "srv/RenewResource.srv"
   "srv/ReleaseResource.srv"
+  "srv/CancelResourceWait.srv"
   "srv/SetFault.srv"
   "msg/FaultCommand.msg"
   DEPENDENCIES builtin_interfaces std_msgs geometry_msgs

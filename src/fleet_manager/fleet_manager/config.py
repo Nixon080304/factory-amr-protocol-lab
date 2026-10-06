@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Load the fleet scaling boundary into immutable, validated models."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 from pathlib import Path
 import re
@@ -49,12 +49,25 @@ class EnergyPolicyConfig:
 
 
 @dataclass(frozen=True)
+class RouteSegment:
+    resource_id: str
+    staging_pose: Pose2D
+    exit_pose: Pose2D
+
+
+@dataclass(frozen=True)
 class FleetConfig:
     robots: tuple[RobotConfig, ...]
     resources: tuple[ResourceConfig, ...]
     routes: Mapping[str, tuple[str, ...]]
     docks: Mapping[str, DockConfig]
     energy: EnergyPolicyConfig
+    route_segments: Mapping[str, tuple[RouteSegment, ...]] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+    traffic_bounds: Mapping[str, tuple[float, float, float, float]] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
 
 
 class _FleetLoader(yaml.SafeLoader):
@@ -149,6 +162,14 @@ def _unique(value, seen, path):
 
 
 def _parse_config(data):
+    data = _mapping(data, "fleet")
+    geometry = data.get("route_segments", {})
+    zone_geometry = data.get("traffic_bounds", {})
+    data = {
+        key: value
+        for key, value in data.items()
+        if key not in ("route_segments", "traffic_bounds")
+    }
     data = _mapping(data, "fleet", ("robots", "resources", "routes", "docks", "energy"))
     robots = []
     seen = {
@@ -177,13 +198,13 @@ def _parse_config(data):
                 f"{path}.frame_prefix: expected a relative frame prefix ending in /"
             )
         spawn = _pose(value["spawn"], f"{path}.spawn")
-        for field, identity in (
+        for identity_field, identity in (
             ("robot_id", robot_id),
             ("namespace", namespace),
             ("frame_prefix", prefix),
             ("spawn", (spawn.x, spawn.y)),
         ):
-            _unique(identity, seen[field], f"{path}.{field}")
+            _unique(identity, seen[identity_field], f"{path}.{identity_field}")
         robots.append(
             RobotConfig(
                 robot_id,
@@ -219,6 +240,59 @@ def _parse_config(data):
             if resource not in resource_ids:
                 raise ValueError(f"{path}: unknown resource {resource!r}")
         routes[name] = tuple(route)
+
+    route_segments = {}
+    traffic = {r.resource_id for r in resources if r.kind == "traffic_zone"}
+    traffic_bounds = {}
+    for resource, values in _mapping(zone_geometry, "traffic_bounds").items():
+        path = f"traffic_bounds.{resource}"
+        if resource not in traffic:
+            raise ValueError(f"{path}: expected a configured traffic zone")
+        if not isinstance(values, list) or len(values) != 4:
+            raise ValueError(f"{path}: expected [xmin, ymin, xmax, ymax]")
+        bounds = tuple(_number(v, f"{path}[{i}]") for i, v in enumerate(values))
+        if bounds[0] >= bounds[2] or bounds[1] >= bounds[3]:
+            raise ValueError(f"{path}: bounds must have positive area")
+        traffic_bounds[resource] = bounds
+    for name, values in _mapping(geometry, "route_segments").items():
+        path = f"route_segments.{name}"
+        if name not in routes:
+            raise ValueError(f"{path}: unknown route")
+        if not isinstance(values, list):
+            raise ValueError(f"{path}: expected a list")
+        segments = []
+        for index, value in enumerate(values):
+            item_path = f"{path}[{index}]"
+            value = _mapping(
+                value, item_path, ("resource_id", "staging_pose", "exit_pose")
+            )
+            resource = _identifier(value["resource_id"], f"{item_path}.resource_id")
+            if resource not in traffic:
+                raise ValueError(f"{item_path}.resource_id: expected a traffic zone")
+            staging = _pose(value["staging_pose"], f"{item_path}.staging_pose")
+            exit_pose = _pose(value["exit_pose"], f"{item_path}.exit_pose")
+            if resource not in traffic_bounds:
+                raise ValueError(f"{item_path}: requires traffic bounds")
+            xmin, ymin, xmax, ymax = traffic_bounds[resource]
+            for pose in (staging, exit_pose):
+                # 0.35 m footprint radius plus 0.25 m arrival tolerance.
+                if not (
+                    pose.x + 0.60 < xmin
+                    or pose.y + 0.60 < ymin
+                    or pose.x - 0.60 > xmax
+                    or pose.y - 0.60 > ymax
+                ):
+                    raise ValueError(
+                        f"{item_path}: staging and exit must be outside traffic bounds"
+                    )
+            if math.hypot(staging.x - exit_pose.x, staging.y - exit_pose.y) < 0.5:
+                raise ValueError(f"{item_path}: staging and exit must be distinct")
+            segments.append(RouteSegment(resource, staging, exit_pose))
+        if tuple(s.resource_id for s in segments) != tuple(
+            r for r in routes[name] if r in traffic
+        ):
+            raise ValueError(f"{path}: must cover traffic zones in route order")
+        route_segments[name] = tuple(segments)
 
     docks = {}
     dock_ids = {
@@ -267,6 +341,8 @@ def _parse_config(data):
         MappingProxyType(routes),
         MappingProxyType(docks),
         energy,
+        MappingProxyType(route_segments),
+        MappingProxyType(traffic_bounds),
     )
 
 

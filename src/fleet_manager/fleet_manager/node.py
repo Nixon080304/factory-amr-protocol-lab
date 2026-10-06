@@ -9,6 +9,7 @@ from factory_interfaces.action import ExecuteFactoryMission, ExecuteFleetMission
 from factory_interfaces.msg import RobotState
 from factory_interfaces.srv import (
     AcquireResource,
+    CancelResourceWait,
     EstimateMissionCost,
     ReleaseResource,
     RenewResource,
@@ -110,6 +111,7 @@ class FleetManagerNode(Node):
                 ("acquire", AcquireResource),
                 ("renew", RenewResource),
                 ("release", ReleaseResource),
+                ("cancel_wait", CancelResourceWait),
             )
         ]
         self.server = ActionServer(
