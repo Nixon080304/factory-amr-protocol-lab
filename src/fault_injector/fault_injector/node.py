@@ -21,14 +21,18 @@ from .controller import FaultController
 from .models import FaultRequest
 
 
-def attach_controls(node, *, owner, callback_group=None, on_reset=None, on_enable=None):
-    """Keep configuration callbacks serialized with the gateway protocol boundary."""
+def attach_controls(
+    node, *, owner, callback_group=None, on_reset=None, on_enable=None, robot_id=None
+):
+    """Use the owner's callback group to serialize fault configuration callbacks."""
 
     def event(name, request):
         node.events.publish(
             ProtocolEvent(
                 stamp=node.get_clock().now().to_msg(),
                 mission_id=request.mission_id,
+                robot_id=request.robot_id
+                or (robot_id(request) if robot_id is not None else ""),
                 protocol="FAULT",
                 direction="INTERNAL",
                 event=name,
@@ -43,19 +47,26 @@ def attach_controls(node, *, owner, callback_group=None, on_reset=None, on_enabl
     )
     pending_controls = {}
 
-    def acknowledge(identifier):
+    def acknowledge(message):
         acknowledgements.publish(
-            FaultCommand(command_id=identifier, acknowledged=True, owner=owner)
+            FaultCommand(
+                command_id=message.command_id,
+                acknowledged=True,
+                owner=owner,
+                mission_id=message.mission_id,
+                robot_id=message.robot_id,
+                station=message.station,
+            )
         )
 
     def ready_controls():
         now = time.monotonic()
-        for identifier, (ready, deadline) in tuple(pending_controls.items()):
+        for identifier, (ready, deadline, message) in tuple(pending_controls.items()):
             if now >= deadline:
                 del pending_controls[identifier]
             elif ready():
                 del pending_controls[identifier]
-                acknowledge(identifier)
+                acknowledge(message)
         if not pending_controls:
             readiness_timer.cancel()
 
@@ -84,6 +95,7 @@ def attach_controls(node, *, owner, callback_group=None, on_reset=None, on_enabl
                     message.duration,
                     message.one_shot,
                     message.fault_code,
+                    robot_id=message.robot_id or None,
                 )
                 controller.enable(control)
                 if on_enable is not None:
@@ -95,10 +107,14 @@ def attach_controls(node, *, owner, callback_group=None, on_reset=None, on_enabl
             timeout = message.ack_timeout_sec
             if not math.isfinite(timeout) or timeout <= 0:
                 return
-            pending_controls[message.command_id] = (ready, time.monotonic() + timeout)
+            pending_controls[message.command_id] = (
+                ready,
+                time.monotonic() + timeout,
+                message,
+            )
             readiness_timer.reset()
             return
-        acknowledge(message.command_id)
+        acknowledge(message)
 
     subscription = node.create_subscription(
         FaultCommand,
@@ -116,6 +132,11 @@ class FaultInjectorNode(Node):
         self.commands = self.create_publisher(
             FaultCommand, "/factory/faults/commands", 100
         )
+        self.robot_ids = frozenset(
+            self.declare_parameter("robot_ids", ["amr_01"]).value
+        )
+        if not self.robot_ids:
+            raise ValueError("robot_ids must not be empty")
         self.owners = self.declare_parameter(
             "fault_owners", ["mqtt_gateway", "modbus_gateway"]
         ).value
@@ -177,28 +198,48 @@ class FaultInjectorNode(Node):
             if (
                 pending is None
                 or not message.acknowledged
-                or message.owner not in pending[1]
+                or (
+                    message.owner,
+                    message.robot_id if message.owner == "mission_coordinator" else "",
+                )
+                not in pending[1]
             ):
                 return
-            future, owners, deadline = pending
+            future, owners, deadline, command = pending
+            if (
+                message.mission_id != command.mission_id
+                or message.station != command.station
+                or (command.robot_id and message.robot_id != command.robot_id)
+            ):
+                return
             # A late acknowledgement must never turn a timed-out request green.
             if time.monotonic() >= deadline:
                 return
-            owners.remove(message.owner)
+            owners.remove(
+                (
+                    message.owner,
+                    message.robot_id if message.owner == "mission_coordinator" else "",
+                )
+            )
             if not owners:
                 del self._pending[message.command_id]
                 future.set_result((True, "Gateway fault state acknowledged"))
 
     def _expire(self):
         with self._lock:
-            for identifier, (future, owners, deadline) in tuple(self._pending.items()):
+            for identifier, (future, owners, deadline, command) in tuple(
+                self._pending.items()
+            ):
                 if time.monotonic() >= deadline:
                     del self._pending[identifier]
                     future.set_result(
                         (
                             False,
                             "Fault acknowledgement timed out: "
-                            + ", ".join(sorted(owners)),
+                            + ", ".join(
+                                f"{owner}/{robot_id}" if robot_id else owner
+                                for owner, robot_id in sorted(owners)
+                            ),
                         )
                     )
 
@@ -210,8 +251,19 @@ class FaultInjectorNode(Node):
             command.ack_timeout_sec = float(self.ack_timeout)
             self._pending[command.command_id] = (
                 future,
-                set(owners),
+                {
+                    (owner, robot_id)
+                    for owner in owners
+                    for robot_id in (
+                        (command.robot_id,)
+                        if command.robot_id
+                        else sorted(self.robot_ids)
+                    )
+                    if owner == "mission_coordinator"
+                }
+                | {(owner, "") for owner in owners if owner != "mission_coordinator"},
                 time.monotonic() + self.ack_timeout,
+                command,
             )
         self.commands.publish(command)
         return await future
@@ -224,6 +276,8 @@ class FaultInjectorNode(Node):
             if not isinstance(fields, dict):
                 raise ValueError("fault request must be an object")
             control = FaultRequest(**fields)
+            if control.robot_id is not None and control.robot_id not in self.robot_ids:
+                raise ValueError("robot ID is not configured")
             owner = (
                 "mqtt_gateway"
                 if control.name.startswith("mqtt_")
@@ -238,7 +292,12 @@ class FaultInjectorNode(Node):
             if owner not in self.owners:
                 raise ValueError("fault owner not enabled: " + owner)
             command = FaultCommand(
-                **{**asdict(control), "station": control.station or "", "owner": owner}
+                **{
+                    **asdict(control),
+                    "station": control.station or "",
+                    "robot_id": control.robot_id or "",
+                    "owner": owner,
+                }
             )
             response.accepted, response.message = await self._deliver(command, (owner,))
         except (TypeError, ValueError, RecursionError) as error:
@@ -317,7 +376,11 @@ class SimulationFaults:
         if event.event != "navigation_pickup_started":
             return
         control = self.controller.consume(
-            "wrong_marker", event.mission_id, "assembly", "navigation_start"
+            "wrong_marker",
+            event.mission_id,
+            "assembly",
+            "navigation_start",
+            robot_id=event.robot_id,
         )
         if control is not None:
 
@@ -326,6 +389,7 @@ class SimulationFaults:
                     ProtocolEvent(
                         stamp=self.node.get_clock().now().to_msg(),
                         mission_id=control.mission_id,
+                        robot_id=event.robot_id,
                         protocol="SIMULATION",
                         direction="INTERNAL",
                         event="wrong_marker_pose_applied",
@@ -374,6 +438,7 @@ class SimulationFaults:
                 ProtocolEvent(
                     stamp=self.node.get_clock().now().to_msg(),
                     mission_id=active[0].mission_id if active is not None else "",
+                    robot_id=active[0].robot_id or "" if active is not None else "",
                     protocol="SIMULATION",
                     direction="INTERNAL",
                     event="wrong_marker_pose_restored",
@@ -441,6 +506,7 @@ class QosExperiment:
             ProtocolEvent(
                 stamp=self.node.get_clock().now().to_msg(),
                 mission_id=self.active.mission_id,
+                robot_id=self.active.robot_id or "",
                 protocol="DDS",
                 direction="INTERNAL",
                 event=name,
@@ -459,6 +525,7 @@ class QosExperiment:
             control.mission_id,
             control.station,
             control.activation_point,
+            robot_id=control.robot_id,
         )
         self.topic = (
             "/factory/faults/qos_experiment/mission_"

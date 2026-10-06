@@ -1,5 +1,7 @@
 """Deterministic PLC cycle; time is supplied by the transport or caller."""
 
+import re
+
 
 class StationCycle:
     """One assembly/load (1) or inspection/unload (2) station."""
@@ -31,6 +33,45 @@ class StationCycle:
         self._part_written = False
         self._presence_valid = False
         self._started_at = None
+        self.owner = None
+        self.last_completion = None
+
+    def claim(self, robot_id, mission_id, part):
+        if any(
+            not isinstance(value, str)
+            or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value)
+            for value in (robot_id, mission_id, part)
+        ):
+            raise ValueError("invalid station ownership")
+        identity = (robot_id, mission_id, part)
+        if self.owner is not None and self.owner != identity:
+            return False
+        if self.owner is None and (self.coils[1] or self.coils[2]):
+            return False
+        self.owner = identity
+        return True
+
+    def release(self, robot_id, mission_id, part):
+        if self.owner != (robot_id, mission_id, part) or self.coils[1] or self.coils[2]:
+            return False
+        self.owner = None
+        return True
+
+    def status(self):
+        return dict(
+            robot_id=self.owner[0] if self.owner else "",
+            mission_id=self.owner[1] if self.owner else "",
+            part=self.owner[2] if self.owner else "",
+            cycle_counter=self.registers[2],
+            last_completion=self.last_completion,
+        )
+
+    def complete(self, robot_id, mission_id, *, now):
+        if self.owner is None or self.owner[:2] != (robot_id, mission_id):
+            return False
+        previous = self.registers[2]
+        self.advance(now)
+        return self.coils[3] and self.registers[2] != previous
 
     def write_register(self, address, value):
         if address != 1 or not isinstance(value, int) or not 0 <= value <= 65535:
@@ -76,4 +117,11 @@ class StationCycle:
         if now - self._started_at >= self.cycle_delay:
             self.registers[2] = (self.registers[2] + 1) % 65536
             self.coils[3] = True
+            if self.owner is not None:
+                self.last_completion = dict(
+                    robot_id=self.owner[0],
+                    mission_id=self.owner[1],
+                    part=self.owner[2],
+                    cycle_counter=self.registers[2],
+                )
             self._started_at = None

@@ -232,6 +232,7 @@ def rig():
                 event.event,
                 event.outcome,
                 event.detail,
+                robot_id=event.robot_id,
             )
 
         sub = peer.create_subscription(
@@ -250,6 +251,7 @@ def rig():
             future = transfer.call_async(
                 TransferPart.Request(
                     mission_id=handle.request.mission_id,
+                    robot_id=handle.request.robot_id,
                     station_id="assembly",
                     part="motor",
                 )
@@ -270,6 +272,7 @@ def rig():
                 future = transfer.call_async(
                     TransferPart.Request(
                         mission_id=handle.request.mission_id,
+                        robot_id=handle.request.robot_id,
                         station_id="inspection",
                         part="motor",
                     )

@@ -256,7 +256,8 @@ protected:
     auto acknowledged = [&] {
       return std::any_of(fault_acks.begin(), fault_acks.end(), [&](const auto &ack) {
         return ack.command_id == fault_id && ack.owner == "mission_coordinator" &&
-               ack.acknowledged;
+               ack.acknowledged && ack.robot_id == "amr_01" &&
+               ack.mission_id == command.mission_id && ack.station == command.station;
       });
     };
     for (int i = 0; i < 100 && !acknowledged(); ++i) {

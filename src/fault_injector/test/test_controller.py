@@ -90,3 +90,174 @@ def test_disabled_controller_has_no_events_or_effects():
     assert controller.consume("mqtt_duplicate", "M-1", "assembly", "request") is None
     controller.reset()
     assert events == []
+
+
+def test_robot_station_and_global_scopes_match_only_intended_consumers():
+    controller = FaultController()
+    robot = FaultRequest(
+        "nav_reject_once", "M-1", activation_point="navigation_start", robot_id="amr_02"
+    )
+    controller.enable(robot)
+    assert (
+        controller.consume(
+            "nav_reject_once", "M-1", "assembly", "navigation_start", robot_id="amr_01"
+        )
+        is None
+    )
+    assert (
+        controller.consume(
+            "nav_reject_once", "M-1", "assembly", "navigation_start", robot_id=""
+        )
+        is None
+    )
+    assert (
+        controller.consume(
+            "nav_reject_once", "M-1", "assembly", "navigation_start", robot_id="amr_02"
+        )
+        == robot
+    )
+    station = FaultRequest("plc_fault", "M-1", station="inspection")
+    controller.enable(station)
+    assert (
+        controller.consume(
+            "plc_fault", "M-1", "assembly", "transfer_start", robot_id="amr_01"
+        )
+        is None
+    )
+    assert (
+        controller.consume(
+            "plc_fault", "M-1", "inspection", "transfer_start", robot_id="amr_02"
+        )
+        == station
+    )
+    global_fault = FaultRequest(
+        "nav_reject_once", "M-1", activation_point="navigation_start", one_shot=False
+    )
+    controller.enable(global_fault)
+    for identifier in ("amr_01", "amr_02"):
+        assert (
+            controller.consume(
+                "nav_reject_once",
+                "M-1",
+                "assembly",
+                "navigation_start",
+                robot_id=identifier,
+            )
+            == global_fault
+        )
+
+
+@pytest.mark.parametrize("robot_id", ["", "bad/id", "x" * 65])
+def test_invalid_explicit_robot_scope_is_rejected(robot_id):
+    with pytest.raises(ValueError, match="robot"):
+        FaultRequest("nav_reject_once", "M-1", robot_id=robot_id)
+
+
+@pytest.mark.parametrize("name", ["mqtt_disconnect", "wrong_marker"])
+def test_shared_physical_effect_rejects_robot_scope_instead_of_affecting_fleet(name):
+    with pytest.raises(ValueError, match="shared"):
+        FaultRequest(name, "M-1", robot_id="amr_02")
+
+
+def test_fault_service_preserves_explicit_robot_target_at_ros_boundary():
+    import asyncio
+    import json
+    from types import SimpleNamespace
+    from fault_injector.node import FaultInjectorNode
+
+    node = FaultInjectorNode.__new__(FaultInjectorNode)
+    node.owners = ["mission_coordinator"]
+    node.robot_ids = frozenset(("amr_01", "amr_02"))
+    delivered = []
+
+    async def deliver(command, owners):
+        delivered.append(command)
+        return True, "acknowledged"
+
+    node._deliver = deliver
+    request = SimpleNamespace(
+        json=json.dumps(
+            dict(
+                name="nav_reject_once",
+                mission_id="M-1",
+                robot_id="amr_02",
+                activation_point="navigation_start",
+            )
+        )
+    )
+    response = asyncio.run(node._set(request, SimpleNamespace()))
+    assert response.accepted
+    assert delivered[0].robot_id == "amr_02"
+    request.json = json.dumps(
+        dict(
+            name="nav_reject_once",
+            mission_id="M-1",
+            robot_id="unknown",
+            activation_point="navigation_start",
+        )
+    )
+    response = asyncio.run(node._set(request, SimpleNamespace()))
+    assert not response.accepted
+    assert len(delivered) == 1
+
+
+def test_robot_fault_ack_requires_exact_target_and_all_global_consumers():
+    import threading
+    from types import SimpleNamespace
+    from factory_interfaces.msg import FaultCommand
+    from fault_injector.node import FaultInjectorNode
+
+    node = FaultInjectorNode.__new__(FaultInjectorNode)
+    node._lock = threading.RLock()
+    node._pending = {}
+    node._command_id = 0
+    node.ack_timeout = 2.0
+    node.robot_ids = frozenset(("amr_01", "amr_02"))
+    published = []
+    node.commands = SimpleNamespace(publish=published.append)
+    delivery = node._deliver(
+        FaultCommand(mission_id="M-1", robot_id="amr_02"), ("mission_coordinator",)
+    )
+    delivery.send(None)
+    identifier = published[-1].command_id
+    future = node._pending[identifier][0]
+    node._ack(
+        FaultCommand(
+            command_id=identifier,
+            owner="mission_coordinator",
+            acknowledged=True,
+            robot_id="amr_01",
+            mission_id="M-1",
+        )
+    )
+    assert not future.done()
+    node._ack(
+        FaultCommand(
+            command_id=identifier,
+            owner="mission_coordinator",
+            acknowledged=True,
+            robot_id="amr_02",
+            mission_id="M-1",
+        )
+    )
+    assert future.done()
+    with pytest.raises(StopIteration) as finished:
+        delivery.send(None)
+    assert finished.value.value[0] is True
+    delivery = node._deliver(FaultCommand(mission_id="M-2"), ("mission_coordinator",))
+    delivery.send(None)
+    identifier = published[-1].command_id
+    future = node._pending[identifier][0]
+    for robot_id in ("amr_01", "amr_02"):
+        node._ack(
+            FaultCommand(
+                command_id=identifier,
+                owner="mission_coordinator",
+                acknowledged=True,
+                robot_id=robot_id,
+                mission_id="M-2",
+            )
+        )
+        assert future.done() == (robot_id == "amr_02")
+    with pytest.raises(StopIteration):
+        delivery.send(None)

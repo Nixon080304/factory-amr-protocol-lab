@@ -3,6 +3,7 @@
 from dataclasses import replace
 from datetime import datetime, timezone
 import hashlib
+import json
 import math
 from pathlib import Path
 import re
@@ -30,6 +31,7 @@ class ProtocolObserverNode(Node):
         self.failure_count = 0
         self.writer = None
         self.records = {}
+        self.robot_records = {}
         self.terminal = set()
         try:
             self.output.mkdir(parents=True, exist_ok=True)
@@ -78,6 +80,9 @@ class ProtocolObserverNode(Node):
                 return
             records = self.records.setdefault(message.mission_id, [])
             records.append(record)
+            self.robot_records.setdefault(
+                (record.mission_id, record.robot_id), []
+            ).append(record)
             if message.event == "mission_finished":
                 self.terminal.add(message.mission_id)
             # Other publishers may deliver a prior phase finish after the result.
@@ -86,6 +91,11 @@ class ProtocolObserverNode(Node):
                 digest = hashlib.sha256(message.mission_id.encode("utf-8")).hexdigest()
                 (self.output / f"mission_{digest}.md").write_text(
                     report.to_markdown(), encoding="utf-8"
+                )
+                (self.output / f"mission_{digest}.json").write_text(
+                    json.dumps(report.to_dict(), ensure_ascii=False, allow_nan=False)
+                    + "\n",
+                    encoding="utf-8",
                 )
         except Exception as error:
             self._failure(message.mission_id, error)

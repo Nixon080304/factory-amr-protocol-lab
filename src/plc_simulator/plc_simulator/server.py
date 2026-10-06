@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import json
 import math
 import signal
 import struct
@@ -78,10 +79,15 @@ class PlcServer:
 
     async def _control_request(self, reader, writer):
         try:
+            prefix = await asyncio.wait_for(reader.readexactly(1), 1.0)
+            if prefix == b"\xff":
+                await self._ownership_request(reader, writer)
+                return
             # Fixed side-channel frame: operation, unit, duration, fault code.
-            # This listener never carries mission IDs or changes Modbus addresses.
+            # Fault frames and typed ownership frames share this opt-in listener.
+            # Neither frame expands the raw Modbus address map.
             operation, unit, duration, code = struct.unpack(
-                "!BBdH", await asyncio.wait_for(reader.readexactly(12), 1.0)
+                "!BBdH", prefix + await asyncio.wait_for(reader.readexactly(11), 1.0)
             )
             if unit not in (1, 2):
                 raise ValueError("unit_id must be 1 or 2")
@@ -121,6 +127,50 @@ class PlcServer:
         writer.write(reply)
         await asyncio.wait_for(writer.drain(), 1.0)
 
+    async def _ownership_request(self, reader, writer):
+        try:
+            size = struct.unpack(
+                "!H", await asyncio.wait_for(reader.readexactly(2), 1.0)
+            )[0]
+            if not 1 <= size <= 1024:
+                raise ValueError("ownership frame exceeds 1024 bytes")
+            fields = json.loads(await asyncio.wait_for(reader.readexactly(size), 1.0))
+            if not isinstance(fields, dict) or set(fields) != {
+                "operation",
+                "unit_id",
+                "robot_id",
+                "mission_id",
+                "part",
+            }:
+                raise ValueError("invalid ownership fields")
+            unit = fields["unit_id"]
+            if type(unit) is not int or unit not in self.stations:
+                raise ValueError("invalid ownership unit")
+            station = self.stations[unit]
+            identity = (fields["robot_id"], fields["mission_id"], fields["part"])
+            operation = fields["operation"]
+            if operation == "claim":
+                accepted = station.claim(*identity)
+            elif operation == "release":
+                accepted = station.release(*identity)
+            elif operation == "status":
+                accepted = station.owner == identity
+            else:
+                raise ValueError("invalid ownership operation")
+            reply = dict(accepted=accepted, **station.status())
+        except (
+            ValueError,
+            TypeError,
+            KeyError,
+            asyncio.IncompleteReadError,
+            asyncio.TimeoutError,
+            RecursionError,
+        ):
+            reply = dict(accepted=False, message="invalid ownership request")
+        encoded = json.dumps(reply, allow_nan=False).encode()
+        writer.write(b"\xff" + struct.pack("!H", len(encoded)) + encoded)
+        await asyncio.wait_for(writer.drain(), 1.0)
+
     async def start_fault_control(self):
         """Opt-in side channel, always loopback, with no Modbus map changes."""
         if self._control_server is not None:
@@ -137,7 +187,10 @@ class PlcServer:
             function_code, start_address, address, count, current_registers, set_values
         ):
             now = asyncio.get_running_loop().time()
-            station.advance(now)
+            if station.owner is not None:
+                station.complete(*station.owner[:2], now=now)
+            else:
+                station.advance(now)
             request_started = False
             if set_values is not None:
                 if function_code in (5, 15):

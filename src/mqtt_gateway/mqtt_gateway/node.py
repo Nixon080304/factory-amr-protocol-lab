@@ -145,10 +145,15 @@ class MqttGatewayNode(Node):
         )
 
     def _event(self, mission_id, name, outcome="", detail=""):
+        mission = self.registry.payload_for(mission_id)
+        robot_id = self.assigned_robots.get(
+            mission_id, mission.robot_id if mission is not None else ""
+        )
         self.events.publish(
             ProtocolEvent(
                 stamp=self.get_clock().now().to_msg(),
                 mission_id=mission_id,
+                robot_id=robot_id or "",
                 protocol="MQTT",
                 direction="INBOUND",
                 event=name,
@@ -396,7 +401,11 @@ class MqttGatewayNode(Node):
                 )
                 return
             fault = self.faults.consume(
-                name, mission.mission_id, mission.pickup, "request"
+                name,
+                mission.mission_id,
+                mission.pickup,
+                "request",
+                robot_id=self.assigned_robots.get(mission.mission_id, mission.robot_id),
             )
             if fault is not None:
                 duplicate = asdict(mission)
@@ -552,7 +561,11 @@ class MqttGatewayNode(Node):
         self._event(mission.mission_id, "mqtt_acceptance_finished", "SUCCEEDED")
         self.current_mission_id = mission.mission_id
         fault = self.faults.consume(
-            "mqtt_disconnect", mission.mission_id, mission.pickup, "accepted"
+            "mqtt_disconnect",
+            mission.mission_id,
+            mission.pickup,
+            "accepted",
+            robot_id=self.assigned_robots.get(mission.mission_id, mission.robot_id),
         )
         if fault is not None:
             self.client.pause()

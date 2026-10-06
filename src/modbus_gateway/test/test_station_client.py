@@ -93,3 +93,44 @@ def test_nonresponsive_operation_is_bounded():
 def test_invalid_unit_or_part_never_reaches_network(unit, part):
     with pytest.raises(ValueError):
         asyncio.run(StationClient().transfer(unit, part))
+
+
+def test_changed_counter_without_complete_coil_never_confirms_payload(monkeypatch):
+    from types import SimpleNamespace
+
+    class CounterOnlySocket:
+        def __init__(self, *args, **kwargs):
+            self.connected = False
+            self.started = False
+
+        async def connect(self):
+            self.connected = True
+            return True
+
+        async def read_coils(self, *args, **kwargs):
+            return SimpleNamespace(
+                bits=[True, self.started, self.started, False, False]
+            )
+
+        async def read_holding_registers(self, *args, **kwargs):
+            return SimpleNamespace(registers=[1, 1, 2 if self.started else 1, 0])
+
+        async def write_register(self, *args, **kwargs):
+            return True
+
+        async def write_coil(self, address, value, **kwargs):
+            self.started |= address == 2 and value
+            return True
+
+        async def write_coils(self, *args, **kwargs):
+            return True
+
+        def close(self):
+            self.connected = False
+
+    monkeypatch.setattr(
+        "modbus_gateway.station_client.AsyncModbusTcpClient", CounterOnlySocket
+    )
+    result = asyncio.run(StationClient(transfer_timeout=0.02).transfer(1, 1))
+    assert not result.success
+    assert result.outcome == "UNKNOWN"

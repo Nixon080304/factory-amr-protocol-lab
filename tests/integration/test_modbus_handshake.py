@@ -258,3 +258,62 @@ def test_post_request_timeout_is_unknown_and_never_replays(
             assert registers[2] == 0
 
     asyncio.run(scenario())
+
+
+def test_two_correlated_station_cycles_and_foreign_cleanup_with_real_modbus():
+    import json
+    import struct
+
+    async def ownership(server, operation, unit, robot, mission):
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection("127.0.0.1", server.fault_control_port), 1
+        )
+        try:
+            fields = dict(
+                operation=operation,
+                unit_id=unit,
+                robot_id=robot,
+                mission_id=mission,
+                part="motor",
+            )
+            encoded = json.dumps(fields).encode()
+            writer.write(b"\xff" + struct.pack("!H", len(encoded)) + encoded)
+            await writer.drain()
+            header = await asyncio.wait_for(reader.readexactly(3), 1)
+            assert header[:1] == b"\xff"
+            return json.loads(
+                await asyncio.wait_for(
+                    reader.readexactly(struct.unpack("!H", header[1:])[0]), 1
+                )
+            )
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    async def scenario():
+        async with station_server(cycle_delay=0.1) as server:
+            await server.start_fault_control()
+            assert (await ownership(server, "claim", 1, "amr_01", "M-1"))["accepted"]
+            assert (await ownership(server, "claim", 2, "amr_02", "M-2"))["accepted"]
+            assert not (await ownership(server, "claim", 1, "amr_02", "M-3"))[
+                "accepted"
+            ]
+            client = StationClient(port=server.port)
+            first, second = await asyncio.wait_for(
+                asyncio.gather(client.transfer(1, 1), client.transfer(2, 1)), 3
+            )
+            assert first.success and second.success
+            assert not (await ownership(server, "release", 1, "amr_02", "M-1"))[
+                "accepted"
+            ]
+            for unit, robot, mission in [(1, "amr_01", "M-1"), (2, "amr_02", "M-2")]:
+                status = await ownership(server, "status", unit, robot, mission)
+                assert status["accepted"]
+                assert status["last_completion"] == dict(
+                    robot_id=robot, mission_id=mission, part="motor", cycle_counter=1
+                )
+                assert (await ownership(server, "release", unit, robot, mission))[
+                    "accepted"
+                ]
+
+    asyncio.run(scenario())

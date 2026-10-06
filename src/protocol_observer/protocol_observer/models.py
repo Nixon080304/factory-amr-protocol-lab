@@ -45,7 +45,14 @@ class ProtocolEventRecord:
         }
 
     @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> "ProtocolEventRecord":
+    def from_dict(
+        cls, value: Mapping[str, Any], *, allow_legacy=False
+    ) -> "ProtocolEventRecord":
         fields = dict(value)
         fields["stamp"] = datetime.fromisoformat(fields["stamp"])
-        return cls(**fields)
+        record = cls(**fields)
+        if "robot_id" not in fields and not allow_legacy:
+            raise ValueError(
+                "legacy trace lacks robot_id; use allow_legacy=True explicitly"
+            )
+        return record

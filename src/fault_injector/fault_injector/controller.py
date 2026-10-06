@@ -21,6 +21,7 @@ class FaultController:
                     request.name,
                     request.mission_id,
                     request.station,
+                    request.robot_id,
                     request.activation_point,
                 )
             ] = (request, None)
@@ -37,7 +38,7 @@ class FaultController:
                     self._event("fault_reset", request)
             return tuple(request for request, _ in self._entries.values())
 
-    def consume(self, name, mission_id, station, activation_point):
+    def consume(self, name, mission_id, station, activation_point, *, robot_id=None):
         with self._lock:
             self.query()
             for key, (request, started) in tuple(self._entries.items()):
@@ -45,6 +46,7 @@ class FaultController:
                     request.name == name
                     and request.mission_id == mission_id
                     and request.station in (None, station)
+                    and request.robot_id in (None, robot_id)
                     and request.activation_point == activation_point
                 ):
                     self._event("fault_activated", request)

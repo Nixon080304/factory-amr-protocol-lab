@@ -44,7 +44,7 @@ class StationClient:
         self.port = port
         self.response_timeout = response_timeout
         self.transfer_timeout = transfer_timeout
-        self._lock = asyncio.Lock()
+        self._locks = {unit: asyncio.Lock() for unit in (1, 2)}
         self._on_retry = on_retry
         self._on_state = on_state
 
@@ -105,7 +105,7 @@ class StationClient:
             raise ValueError("unit_id must be 1 or 2")
         if type(part_code) is not int or not 0 <= part_code <= 65535:
             raise ValueError("part_code must be a uint16")
-        async with self._lock:
+        async with self._locks[unit_id]:
             return await self._transfer(unit_id, part_code)
 
     async def _transfer(self, unit_id, part_code):
@@ -193,7 +193,7 @@ class StationClient:
                 while asyncio.get_running_loop().time() < deadline:
                     coils, registers = await state(deadline)
                     observed = registers[address.CYCLE_COUNTER]
-                    if observed != counter:
+                    if coils[address.TRANSFER_COMPLETE] and observed != counter:
                         outcome = "COMPLETED"
                         completed_counter = observed
                     if coils[address.STATION_FAULT]:

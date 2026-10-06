@@ -54,18 +54,51 @@ def generate_test_description():
         parameters=[{"use_sim_time": True}],
         output="screen",
     )
+    from factory_simulation.description import robot_actions
+
+    second_part = Node(
+        package="gazebo_ros",
+        executable="spawn_entity.py",
+        arguments=[
+            "-entity",
+            "factory_part_02",
+            "-file",
+            str(share / "models/factory_part/model.sdf"),
+            "-x",
+            "-3",
+            "-y",
+            "2",
+            "-z",
+            "0.65",
+            "-timeout",
+            "30",
+        ],
+        output="screen",
+    )
     return LaunchDescription(
-        [simulation, payload, launch_testing.actions.ReadyToTest()]
+        [
+            simulation,
+            *robot_actions("/amr_02", "amr_02/", "amr_02", "2", "-3", "0"),
+            second_part,
+            payload,
+            launch_testing.actions.ReadyToTest(),
+        ]
     )
 
 
 def event(
-    *, kind="LOADING", mission_id="payload_test", counter=10, outcome="SUCCEEDED"
+    *,
+    kind="LOADING",
+    mission_id="payload_test",
+    counter=10,
+    outcome="SUCCEEDED",
+    robot_id="amr_01",
 ):
     from factory_interfaces.msg import ProtocolEvent
 
     message = ProtocolEvent()
     message.mission_id = mission_id
+    message.robot_id = robot_id
     message.protocol = "MODBUS"
     message.direction = "RECEIVE"
     message.event = (
@@ -317,6 +350,7 @@ class TestGazeboPayload(unittest.TestCase):
             {
                 "state": "IN_TRANSIT",
                 "mission_id": "payload_test",
+                "robot_id": "amr_01",
                 "transfer_kind": "LOADING",
                 "cycle_counter": 10,
             },
@@ -326,6 +360,7 @@ class TestGazeboPayload(unittest.TestCase):
             [
                 loaded,
                 event(kind="UNLOADING", mission_id="other"),
+                event(kind="UNLOADING", robot_id="amr_02"),
                 event(kind="UNLOADING", outcome="FAILED"),
             ],
             "assembly_conveyor",
@@ -404,6 +439,105 @@ class TestGazeboPayload(unittest.TestCase):
             )
         finally:
             self.node.destroy_subscription(subscription)
+            payload.destroy_node()
+
+    def test_two_robot_payloads_follow_only_their_configured_entities(self):
+        from factory_interfaces.msg import ProtocolEvent
+        from factory_simulation.entity_probe import set_entity_pose
+        from payload_simulator.node import PayloadSimulatorNode
+
+        self.deadline = time.monotonic() + 45
+        payload = PayloadSimulatorNode(
+            parameter_overrides=[
+                Parameter("robot_ids", value=["amr_01", "amr_02"]),
+                Parameter("robot_entities", value=["factory_amr", "amr_02"]),
+                Parameter("part_entities", value=["factory_part", "factory_part_02"]),
+            ],
+            cli_args=[
+                "--ros-args",
+                "-r",
+                "/factory/protocol_events:=/two_payload/events",
+                "-r",
+                "/factory/payload_state:=/two_payload/state",
+            ],
+        )
+        publisher = self.node.create_publisher(
+            ProtocolEvent, "/two_payload/events", 100
+        )
+
+        def pump(predicate, timeout=8):
+            deadline = min(self.deadline, time.monotonic() + timeout)
+            while not predicate() and time.monotonic() < deadline:
+                rclpy.spin_once(payload, timeout_sec=0.01)
+                rclpy.spin_once(self.node, timeout_sec=0.01)
+            self.assertTrue(
+                predicate(), "bounded two-robot visual condition did not arrive"
+            )
+
+        def mounted(robot_name, part_name):
+            robot, part = self.pose(robot_name), self.pose(part_name)
+            yaw = 2 * math.atan2(robot.orientation.z, robot.orientation.w)
+            offset = (-0.03 * math.cos(yaw), -0.03 * math.sin(yaw), 0.28)
+            return all(
+                abs((part_value - robot_value) - expected) < 0.02
+                for part_value, robot_value, expected in zip(
+                    (part.position.x, part.position.y, part.position.z),
+                    (robot.position.x, robot.position.y, robot.position.z),
+                    offset,
+                )
+            )
+
+        try:
+            pump(lambda: publisher.get_subscription_count() == 1, 3)
+            publisher.publish(event(robot_id="amr_01", mission_id="two_01", counter=1))
+            publisher.publish(event(robot_id="amr_02", mission_id="two_02", counter=2))
+            pump(
+                lambda: (
+                    mounted("factory_amr", "factory_part")
+                    and mounted("amr_02", "factory_part_02")
+                ),
+                12,
+            )
+            moved = Pose()
+            moved.position.x, moved.position.y, moved.position.z = 2.0, -1.0, 0.01
+            moved.orientation.w = 1.0
+            set_entity_pose(self.node, "amr_02", moved, timeout_sec=2)
+            pump(lambda: mounted("amr_02", "factory_part_02"))
+            publisher.publish(
+                event(
+                    kind="UNLOADING", robot_id="amr_02", mission_id="two_01", counter=3
+                )
+            )
+            pump(
+                lambda: (
+                    payload._machine.state_for("amr_02", "two_02").value == "IN_TRANSIT"
+                )
+            )
+            for _ in range(20):
+                rclpy.spin_once(payload, timeout_sec=0.01)
+            self.assertTrue(mounted("amr_02", "factory_part_02"))
+            publisher.publish(
+                event(
+                    kind="UNLOADING", robot_id="amr_01", mission_id="two_01", counter=3
+                )
+            )
+            pump(
+                lambda: (
+                    payload._machine.state_for("amr_01", "two_01").value
+                    == "AT_INSPECTION"
+                )
+            )
+            pump(
+                lambda: (
+                    not payload._animations
+                    and not payload._steps
+                    and payload._future is None
+                )
+            )
+            self.assert_pose("factory_part", (3, 2, 0.65))
+            self.assertTrue(mounted("amr_02", "factory_part_02"))
+        finally:
+            self.node.destroy_publisher(publisher)
             payload.destroy_node()
 
 

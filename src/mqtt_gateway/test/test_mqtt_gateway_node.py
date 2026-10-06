@@ -44,7 +44,7 @@ def without_dds():
         info=lambda message: None, error=lambda message: None
     )
     node._timestamp = lambda: "2026-10-05T00:00:00Z"
-    node.faults = SimpleNamespace(consume=lambda *args: None)
+    node.faults = SimpleNamespace(consume=lambda *args, **kwargs: None)
     goals = []
 
     def send(goal, feedback_callback):
@@ -80,6 +80,56 @@ def test_without_dds_explicit_configured_robot_remains_pinned(without_dds):
     )
     node._drain()
     assert goals[0][0].requested_robot_id == "amr_02"
+
+
+def test_without_dds_protocol_events_preserve_pin_and_reassignment(without_dds):
+    from types import MethodType, SimpleNamespace
+    from rclpy.time import Time
+    from mqtt_gateway.models import MissionPayload
+
+    node, _, _ = without_dds
+    events = []
+    node._event = MethodType(MqttGatewayNode._event, node)
+    node.events = SimpleNamespace(publish=events.append)
+    node.get_clock = lambda: SimpleNamespace(now=lambda: Time(seconds=1))
+    node.registry.register(
+        MissionPayload("pin", "amr_02", "assembly", "inspection", "motor")
+    )
+    node.registry.register(
+        MissionPayload("auto", None, "assembly", "inspection", "motor")
+    )
+    node._event("pin", "mqtt_acceptance_started")
+    node._event("auto", "mqtt_acceptance_started")
+    node.assigned_robots["auto"] = "amr_01"
+    node._event("auto", "mqtt_duplicate")
+    node.assigned_robots["auto"] = "amr_02"
+    node._event("auto", "mqtt_duplicate")
+    assert [event.robot_id for event in events] == ["amr_02", "", "amr_01", "amr_02"]
+
+
+def test_without_dds_robot_scoped_mqtt_injection_matches_only_target(without_dds):
+    from fault_injector.controller import FaultController
+    from fault_injector.models import FaultRequest
+    from mqtt_gateway.models import MissionPayload
+
+    node, broker, _ = without_dds
+    node.faults = FaultController()
+    node._fault_request_transport = node._fault_subscription_ready = True
+    node.faults.enable(
+        FaultRequest(
+            "mqtt_duplicate", "M-target", activation_point="request", robot_id="amr_02"
+        )
+    )
+    node._inject_request_faults(
+        MissionPayload("M-target", "amr_01", "assembly", "inspection", "motor")
+    )
+    assert not node._pending_injections
+    node._inject_request_faults(
+        MissionPayload("M-target", "amr_02", "assembly", "inspection", "motor")
+    )
+    assert len(node._pending_injections) == 1
+    assert json.loads(node._pending_injections[0].payload)["robot_id"] == "amr_02"
+    assert len(broker.published) == 1
 
 
 def test_without_dds_unconfigured_pin_never_reaches_action(without_dds):

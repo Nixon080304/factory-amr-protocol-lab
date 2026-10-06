@@ -139,6 +139,12 @@ def _duration_ms(phase: str, events: Sequence[ProtocolEventRecord]) -> Optional[
     total = 0.0
     pairs = 0
     for event in events:
+        if (
+            phase not in ("mission", "mqtt_acceptance")
+            and not event.robot_id
+            and event.event in (f"{phase}_started", f"{phase}_finished")
+        ):
+            return None
         if event.event == f"{phase}_started":
             if event.robot_id in starts:
                 return None
@@ -174,6 +180,28 @@ class MissionReport:
     retry_count: int
     failure_count: int
     final_outcome: str
+
+    def to_dict(self):
+        return dict(
+            mission_id=self.mission_id,
+            events=[event.to_dict() for event in self.events],
+            durations_ms=self.durations_ms,
+            robot_durations_ms={
+                robot_id: {
+                    phase: _duration_ms(
+                        phase,
+                        [event for event in self.events if event.robot_id == robot_id],
+                    )
+                    for phase in PHASE_LABELS
+                }
+                for robot_id in sorted(
+                    {event.robot_id for event in self.events if event.robot_id}
+                )
+            },
+            retry_count=self.retry_count,
+            failure_count=self.failure_count,
+            final_outcome=self.final_outcome,
+        )
 
     @classmethod
     def from_events(
@@ -249,6 +277,7 @@ class MissionReport:
                 "COMPLETED" if event.outcome == "SUCCEEDED" else "not available",
             )
             cells = [
+                event.robot_id or "not available",
                 detail.get("station_id", "not available"),
                 detail.get("transfer_kind", "not available"),
                 detail.get("cycle_counter", "not available"),
@@ -266,8 +295,8 @@ class MissionReport:
                     "",
                     "## Transfer evidence",
                     "",
-                    "| Station | Kind | Counter | Physical outcome | Protocol outcome | Error | Detail |",
-                    "| --- | --- | --- | --- | --- | --- | --- |",
+                    "| Robot | Station | Kind | Counter | Physical outcome | Protocol outcome | Error | Detail |",
+                    "| --- | --- | --- | --- | --- | --- | --- | --- |",
                     *transfers,
                 ]
             )

@@ -61,6 +61,43 @@ def test_transport_boundary_preserves_both_robot_ids(tmp_path, monkeypatch):
     assert endpoints == ["/factory/protocol_events", "/factory/protocol_events"]
 
 
+def test_observer_keeps_robot_local_history_and_one_fleet_report(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from rclpy.node import Node
+
+    monkeypatch.setattr(Node, "__init__", lambda *args, **kwargs: None)
+    monkeypatch.setattr(Node, "set_parameters", lambda *args: [])
+    monkeypatch.setattr(
+        Node, "declare_parameter", lambda *args: SimpleNamespace(value=str(tmp_path))
+    )
+    monkeypatch.setattr(Node, "create_subscription", lambda *args, **kwargs: None)
+    node = ProtocolObserverNode()
+    for robot, name, seconds in [
+        ("amr_01", "navigation_pickup_started", 1),
+        ("amr_02", "navigation_pickup_started", 2),
+        ("amr_02", "navigation_pickup_finished", 6),
+        ("amr_02", "mission_finished", 7),
+        ("amr_01", "navigation_pickup_finished", 4),
+    ]:
+        message = ProtocolEvent(
+            mission_id="M-1",
+            robot_id=robot,
+            protocol="ROS",
+            event=name,
+            outcome="COMPLETED" if name == "mission_finished" else "",
+        )
+        message.stamp.sec = seconds
+        node._observe(message)
+    assert set(node.robot_records) == {("M-1", "amr_01"), ("M-1", "amr_02")}
+    assert len(node.records["M-1"]) == 5
+    reports = list(tmp_path.glob("mission_*.json"))
+    assert len(reports) == 1
+    report = json.loads(reports[0].read_text())
+    assert report["durations_ms"]["navigation_pickup"] == 7000.0
+    assert report["robot_durations_ms"]["amr_01"]["navigation_pickup"] == 3000.0
+    assert report["robot_durations_ms"]["amr_02"]["navigation_pickup"] == 4000.0
+
+
 @pytest.mark.parametrize("namespace", ["/amr_01", "/amr_02"])
 def test_dds_trace_report_late_phase_and_write_failure(tmp_path, namespace):
     context = Context()

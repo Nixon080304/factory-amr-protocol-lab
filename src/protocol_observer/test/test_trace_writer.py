@@ -106,3 +106,27 @@ def test_reopening_invalid_sequence_rejects_trace_without_modification(tmp_path)
     with pytest.raises(ValueError, match="sequence"):
         TraceWriter(path)
     assert path.read_bytes() == original
+
+
+def test_legacy_trace_identity_requires_explicit_reading_policy(tmp_path):
+    fields = dict(
+        stamp="2026-10-02T00:00:00+00:00",
+        mission_id="M-1",
+        protocol="MODBUS",
+        direction="OUTBOUND",
+        event="modbus_pickup_started",
+        outcome="",
+        latency_ms=0,
+        detail="",
+        sequence=1,
+    )
+    with pytest.raises(ValueError, match="robot_id"):
+        ProtocolEventRecord.from_dict(fields)
+    legacy = ProtocolEventRecord.from_dict(fields, allow_legacy=True)
+    assert legacy.robot_id == ""
+    path = tmp_path / "trace.jsonl"
+    path.write_text(json.dumps(fields) + "\n")
+    with pytest.raises(ValueError, match="robot_id"):
+        TraceWriter(path)
+    TraceWriter(path, allow_legacy=True).append(legacy)
+    assert json.loads(path.read_text().splitlines()[-1])["robot_id"] == ""

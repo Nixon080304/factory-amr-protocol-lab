@@ -7,7 +7,7 @@ from protocol_observer.models import ProtocolEventRecord
 from protocol_observer.report import MissionReport
 
 
-def event(seconds, name, outcome="", mission_id="M-001", sequence=0):
+def event(seconds, name, outcome="", mission_id="M-001", sequence=0, robot_id="amr_01"):
     return ProtocolEventRecord(
         datetime(2026, 10, 2, tzinfo=timezone.utc) + timedelta(seconds=seconds),
         mission_id,
@@ -18,6 +18,7 @@ def event(seconds, name, outcome="", mission_id="M-001", sequence=0):
         999999.0,
         "",
         sequence,
+        robot_id=robot_id,
     )
 
 
@@ -157,3 +158,38 @@ def test_repeated_phase_sums_only_when_all_attempts_are_paired():
 def test_blank_mission_cannot_group_uncorrelated_events():
     with pytest.raises(ValueError, match="mission_id"):
         MissionReport.from_events("", [event(0, "mission_started", mission_id="")])
+
+
+def test_fleet_report_serializes_robot_phase_and_transfer_evidence():
+    report = MissionReport.from_events(
+        "M-001",
+        [
+            replace(event(1, "navigation_pickup_started"), robot_id="amr_01"),
+            replace(event(2, "navigation_pickup_started"), robot_id="amr_02"),
+            replace(event(4, "navigation_pickup_finished"), robot_id="amr_01"),
+            replace(event(6, "navigation_pickup_finished"), robot_id="amr_02"),
+            replace(
+                event(7, "modbus_pickup_finished", "SUCCEEDED"),
+                robot_id="amr_02",
+                protocol="MODBUS",
+                detail='{"station_id":"assembly","transfer_kind":"LOADING","cycle_counter":5}',
+            ),
+        ],
+    )
+    serialized = report.to_dict()
+    assert serialized["robot_durations_ms"]["amr_01"]["navigation_pickup"] == 3000.0
+    assert serialized["robot_durations_ms"]["amr_02"]["navigation_pickup"] == 4000.0
+    assert serialized["durations_ms"]["navigation_pickup"] == 7000.0
+    assert serialized["events"][-1]["robot_id"] == "amr_02"
+    assert "| amr_02 | assembly | LOADING | 5 |" in report.to_markdown()
+
+
+def test_unidentified_legacy_robot_phase_cannot_create_fleet_duration():
+    report = MissionReport.from_events(
+        "M-001",
+        [
+            event(1, "navigation_pickup_started", robot_id=""),
+            event(4, "navigation_pickup_finished", robot_id=""),
+        ],
+    )
+    assert report.durations_ms["navigation_pickup"] is None

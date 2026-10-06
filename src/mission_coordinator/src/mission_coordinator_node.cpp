@@ -466,6 +466,8 @@ void MissionCoordinatorNode::fault_command(
   ack.command_id = message.command_id;
   ack.owner = "mission_coordinator";
   ack.robot_id = robot_.robot_id;
+  ack.mission_id = message.mission_id;
+  ack.station = message.station;
   ack.acknowledged = true;
   fault_acks_->publish(ack);
 }

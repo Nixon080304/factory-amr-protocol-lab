@@ -15,7 +15,7 @@ class TraceWriter:
     concurrently share a path; the later ROS adapter owns one writer.
     """
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, allow_legacy=False):
         self.path = Path(path)
         self._sequence = 0
         if self.path.exists():
@@ -25,7 +25,9 @@ class TraceWriter:
                         raise ValueError(
                             "existing trace record must end with a newline"
                         )
-                    record = ProtocolEventRecord.from_dict(json.loads(line))
+                    record = ProtocolEventRecord.from_dict(
+                        json.loads(line), allow_legacy=allow_legacy
+                    )
                     self._sequence = max(self._sequence, record.sequence or 0)
 
     def append(self, event: ProtocolEventRecord) -> None:

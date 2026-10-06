@@ -1,14 +1,17 @@
 """Typed transfer service with a serialized PLC boundary and live ROS clock."""
 
 import asyncio
+from contextvars import ContextVar
 import json
 import re
 import socket
 import struct
+import threading
+import time
 
 import rclpy
 from rclpy.impl.implementation_singleton import rclpy_implementation
-from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.parameter import Parameter
@@ -27,6 +30,20 @@ class ModbusGatewayNode(Node):
         port = self.declare_parameter("plc_port", 1502).value
         self.fault_control_port = self.declare_parameter("fault_control_port", 0).value
         self.motor_code = self.declare_parameter("motor_part_code", 1).value
+        self.robot_ids = frozenset(
+            self.declare_parameter("robot_ids", ["amr_01"]).value
+        )
+        if not self.robot_ids or any(
+            not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", identifier)
+            for identifier in self.robot_ids
+        ):
+            raise ValueError("robot_ids must contain valid configured robot IDs")
+        self._request = ContextVar("transfer_request", default=None)
+        self._station_locks = {
+            station: threading.Lock() for station in ("assembly", "inspection")
+        }
+        self._requests = {}
+        self._requests_lock = threading.Lock()
         if type(self.motor_code) is not int or not 0 <= self.motor_code <= 65535:
             raise ValueError("motor_part_code must be a uint16")
         self.events = self.create_publisher(
@@ -34,7 +51,7 @@ class ModbusGatewayNode(Node):
             "/factory/protocol_events",
             QoSProfile(depth=100, reliability=ReliabilityPolicy.RELIABLE),
         )
-        self.protocol_group = MutuallyExclusiveCallbackGroup()
+        self.protocol_group = ReentrantCallbackGroup()
         self.service = self.create_service(
             TransferPart,
             "/factory/transfer_part",
@@ -49,9 +66,14 @@ class ModbusGatewayNode(Node):
             response_timeout=self.declare_parameter("response_timeout", 2.0).value,
             transfer_timeout=self.declare_parameter("transfer_timeout", 2.0).value,
         )
-        self.mission_id = ""
+        self.fault_group = MutuallyExclusiveCallbackGroup()
         self.faults, self.fault_subscription = attach_controls(
-            self, owner="modbus_gateway", callback_group=self.protocol_group
+            self,
+            owner="modbus_gateway",
+            callback_group=self.fault_group,
+            robot_id=lambda fault: (
+                self._request.get().robot_id if self._request.get() is not None else ""
+            ),
         )
 
     def _plc_control(self, unit_id, fault=None):
@@ -79,10 +101,21 @@ class ModbusGatewayNode(Node):
                 raise RuntimeError("PLC fault control rejected")
 
     def _event(self, name, outcome="", detail=""):
+        request = self._request.get()
+        if request is not None:
+            try:
+                fields = json.loads(detail) if detail else {}
+            except (ValueError, TypeError):
+                fields = {"message": detail}
+            if not isinstance(fields, dict):
+                fields = {"message": detail}
+            fields.update(station_id=request.station_id, part=request.part)
+            detail = json.dumps(fields)
         self.events.publish(
             ProtocolEvent(
                 stamp=self.get_clock().now().to_msg(),
-                mission_id=self.mission_id,
+                mission_id=request.mission_id if request is not None else "",
+                robot_id=request.robot_id if request is not None else "",
                 protocol="MODBUS",
                 direction="OUTBOUND",
                 event=name,
@@ -90,6 +123,43 @@ class ModbusGatewayNode(Node):
                 detail=detail,
             )
         )
+
+    def _plc_ownership(self, unit_id, operation, request):
+        fields = dict(
+            operation=operation,
+            unit_id=unit_id,
+            robot_id=request.robot_id,
+            mission_id=request.mission_id,
+            part=request.part,
+        )
+        encoded = json.dumps(fields, allow_nan=False).encode()
+        with socket.create_connection(
+            ("127.0.0.1", self.fault_control_port), timeout=1.0
+        ) as connection:
+            deadline = time.monotonic() + 2.0
+
+            def read_exact(size):
+                result = bytearray()
+                while len(result) < size:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("PLC ownership response deadline")
+                    connection.settimeout(remaining)
+                    chunk = connection.recv(size - len(result))
+                    if not chunk:
+                        raise OSError("PLC ownership response closed")
+                    result.extend(chunk)
+                return bytes(result)
+
+            connection.sendall(b"\xff" + struct.pack("!H", len(encoded)) + encoded)
+            header = read_exact(3)
+            size = struct.unpack("!H", header[1:])[0]
+            if header[:1] != b"\xff" or not 1 <= size <= 1024:
+                raise ValueError("invalid PLC ownership response")
+            reply = json.loads(read_exact(size))
+            if not isinstance(reply, dict) or type(reply.get("accepted")) is not bool:
+                raise ValueError("invalid PLC ownership result")
+            return reply
 
     def _retry(self, attempt, delay):
         self._event(
@@ -105,25 +175,72 @@ class ModbusGatewayNode(Node):
         )
 
     def _transfer(self, request, response):
-        self.mission_id = request.mission_id
         if (
             not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", request.mission_id)
+            or request.robot_id not in self.robot_ids
             or request.station_id not in ("assembly", "inspection")
-            or request.part != "motor"
         ):
             response.error_code = "INVALID_MISSION"
             response.message = "Unsupported transfer request"
             return response
+        key = (request.mission_id, request.station_id)
+        identity = (request.robot_id, request.part)
+        with self._requests_lock:
+            previous = self._requests.get(key)
+            if previous is not None:
+                if previous[0] != identity:
+                    response.error_code = "CONFLICTING_TRANSFER"
+                    response.message = (
+                        "Mission station transfer has another robot or part"
+                    )
+                elif previous[1] is None:
+                    response.error_code = "STATION_BUSY"
+                    response.message = "Identical transfer is still in progress"
+                else:
+                    response.accepted, response.error_code, response.message = previous[
+                        1
+                    ]
+                return response
+            if request.part != "motor":
+                response.error_code = "INVALID_MISSION"
+                response.message = "Unsupported transfer part"
+                return response
+            lock = self._station_locks[request.station_id]
+            if not lock.acquire(blocking=False):
+                response.error_code = "STATION_BUSY"
+                response.message = "Station transfer is in progress"
+                return response
+            self._requests[key] = (identity, None)
+        token = self._request.set(request)
+        try:
+            return self._execute_transfer(request, response)
+        finally:
+            with self._requests_lock:
+                self._requests[key] = (
+                    identity,
+                    (response.accepted, response.error_code, response.message),
+                )
+            self._request.reset(token)
+            lock.release()
+
+    def _execute_transfer(self, request, response):
         pickup = request.station_id == "assembly"
         phase = "modbus_pickup" if pickup else "modbus_dropoff"
         self.get_logger().info(
-            f"mission_id={request.mission_id} robot_id=amr_01 station={request.station_id} state={'LOADING' if pickup else 'UNLOADING'}"
+            f"mission_id={request.mission_id} robot_id={request.robot_id} station={request.station_id} state={'LOADING' if pickup else 'UNLOADING'}"
         )
         self._event(phase + "_started")
         active = []
         outcome = "NOT_REQUESTED"
         result = None
+        claimed = False
+        unit_id = 1 if pickup else 2
         try:
+            if self.fault_control_port:
+                if not self._plc_ownership(unit_id, "claim", request)["accepted"]:
+                    response.error_code = "STATION_BUSY"
+                    raise RuntimeError("PLC station has another owner")
+                claimed = True
             for name in (
                 "modbus_delay",
                 "modbus_timeout",
@@ -131,7 +248,11 @@ class ModbusGatewayNode(Node):
                 "plc_fault",
             ):
                 fault = self.faults.consume(
-                    name, request.mission_id, request.station_id, "transfer_start"
+                    name,
+                    request.mission_id,
+                    request.station_id,
+                    "transfer_start",
+                    robot_id=request.robot_id,
                 )
                 if fault is not None:
                     active.append(fault)
@@ -143,6 +264,21 @@ class ModbusGatewayNode(Node):
                 self.station.transfer(1 if pickup else 2, self.motor_code)
             )
             outcome = result.outcome
+            if claimed and outcome == "COMPLETED":
+                outcome = "UNKNOWN"
+                ownership = self._plc_ownership(unit_id, "status", request)
+                expected = dict(
+                    robot_id=request.robot_id,
+                    mission_id=request.mission_id,
+                    part=request.part,
+                    cycle_counter=result.cycle_counter,
+                )
+                if (
+                    not ownership["accepted"]
+                    or ownership.get("last_completion") != expected
+                ):
+                    raise RuntimeError("PLC completion does not match transfer owner")
+                outcome = "COMPLETED"
             response.accepted, response.error_code, response.message = (
                 result.success,
                 result.error_code,
@@ -161,7 +297,7 @@ class ModbusGatewayNode(Node):
             )
         except Exception as error:
             response.accepted = False
-            response.error_code = "PLC_TIMEOUT"
+            response.error_code = response.error_code or "PLC_TIMEOUT"
             response.message = str(error)
             detail = str(error)
             self.get_logger().error(
@@ -180,6 +316,17 @@ class ModbusGatewayNode(Node):
                     detail = response.message
                 for fault in active:
                     self.faults.finish(fault)
+            if claimed:
+                try:
+                    if not self._plc_ownership(unit_id, "release", request)["accepted"]:
+                        raise RuntimeError("PLC station ownership cleanup rejected")
+                except Exception as error:
+                    response.accepted = False
+                    response.error_code = response.error_code or "PLC_TIMEOUT"
+                    response.message = (
+                        f"{response.message}; ownership cleanup failed: {error}"
+                    )
+                    detail = response.message
         if not response.accepted and outcome != "NOT_REQUESTED":
             response.error_code += "_TRANSFER_" + outcome
             detail = json.dumps(
@@ -196,7 +343,7 @@ class ModbusGatewayNode(Node):
             phase + "_finished", "SUCCEEDED" if response.accepted else "FAILED", detail
         )
         self.get_logger().info(
-            f"mission_id={request.mission_id} robot_id=amr_01 station={request.station_id} state=TRANSFER_FINISHED error_code={response.error_code}"
+            f"mission_id={request.mission_id} robot_id={request.robot_id} station={request.station_id} state=TRANSFER_FINISHED error_code={response.error_code}"
         )
         return response
 
@@ -205,7 +352,7 @@ def main(args=None):
     rclpy.init(args=args)
     node = None
     # The service owns its group. The default group remains free for /clock.
-    executor = MultiThreadedExecutor(num_threads=2)
+    executor = MultiThreadedExecutor(num_threads=4)
     try:
         node = ModbusGatewayNode()
         executor.add_node(node)
