@@ -1,13 +1,16 @@
 <?xml version="1.0"?>
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 <robot name="factory_amr" xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:arg name="namespace" default=""/>
+  <xacro:arg name="frame_prefix" default=""/>
+  <xacro:property name="prefix" value="$(arg frame_prefix)"/>
   <!-- Burger dimensions and installed description meshes; no hardware drivers. -->
   <material name="dark"><color rgba="0.2 0.2 0.2 1"/></material>
-  <link name="base_footprint"/>
-  <joint name="base_joint" type="fixed">
-    <parent link="base_footprint"/><child link="base_link"/><origin xyz="0 0 0.010"/>
+  <link name="${prefix}base_footprint"/>
+  <joint name="${prefix}base_joint" type="fixed">
+    <parent link="${prefix}base_footprint"/><child link="${prefix}base_link"/><origin xyz="0 0 0.010"/>
   </joint>
-  <link name="base_link">
+  <link name="${prefix}base_link">
     <inertial><origin xyz="-0.032 0 0.070"/><mass value="0.825735"/>
       <inertia ixx="0.002212" ixy="0" ixz="0" iyy="0.002119" iyz="0" izz="0.002006"/></inertial>
     <visual><origin xyz="-0.032 0 0"/><geometry>
@@ -16,11 +19,11 @@
     <collision><origin xyz="-0.032 0 0.070"/><geometry><box size="0.140 0.140 0.140"/></geometry></collision>
   </link>
   <xacro:macro name="wheel" params="side y">
-    <joint name="wheel_${side}_joint" type="continuous">
-      <parent link="base_link"/><child link="wheel_${side}_link"/>
+    <joint name="${prefix}wheel_${side}_joint" type="continuous">
+      <parent link="${prefix}base_link"/><child link="${prefix}wheel_${side}_link"/>
       <origin xyz="0 ${y} 0.023" rpy="-${pi/2} 0 0"/><axis xyz="0 0 1"/>
     </joint>
-    <link name="wheel_${side}_link">
+    <link name="${prefix}wheel_${side}_link">
       <inertial><mass value="0.028499"/>
         <inertia ixx="0.00001118" ixy="0" ixz="0" iyy="0.00001119" iyz="0" izz="0.00002071"/></inertial>
       <visual><origin rpy="${pi/2} 0 0"/><geometry>
@@ -28,67 +31,67 @@
       </geometry><material name="dark"/></visual>
       <collision><geometry><cylinder radius="0.033" length="0.018"/></geometry></collision>
     </link>
-    <gazebo reference="wheel_${side}_link"><mu1>1.0</mu1><mu2>1.0</mu2><kp>100000</kp><kd>1</kd></gazebo>
+    <gazebo reference="${prefix}wheel_${side}_link"><mu1>1.0</mu1><mu2>1.0</mu2><kp>100000</kp><kd>1</kd></gazebo>
   </xacro:macro>
   <xacro:wheel side="left" y="0.08"/>
   <xacro:wheel side="right" y="-0.08"/>
-  <joint name="caster_joint" type="fixed">
-    <parent link="base_link"/><child link="caster_link"/><origin xyz="-0.081 0 0"/>
+  <joint name="${prefix}caster_joint" type="fixed">
+    <parent link="${prefix}base_link"/><child link="${prefix}caster_link"/><origin xyz="-0.081 0 0"/>
   </joint>
-  <link name="caster_link">
+  <link name="${prefix}caster_link">
     <inertial><mass value="0.005"/><inertia ixx="0.00001" ixy="0" ixz="0" iyy="0.00001" iyz="0" izz="0.00001"/></inertial>
     <collision><geometry><sphere radius="0.010"/></geometry></collision>
   </link>
-  <gazebo reference="caster_link"><mu1>0.01</mu1><mu2>0.01</mu2></gazebo>
-  <joint name="scan_joint" type="fixed">
-    <parent link="base_link"/><child link="base_scan"/><origin xyz="-0.032 0 0.172"/>
+  <gazebo reference="${prefix}caster_link"><mu1>0.01</mu1><mu2>0.01</mu2></gazebo>
+  <joint name="${prefix}scan_joint" type="fixed">
+    <parent link="${prefix}base_link"/><child link="${prefix}base_scan"/><origin xyz="-0.032 0 0.172"/>
   </joint>
-  <link name="base_scan">
+  <link name="${prefix}base_scan">
     <inertial><mass value="0.114"/><inertia ixx="0.001" ixy="0" ixz="0" iyy="0.001" iyz="0" izz="0.001"/></inertial>
     <visual><geometry><mesh filename="package://turtlebot3_description/meshes/sensors/lds.stl" scale="0.001 0.001 0.001"/></geometry><material name="dark"/></visual>
   </link>
-  <joint name="imu_joint" type="fixed">
-    <parent link="base_link"/><child link="imu_link"/><origin xyz="-0.032 0 0.068"/>
+  <joint name="${prefix}imu_joint" type="fixed">
+    <parent link="${prefix}base_link"/><child link="${prefix}imu_link"/><origin xyz="-0.032 0 0.068"/>
   </joint>
-  <link name="imu_link"/>
+  <link name="${prefix}imu_link"/>
   <!-- Optical +Z points forward, +X right, +Y down (REP-103). Camera height is 0.35 m. -->
-  <joint name="camera_joint" type="fixed">
-    <parent link="base_link"/><child link="camera_link"/><origin xyz="0.10 0 0.34"/>
+  <joint name="${prefix}camera_joint" type="fixed">
+    <parent link="${prefix}base_link"/><child link="${prefix}camera_link"/><origin xyz="0.10 0 0.34"/>
   </joint>
-  <link name="camera_link">
+  <link name="${prefix}camera_link">
     <inertial><mass value="0.02"/><inertia ixx="0.00001" ixy="0" ixz="0" iyy="0.00001" iyz="0" izz="0.00001"/></inertial>
     <visual><geometry><box size="0.04 0.04 0.04"/></geometry><material name="dark"/></visual>
   </link>
-  <joint name="camera_optical_joint" type="fixed">
-    <parent link="camera_link"/><child link="camera_optical_frame"/><origin rpy="-${pi/2} 0 -${pi/2}"/>
+  <joint name="${prefix}camera_optical_joint" type="fixed">
+    <parent link="${prefix}camera_link"/><child link="${prefix}camera_optical_frame"/><origin rpy="-${pi/2} 0 -${pi/2}"/>
   </joint>
-  <link name="camera_optical_frame"/>
-  <gazebo reference="base_scan">
+  <link name="${prefix}camera_optical_frame"/>
+  <gazebo reference="${prefix}base_scan">
     <sensor name="lidar" type="ray">
       <always_on>true</always_on><update_rate>10</update_rate><visualize>false</visualize>
       <ray><scan><horizontal><samples>360</samples><resolution>1</resolution>
         <min_angle>-${pi}</min_angle><max_angle>${pi}</max_angle></horizontal></scan>
         <range><min>0.12</min><max>12</max><resolution>0.01</resolution></range></ray>
       <plugin name="lidar_ros" filename="libgazebo_ros_ray_sensor.so">
-        <ros><remapping>~/out:=scan</remapping>
+        <ros><namespace>$(arg namespace)</namespace><remapping>~/out:=scan</remapping>
           <qos><topic name="scan"><publisher>
             <reliability>best_effort</reliability><durability>volatile</durability>
             <history depth="5">keep_last</history>
           </publisher></topic></qos>
         </ros>
-        <output_type>sensor_msgs/LaserScan</output_type><frame_name>base_scan</frame_name>
+        <output_type>sensor_msgs/LaserScan</output_type><frame_name>${prefix}base_scan</frame_name>
       </plugin>
     </sensor>
   </gazebo>
-  <gazebo reference="imu_link">
+  <gazebo reference="${prefix}imu_link">
     <sensor name="imu" type="imu">
       <always_on>true</always_on><update_rate>50</update_rate>
       <plugin name="imu_ros" filename="libgazebo_ros_imu_sensor.so">
-        <ros><remapping>~/out:=imu</remapping></ros><frame_name>imu_link</frame_name>
+        <ros><namespace>$(arg namespace)</namespace><remapping>~/out:=imu</remapping></ros><frame_name>${prefix}imu_link</frame_name>
       </plugin>
     </sensor>
   </gazebo>
-  <gazebo reference="camera_link">
+  <gazebo reference="${prefix}camera_link">
     <sensor name="rgb_camera" type="camera">
       <always_on>true</always_on><update_rate>10</update_rate>
       <camera><horizontal_fov>1.3962634</horizontal_fov>
@@ -96,7 +99,7 @@
         <clip><near>0.02</near><far>12</far></clip>
       </camera>
       <plugin name="camera_ros" filename="libgazebo_ros_camera.so">
-        <ros><qos>
+        <ros><namespace>$(arg namespace)</namespace><qos>
           <topic name="camera/image_raw"><publisher>
             <reliability>best_effort</reliability><durability>volatile</durability>
             <history depth="5">keep_last</history>
@@ -106,23 +109,25 @@
             <history depth="5">keep_last</history>
           </publisher></topic>
         </qos></ros>
-        <camera_name>camera</camera_name><frame_name>camera_optical_frame</frame_name>
+        <camera_name>camera</camera_name><frame_name>${prefix}camera_optical_frame</frame_name>
       </plugin>
     </sensor>
   </gazebo>
   <gazebo>
     <plugin name="diff_drive" filename="libgazebo_ros_diff_drive.so">
-      <update_rate>50</update_rate><left_joint>wheel_left_joint</left_joint><right_joint>wheel_right_joint</right_joint>
+      <ros><namespace>$(arg namespace)</namespace><remapping>/tf:=tf</remapping><remapping>/tf_static:=tf_static</remapping></ros>
+      <update_rate>50</update_rate><left_joint>${prefix}wheel_left_joint</left_joint><right_joint>${prefix}wheel_right_joint</right_joint>
       <wheel_separation>0.160</wheel_separation><wheel_diameter>0.066</wheel_diameter>
       <max_wheel_torque>10</max_wheel_torque><max_wheel_acceleration>1.0</max_wheel_acceleration>
       <command_topic>cmd_vel</command_topic><odometry_topic>odom</odometry_topic>
-      <odometry_frame>odom</odometry_frame><robot_base_frame>base_footprint</robot_base_frame>
+      <odometry_frame>${prefix}odom</odometry_frame><robot_base_frame>${prefix}base_footprint</robot_base_frame>
       <!-- Encoder odometry starts at the spawn pose; localization supplies map to odom. -->
       <odometry_source>0</odometry_source>
       <publish_odom>true</publish_odom><publish_odom_tf>true</publish_odom_tf><publish_wheel_tf>false</publish_wheel_tf>
     </plugin>
     <plugin name="joint_states" filename="libgazebo_ros_joint_state_publisher.so">
-      <update_rate>50</update_rate><joint_name>wheel_left_joint</joint_name><joint_name>wheel_right_joint</joint_name>
+      <ros><namespace>$(arg namespace)</namespace></ros>
+      <update_rate>50</update_rate><joint_name>${prefix}wheel_left_joint</joint_name><joint_name>${prefix}wheel_right_joint</joint_name>
     </plugin>
   </gazebo>
 </robot>

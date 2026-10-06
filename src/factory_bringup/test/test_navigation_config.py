@@ -125,7 +125,7 @@ def test_nav2_uses_simulation_frames_and_one_velocity_smoother():
             frame,
             "base_footprint",
         )
-        assert costmap["obstacle_layer"]["scan"]["topic"] == "/scan"
+        assert costmap["obstacle_layer"]["scan"]["topic"] == "scan"
         assert costmap["obstacle_layer"]["scan"]["marking"] is True
         assert costmap["obstacle_layer"]["scan"]["clearing"] is True
     assert (

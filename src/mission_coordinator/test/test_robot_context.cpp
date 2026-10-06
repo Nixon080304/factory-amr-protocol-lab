@@ -43,7 +43,9 @@ TEST(RobotContextTest, FutureRobotUsesSameIdentityAndFrameRules) {
             "floor/warehouse_10/camera_optical_frame");
   EXPECT_EQ(robot.local_frame("floor/warehouse_10/camera_optical_frame"),
             "floor/warehouse_10/camera_optical_frame");
-  EXPECT_EQ(robot.local_frame("map"), "map");
+  EXPECT_EQ(robot.local_frame("map"), "floor/warehouse_10/map");
+  EXPECT_EQ(robot.local_frame("floor/warehouse_10/map"), "floor/warehouse_10/map");
+  EXPECT_EQ(RobotContext("amr_01", "").local_frame("map"), "map");
   EXPECT_EQ(RobotContext("amr_01", "").local_frame("camera_optical_frame"),
             "camera_optical_frame");
 }

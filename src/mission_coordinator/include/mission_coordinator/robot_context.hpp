@@ -39,8 +39,7 @@ struct RobotContext {
   }
 
   std::string local_frame(const std::string &frame) const {
-    if (frame == map_frame ||
-        frame.compare(0, frame_prefix.size(), frame_prefix) == 0) {
+    if (frame.compare(0, frame_prefix.size(), frame_prefix) == 0) {
       return frame;
     }
     return frame_prefix + frame;

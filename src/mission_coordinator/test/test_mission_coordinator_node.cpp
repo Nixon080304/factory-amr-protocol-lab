@@ -153,7 +153,7 @@ protected:
       clock_pub->publish(clock);
       geometry_msgs::msg::PoseWithCovarianceStamped pose;
       pose.header.stamp = stamp;
-      pose.header.frame_id = "map";
+      pose.header.frame_id = robot_id() + "/map";
       pose.pose.pose = target.pose;
       if (!localized) {
         pose.pose.pose.position.x += 3.0;
@@ -354,7 +354,7 @@ TEST_F(SecondCoordinatorTest, ExecutesOnlyItsAssignedRobotAndCorrelatesEvents) {
   auto handle = send("second_robot", "amr_02");
   ASSERT_NE(handle, nullptr);
   EXPECT_TRUE(finish(handle).result->success);
-  EXPECT_EQ(target.header.frame_id, "map");
+  EXPECT_EQ(target.header.frame_id, "amr_02/map");
   ASSERT_EQ(transfers.size(), 2u);
   for (const auto &request : transfers) {
     EXPECT_EQ(request.robot_id, "amr_02");
@@ -717,7 +717,7 @@ TEST_F(CoordinatorTest, StationaryLocalizationWaitsForClockThenRemainsUsable) {
   pump(10, false, false);
   const double source_stamp = sim_time + 0.08;
   geometry_msgs::msg::PoseWithCovarianceStamped pose;
-  pose.header.frame_id = "map";
+  pose.header.frame_id = robot_id() + "/map";
   pose.header.stamp = rclcpp::Time(static_cast<int64_t>(source_stamp * 1e9));
   pose.pose.pose = target.pose;
   pose_pub->publish(pose);

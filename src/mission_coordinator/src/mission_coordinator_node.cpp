@@ -71,17 +71,17 @@ MissionCoordinatorNode::MissionCoordinatorNode(const rclcpp::NodeOptions &option
         const double stamp = rclcpp::Time(message->header.stamp).seconds();
         // A sensor can arrive before the matching /clock update. Keep one
         // current-leg candidate; localized() still forbids future evidence.
-        pose_valid_ = goal_ && stamp >= localization_started_ &&
-                      message->header.frame_id == RobotContext::map_frame &&
-                      std::isfinite(p.position.x) && std::isfinite(p.position.y) &&
-                      std::isfinite(p.position.z) && std::isfinite(p.orientation.x) &&
-                      std::isfinite(p.orientation.y) &&
-                      std::isfinite(p.orientation.z) &&
-                      std::isfinite(p.orientation.w) &&
-                      std::abs(p.orientation.x * p.orientation.x +
-                               p.orientation.y * p.orientation.y +
-                               p.orientation.z * p.orientation.z +
-                               p.orientation.w * p.orientation.w - 1.0) < 0.01;
+        pose_valid_ =
+            goal_ && stamp >= localization_started_ &&
+            message->header.frame_id == robot_.local_frame(RobotContext::map_frame) &&
+            std::isfinite(p.position.x) && std::isfinite(p.position.y) &&
+            std::isfinite(p.position.z) && std::isfinite(p.orientation.x) &&
+            std::isfinite(p.orientation.y) && std::isfinite(p.orientation.z) &&
+            std::isfinite(p.orientation.w) &&
+            std::abs(p.orientation.x * p.orientation.x +
+                     p.orientation.y * p.orientation.y +
+                     p.orientation.z * p.orientation.z +
+                     p.orientation.w * p.orientation.w - 1.0) < 0.01;
         pose_ = p;
         pose_stamp_ = stamp;
       });
@@ -214,7 +214,7 @@ void MissionCoordinatorNode::navigate() {
   localization_started_ = phase_started_;
   auto coordinates = poses_.at(machine_.current_station());
   geometry_msgs::msg::PoseStamped pose;
-  pose.header.frame_id = RobotContext::map_frame;
+  pose.header.frame_id = robot_.local_frame(RobotContext::map_frame);
   pose.header.stamp = now();
   pose.pose.position.x = coordinates[0];
   pose.pose.position.y = coordinates[1];

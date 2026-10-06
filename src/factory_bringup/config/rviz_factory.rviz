@@ -15,26 +15,26 @@ Visualization Manager:
       Name: Factory map
       Enabled: true
       Topic:
-        Value: /map
+        Value: map
         Durability Policy: Transient Local
     - Class: rviz_default_plugins/RobotModel
       Name: AMR
       Enabled: true
       Description Source: Topic
       Description Topic:
-        Value: /robot_description
+        Value: robot_description
         Durability Policy: Transient Local
     - Class: rviz_default_plugins/LaserScan
       Name: Scan
       Enabled: true
       Topic:
-        Value: /scan
+        Value: scan
         Reliability Policy: Best Effort
     - Class: rviz_default_plugins/Path
       Name: Nav2 plan
       Enabled: true
       Topic:
-        Value: /plan
+        Value: plan
     - Class: rviz_default_plugins/TF
       Name: TF
       Enabled: false
@@ -42,7 +42,7 @@ Visualization Manager:
       Name: AMCL localization
       Enabled: true
       Topic:
-        Value: /amcl_pose
+        Value: amcl_pose
         Durability Policy: Transient Local
     - Class: rviz_default_plugins/Map
       Name: Global costmap
@@ -50,7 +50,7 @@ Visualization Manager:
       Alpha: 0.4
       Color Scheme: costmap
       Topic:
-        Value: /global_costmap/costmap
+        Value: global_costmap/costmap
         Durability Policy: Transient Local
     - Class: rviz_default_plugins/Map
       Name: Local costmap
@@ -58,7 +58,7 @@ Visualization Manager:
       Alpha: 0.5
       Color Scheme: costmap
       Topic:
-        Value: /local_costmap/costmap
+        Value: local_costmap/costmap
         Durability Policy: Transient Local
     - Class: rviz_default_plugins/Pose
       Name: Current mission goal
@@ -76,10 +76,10 @@ Visualization Manager:
     - Class: rviz_default_plugins/MoveCamera
     - Class: rviz_default_plugins/SetInitialPose
       Topic:
-        Value: /initialpose
+        Value: initialpose
     - Class: rviz_default_plugins/SetGoal
       Topic:
-        Value: /goal_pose
+        Value: goal_pose
   Views:
     Current:
       Class: rviz_default_plugins/TopDownOrtho

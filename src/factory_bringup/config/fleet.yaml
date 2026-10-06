@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Add each robot here; all fleet consumers iterate over this configuration.
-# Poses are [x, y, yaw] in the shared map frame.
+# Poses are [x, y, yaw] in world coordinates. Each prefixed map uses this same origin.
 robots:
   - robot_id: amr_01
     namespace: /amr_01
