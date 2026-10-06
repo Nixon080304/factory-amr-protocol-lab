@@ -290,6 +290,7 @@ class FleetManagerNode(Node):
                         reply.error_code,
                         reply.message,
                         cancelled=outcome.status == GoalStatus.STATUS_CANCELED,
+                        recovery_required=reply.final_state == "RECOVERY_REQUIRED",
                     )
                 )
             except Exception as error:
@@ -325,6 +326,9 @@ class FleetManagerNode(Node):
             values = self.adapter.resource(operation, request)
         except (ValueError, KeyError) as error:
             values = {"reason": str(error)}
+            if operation == "cancel_wait":
+                # Validation failure is not atomic proof that ownership is absent.
+                values["reconciliation_required"] = True
         for field, value in values.items():
             setattr(response, field, value)
         return response

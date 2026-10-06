@@ -39,6 +39,7 @@ class RobotReply:
     error_code: str = ""
     message: str = ""
     cancelled: bool = False
+    recovery_required: bool = False
 
 
 @dataclass
@@ -373,6 +374,7 @@ class FleetAdapter:
                 reply.error_code,
                 reply.message,
                 cancelled=reply.cancelled,
+                recovery_required=reply.recovery_required,
             ),
             self.clock(),
         )
@@ -433,10 +435,15 @@ class FleetAdapter:
         now = self.clock()
         identity = (request.robot_id, request.mission_id, request.resource_id)
         if operation == "cancel_wait":
-            cancelled = self.resources.cancel_waiter(LeaseRequest(*identity), now)
+            resolution = self.resources.resolve_waiter(LeaseRequest(*identity), now)
             return {
-                "cancelled": cancelled,
-                "reason": "waiter cancelled" if cancelled else "no waiter",
+                "cancelled": resolution.cancelled,
+                "reason": resolution.reason,
+                "lease_id": resolution.lease.lease_id if resolution.lease else "",
+                "lease_ttl_sec": resolution.lease.expires_at - now
+                if resolution.lease
+                else 0.0,
+                "reconciliation_required": resolution.reconciliation_required,
             }
         if (
             operation != "release"

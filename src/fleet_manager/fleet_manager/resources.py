@@ -54,6 +54,14 @@ class ResourceSnapshot:
 
 
 @dataclass(frozen=True)
+class WaiterResolution:
+    cancelled: bool
+    lease: Lease | None
+    reconciliation_required: bool
+    reason: str
+
+
+@dataclass(frozen=True)
 class _Waiter:
     requested_at: float
     sequence: int
@@ -228,16 +236,44 @@ class ResourceManager:
 
     def cancel_waiter(self, request: LeaseRequest, now: float) -> bool:
         """Cancel a queued request without releasing any held lease."""
+        return self.resolve_waiter(request, now).cancelled
+
+    def resolve_waiter(self, request: LeaseRequest, now: float) -> WaiterResolution:
+        """Remove an exact waiter and resolve its ownership under the same lock.
+
+        Automatic handoff may already have granted the request. Return only that
+        request's live lease; never release it or reveal another owner's token.
+        A matching quarantined former owner requires physical reconciliation.
+        """
         self._request(request)
         now = self._time(now)
         with self._lock:
             self._expire(now)
             queue = self._queues[request.resource_id]
+            cancelled = False
             for index, waiter in enumerate(queue):
                 if waiter.request == request:
                     queue.pop(index)
-                    return True
-            return False
+                    cancelled = True
+                    break
+            lease = self._leases.get(request.resource_id)
+            exact = (
+                lease
+                if lease is not None and self._same_request(lease, request)
+                else None
+            )
+            former = self._former.get(request.resource_id)
+            reconciliation = former is not None and self._same_request(former, request)
+            reason = (
+                "reconciliation required"
+                if reconciliation
+                else "exact request owns lease"
+                if exact is not None
+                else "waiter cancelled"
+                if cancelled
+                else "no waiter or ownership"
+            )
+            return WaiterResolution(cancelled, exact, reconciliation, reason)
 
     def expire(self, now: float) -> tuple[Lease, ...]:
         """Fence expired owners; physical occupancy remains uncertain."""

@@ -67,7 +67,12 @@ public:
       });
     case ResourceOperation::CancelWait:
       return dispatch<CancelWait>(cancel_wait, key, callback, [](const auto &r) {
-        return ResourceReply{r.cancelled, "", 0, r.reason};
+        return ResourceReply{r.cancelled,
+                             r.lease_id,
+                             r.lease_ttl_sec,
+                             r.reason,
+                             r.reconciliation_required,
+                             true};
       });
     }
     throw std::invalid_argument("invalid resource operation");

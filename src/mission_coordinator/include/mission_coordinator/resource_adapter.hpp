@@ -14,6 +14,8 @@ struct ResourceReply {
   std::string lease_id;
   double ttl{0};
   std::string reason;
+  bool reconciliation_required{false};
+  bool ownership_resolved{false};
 };
 class ResourceTransport {
 public:
@@ -48,8 +50,10 @@ public:
   void release(const std::string &resource, const std::string &mission,
                std::function<void(bool)> callback);
   // Cancels pending acquisitions and requests cleanup only for proven-safe leases.
-  // False means physical/lease uncertainty remains and requires reconciliation.
+  // False means cleanup is pending or ownership/physical uncertainty remains.
   bool release_all(const std::string &mission);
+  // True only while bounded cleanup/late acquire resolution can still finish.
+  bool cleanup_pending(const std::string &mission) const;
 
 private:
   struct State;

@@ -15,6 +15,7 @@
 #include <factory_interfaces/srv/acquire_resource.hpp>
 #include <factory_interfaces/srv/renew_resource.hpp>
 #include <factory_interfaces/srv/release_resource.hpp>
+#include <factory_interfaces/srv/cancel_resource_wait.hpp>
 #include <factory_interfaces/msg/station_detection.hpp>
 #include <factory_interfaces/msg/protocol_event.hpp>
 #include <std_msgs/msg/string.hpp>
@@ -337,15 +338,30 @@ protected:
           if (response->released)
             owners.erase(request->resource_id);
         });
+    cancel_wait_service =
+        peer->create_service<factory_interfaces::srv::CancelResourceWait>(
+            "/factory/resources/cancel_wait",
+            [this](
+                std::shared_ptr<factory_interfaces::srv::CancelResourceWait::Request>,
+                std::shared_ptr<factory_interfaces::srv::CancelResourceWait::Response>
+                    response) {
+              response->cancelled = !quarantined_cancel;
+              response->reason = quarantined_cancel ? "reconciliation required"
+                                                    : "waiter cancelled; no ownership";
+              response->reconciliation_required = quarantined_cancel;
+            });
     pump(30);
   }
   bool allow_station{false};
+  bool quarantined_cancel{false};
   std::map<std::string, std::string> owners;
   std::vector<std::string> acquired;
   std::vector<factory_interfaces::srv::ReleaseResource::Request> released;
   rclcpp::Service<factory_interfaces::srv::AcquireResource>::SharedPtr acquire_service;
   rclcpp::Service<factory_interfaces::srv::RenewResource>::SharedPtr renew_service;
   rclcpp::Service<factory_interfaces::srv::ReleaseResource>::SharedPtr release_service;
+  rclcpp::Service<factory_interfaces::srv::CancelResourceWait>::SharedPtr
+      cancel_wait_service;
 };
 class TrafficCoordinatorTest : public LeasedCoordinatorTest {
 protected:
@@ -466,6 +482,31 @@ TEST_F(LeasedCoordinatorTest, CanceledUnconfirmedTransferRetainsStationLease) {
   EXPECT_EQ(finish(handle).result->error_code, "MISSION_CANCELED");
   ASSERT_EQ(released.size(), 1u);
   EXPECT_EQ(released[0].resource_id, "assembly");
+}
+TEST_F(LeasedCoordinatorTest, ConfirmedWaiterCancellationFinishesWithoutRecovery) {
+  create_resources();
+  auto handle = send();
+  for (int i = 0; i < 100 && acquired.empty(); ++i)
+    pump();
+  ASSERT_FALSE(acquired.empty());
+  client->async_cancel_goal(handle);
+  auto result = finish(handle);
+  EXPECT_EQ(result.code, rclcpp_action::ResultCode::CANCELED);
+  EXPECT_EQ(result.result->final_state, "FAILED");
+  EXPECT_TRUE(transfers.empty());
+  EXPECT_TRUE(released.empty());
+}
+TEST_F(LeasedCoordinatorTest, QuarantinedWaiterCancellationReportsRecovery) {
+  create_resources();
+  quarantined_cancel = true;
+  auto handle = send();
+  for (int i = 0; i < 100 && acquired.empty(); ++i)
+    pump();
+  ASSERT_FALSE(acquired.empty());
+  client->async_cancel_goal(handle);
+  EXPECT_EQ(finish(handle).result->final_state, "RECOVERY_REQUIRED");
+  EXPECT_TRUE(transfers.empty());
+  EXPECT_TRUE(released.empty());
 }
 
 TEST_F(CoordinatorTest, ValidMissionCompletesWithOrderedFeedbackAndPhases) {

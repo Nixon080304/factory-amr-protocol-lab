@@ -72,6 +72,7 @@ private:
   size_t route_index_{0};
   bool leases_enabled_{false}, waiting_resource_{false}, crossing_resource_{false};
   bool finishing_{false};
+  std::string pending_finish_error_;
   std::string held_resource_;
   std::vector<double> navigation_target_;
   rclcpp_action::Server<Mission>::SharedPtr server_;

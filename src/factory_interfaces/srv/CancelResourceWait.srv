@@ -6,3 +6,6 @@ string resource_id
 ---
 bool cancelled
 string reason
+string lease_id
+float64 lease_ttl_sec
+bool reconciliation_required

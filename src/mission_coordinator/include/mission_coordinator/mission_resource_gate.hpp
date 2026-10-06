@@ -66,6 +66,18 @@ public:
           }
         });
   }
+  void release(const std::string &resource, std::function<void(bool)> continuation) {
+    const auto mission = state_->machine.mission().mission_id;
+    const auto generation = state_->generation;
+    std::weak_ptr<State> weak = state_;
+    state_->resources.release(resource, mission,
+                              [weak, generation, mission, continuation](bool cleared) {
+                                auto state = weak.lock();
+                                if (state && generation == state->generation &&
+                                    state->machine.mission().mission_id == mission)
+                                  continuation(cleared);
+                              });
+  }
   bool cancel() {
     ++state_->generation;
     state_->active.clear();

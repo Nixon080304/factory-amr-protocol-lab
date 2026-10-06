@@ -37,8 +37,11 @@ struct Wire : ResourceTransport {
     return call;
   }
   void answer(bool ok, std::string id = "unguessable-central-token", double ttl = 10,
-              std::string reason = "") {
-    take().callback({ok, std::move(id), ttl, std::move(reason)});
+              std::string reason = "", bool reconciliation = false,
+              bool resolved = true) {
+    auto call = take();
+    call.callback({ok, std::move(id), ttl, std::move(reason), reconciliation,
+                   call.operation == ResourceOperation::CancelWait && resolved});
   }
 };
 struct LeaseTest : testing::Test {
@@ -151,7 +154,7 @@ TEST_F(LeaseTest, ServiceLossRevokesAuthorityBeforeNextEffect) {
 TEST_F(LeaseTest, CancellationFencesLateGrantAndCleansExactSafeLease) {
   acquire();
   auto pending = wire->take();
-  EXPECT_TRUE(adapter.release_all("m1"));
+  EXPECT_FALSE(adapter.release_all("m1"));
   ASSERT_EQ(wire->calls.size(), 1u);
   EXPECT_EQ(wire->calls.front().operation, ResourceOperation::CancelWait);
   EXPECT_TRUE(wire->calls.front().key.lease_id.empty());
@@ -161,6 +164,120 @@ TEST_F(LeaseTest, CancellationFencesLateGrantAndCleansExactSafeLease) {
   EXPECT_EQ(wire->calls.front().key.lease_id, "late-central-token");
   EXPECT_FALSE(adapter.authorized("central_aisle", "m1"));
   EXPECT_EQ(notices.back().state, ResourceState::Cancelled);
+}
+TEST_F(LeaseTest, CancellationResolvesAutomaticHandoffBeforeReportingSafeCleanup) {
+  acquire();
+  wire->answer(false, "", 0, "queued behind owner");
+  EXPECT_FALSE(adapter.release_all("m1"));
+  ASSERT_EQ(wire->calls.size(), 1u);
+  EXPECT_EQ(wire->calls.front().operation, ResourceOperation::CancelWait);
+  wire->answer(false, "auto-handoff-token", 10, "exact request already owns lease");
+  ASSERT_EQ(wire->calls.size(), 1u);
+  EXPECT_EQ(wire->calls.front().operation, ResourceOperation::Release);
+  EXPECT_EQ(wire->calls.front().key.lease_id, "auto-handoff-token");
+  EXPECT_FALSE(adapter.release_all("m1"));
+  wire->answer(true, "", 0, "exact safe lease released");
+  EXPECT_TRUE(adapter.release_all("m1"));
+  EXPECT_FALSE(adapter.authorized("central_aisle", "m1"));
+}
+TEST_F(LeaseTest, CancellationCannotResolveWhileOlderAcquireCanStillQueueOrGrant) {
+  acquire();
+  auto old = wire->take();
+  EXPECT_FALSE(adapter.release_all("m1"));
+  EXPECT_TRUE(adapter.cleanup_pending("m1"));
+  wire->answer(true, "", 0, "no waiter or ownership");
+  EXPECT_FALSE(adapter.release_all("m1"));
+  EXPECT_TRUE(adapter.cleanup_pending("m1"));
+  old.callback({false, "", 0, "late denial queued"});
+  wire->answer(true, "", 0, "late waiter cancelled");
+  EXPECT_FALSE(adapter.cleanup_pending("m1"));
+  EXPECT_TRUE(adapter.release_all("m1"));
+}
+TEST_F(LeaseTest, QuarantinedOrTransportFailedCancellationNeverClaimsClearance) {
+  acquire();
+  wire->answer(false, "", 0, "queued");
+  adapter.release_all("m1");
+  wire->answer(false, "", 0, "quarantined exact request", true);
+  EXPECT_FALSE(adapter.cleanup_pending("m1"));
+  EXPECT_FALSE(adapter.release_all("m1"));
+}
+TEST_F(LeaseTest, QuarantineReplyCannotBeOverwrittenByAnotherCleanupAcknowledgement) {
+  acquire();
+  auto old = wire->take();
+  adapter.release_all("m1");
+  auto cancellation = wire->take();
+  old.callback({true, "late-token", 10, "late grant"});
+  wire->answer(true, "", 0, "released late-token");
+  cancellation.callback({false, "", 0, "quarantined", true, true});
+  EXPECT_FALSE(adapter.release_all("m1"));
+}
+TEST_F(LeaseTest, FailedOwnershipQueryCannotInheritAnotherCleanupAcknowledgement) {
+  for (const bool query_first : {false, true}) {
+    auto transport = std::make_shared<Wire>();
+    ResourceAdapter resources(transport, "cart_10", [this] { return time; });
+    resources.acquire("central_aisle", "m1", [](const auto &) {});
+    auto old = transport->take();
+    resources.release_all("m1");
+    auto cancellation = transport->take();
+    old.callback({true, "late-token", 10, "late grant"});
+    auto fail_query = [&] {
+      cancellation.callback({false, "", 0, "transport response failed", false, false});
+    };
+    if (query_first)
+      fail_query();
+    transport->answer(true, "", 0, "released late-token");
+    if (!query_first)
+      fail_query();
+    EXPECT_FALSE(resources.release_all("m1"));
+  }
+}
+TEST_F(LeaseTest, ExhaustedUnavailableCleanupNeverReturnsSafeCompletion) {
+  acquire();
+  wire->answer(false, "", 0, "queued");
+  wire->ready = false;
+  EXPECT_FALSE(adapter.release_all("m1"));
+  for (unsigned i = 0; i < 20; ++i)
+    advance(0.25);
+  EXPECT_FALSE(adapter.cleanup_pending("m1"));
+  EXPECT_FALSE(adapter.release_all("m1"));
+  EXPECT_TRUE(wire->calls.empty());
+}
+TEST_F(LeaseTest, UnansweredAcquireHasBoundedTerminalRecoveryWithoutSafeCompletion) {
+  acquire();
+  wire->take();
+  adapter.release_all("m1");
+  wire->answer(true, "", 0, "no ownership at cancellation");
+  advance(30);
+  EXPECT_FALSE(adapter.cleanup_pending("m1"));
+  EXPECT_FALSE(adapter.release_all("m1"));
+}
+TEST_F(LeaseTest, ReleaseAcknowledgementCannotAdvanceWhileOlderAcquireIsUnresolved) {
+  acquire();
+  auto old = wire->take();
+  advance(1);
+  advance(0.25);
+  wire->answer(true, "token");
+  bool continuation = false;
+  adapter.release("central_aisle", "m1", [&](bool safe) { continuation = safe; });
+  wire->answer(true, "", 0, "released token");
+  EXPECT_FALSE(continuation);
+  EXPECT_TRUE(adapter.cleanup_pending("m1"));
+  old.callback({true, "new-late-token", 10, "regranted after release"});
+  EXPECT_FALSE(adapter.authorized("central_aisle", "m1"));
+}
+TEST_F(LeaseTest, LateGrantCannotReleaseWhenPhysicalOccupancyIsUncertain) {
+  acquire();
+  auto old = wire->take();
+  advance(1);
+  advance(0.25);
+  wire->answer(true, "token");
+  ASSERT_TRUE(adapter.enter("central_aisle", "m1"));
+  wire->ready = false;
+  adapter.tick();
+  wire->ready = true;
+  old.callback({true, "different-token", 10, "late grant"});
+  EXPECT_TRUE(wire->calls.empty());
+  EXPECT_FALSE(adapter.release_all("m1"));
 }
 TEST_F(LeaseTest, CancellationFromWaitingNoticeCannotDispatchAcquireAfterCleanup) {
   adapter.acquire("central_aisle", "m1", [&](const auto &notice) {
@@ -226,6 +343,46 @@ TEST_F(LeaseTest, StaleGrantDuringRetryMustNotReleaseThePendingIdempotentLease) 
   wire->answer(true, "shared-central-token");
   EXPECT_TRUE(adapter.enter("central_aisle", "m1"));
   EXPECT_TRUE(wire->calls.empty());
+}
+TEST_F(LeaseTest, UnresolvedOldGrantFencesReleaseAndSameResourceReacquisition) {
+  acquire();
+  auto old = wire->take();
+  advance(1);
+  advance(0.25);
+  wire->answer(true, "first-token");
+  adapter.release("central_aisle", "m1", [](bool) {});
+  wire->answer(true);
+  acquire();
+  EXPECT_EQ(notices.back().state, ResourceState::Lost);
+  EXPECT_FALSE(adapter.enter("central_aisle", "m1"));
+  old.callback({true, "late-second-token", 10, "late ownership"});
+  wire->answer(false, "late-second-token", 10, "exact request owns lease");
+  ASSERT_EQ(wire->calls.front().operation, ResourceOperation::Release);
+  EXPECT_EQ(wire->calls.front().key.lease_id, "late-second-token");
+  wire->answer(true);
+  acquire();
+  wire->answer(true, "current-third-token");
+  ASSERT_TRUE(adapter.enter("central_aisle", "m1"));
+  EXPECT_TRUE(wire->calls.empty());
+  EXPECT_TRUE(adapter.authorized("central_aisle", "m1"));
+}
+TEST_F(LeaseTest, ExhaustedAcquireCancelsDenialArrivingAfterItsCleanup) {
+  acquire();
+  auto old = wire->take();
+  for (unsigned i = 0; i < 120; ++i) {
+    advance(1);
+    if (notices.back().state == ResourceState::Lost)
+      break;
+    advance(0.25);
+    wire->take();
+  }
+  ASSERT_EQ(notices.back().state, ResourceState::Lost);
+  ASSERT_EQ(wire->calls.size(), 1u);
+  EXPECT_EQ(wire->calls.front().operation, ResourceOperation::CancelWait);
+  wire->answer(true, "", 0, "no ownership");
+  old.callback({false, "", 0, "late request queued"});
+  ASSERT_EQ(wire->calls.size(), 1u);
+  EXPECT_EQ(wire->calls.front().operation, ResourceOperation::CancelWait);
 }
 TEST_F(LeaseTest, CancelledMissionCannotReacquireAndRaceItsLateCleanup) {
   acquire();
@@ -409,4 +566,27 @@ TEST(ResourceMissionContract, ServiceLossBetweenGrantNoticeAndEffectReportsRecov
   wire->answer(true);
   EXPECT_EQ(effects, 0u);
   EXPECT_EQ(last, ResourceState::Lost);
+}
+
+TEST(ResourceMissionContract, CancellationFencesAlreadyPendingReleaseContinuation) {
+  double time = 100;
+  auto wire = std::make_shared<Wire>();
+  ResourceAdapter resources(wire, "cart_10", [&] { return time; });
+  MissionStateMachine machine;
+  machine.start({"cancel-release", "cart_10", "assembly", "inspection", "motor"});
+  machine.begin_navigation();
+  MissionResourceGate gate(resources, machine);
+  gate.acquire(
+      "central_aisle", [] {}, [](const auto &) {});
+  wire->answer(true, "token");
+  resources.exited("central_aisle", "cancel-release");
+  unsigned next_goals = 0;
+  gate.release("central_aisle", [&](bool cleared) {
+    if (cleared)
+      ++next_goals;
+  });
+  machine.cancel();
+  gate.cancel();
+  wire->answer(true, "", 0, "exact release acknowledged");
+  EXPECT_EQ(next_goals, 0u);
 }

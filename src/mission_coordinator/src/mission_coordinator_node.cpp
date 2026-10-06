@@ -398,21 +398,19 @@ void MissionCoordinatorNode::navigation_arrived() {
       const auto generation = mission_generation_;
       resources_.exited(segment.resource, machine_.mission().mission_id);
       waiting_resource_ = true;
-      resources_.release(segment.resource, machine_.mission().mission_id,
-                         [this, generation](bool cleared) {
-                           if (!goal_ || generation != mission_generation_ ||
-                               finishing_)
-                             return;
-                           if (!cleared) {
-                             restart_required_ = true;
-                             finish("RESOURCE_RELEASE_FAILED");
-                             return;
-                           }
-                           held_resource_.clear();
-                           waiting_resource_ = crossing_resource_ = false;
-                           ++route_index_;
-                           navigate();
-                         });
+      resource_gate_.release(segment.resource, [this, generation](bool cleared) {
+        if (!goal_ || generation != mission_generation_ || finishing_)
+          return;
+        if (!cleared) {
+          restart_required_ = true;
+          finish("RESOURCE_RELEASE_FAILED");
+          return;
+        }
+        held_resource_.clear();
+        waiting_resource_ = crossing_resource_ = false;
+        ++route_index_;
+        navigate();
+      });
     }
   } else
     verify_station();
@@ -728,8 +726,7 @@ void MissionCoordinatorNode::transfer_effect() {
         }
         waiting_resource_ = true;
         resources_.exited(held_resource_, machine_.mission().mission_id);
-        resources_.release(held_resource_, machine_.mission().mission_id,
-                           continue_mission);
+        resource_gate_.release(held_resource_, continue_mission);
       } else
         continue_mission(true);
     });
@@ -747,6 +744,11 @@ void MissionCoordinatorNode::transfer_effect() {
 void MissionCoordinatorNode::tick() {
   resources_.tick();
   if (!goal_) {
+    return;
+  }
+  if (finishing_) {
+    if (!resources_.cleanup_pending(machine_.mission().mission_id))
+      finish(pending_finish_error_);
     return;
   }
   if (!deferred_error_.empty()) {
@@ -787,6 +789,11 @@ void MissionCoordinatorNode::finish(const std::string &error) {
   }
   finishing_ = true;
   const bool safe_cleanup = resource_gate_.cancel();
+  navigation_.cancel();
+  if (!safe_cleanup && resources_.cleanup_pending(machine_.mission().mission_id)) {
+    pending_finish_error_ = error;
+    return;
+  }
   const bool recovery =
       leases_enabled_ && (!safe_cleanup || error == "RESOURCE_LEASE_LOST" ||
                           error == "RESOURCE_RELEASE_FAILED");
@@ -825,6 +832,7 @@ void MissionCoordinatorNode::finish(const std::string &error) {
   pose_valid_ = false;
   navigation_completed_ = false;
   waiting_resource_ = crossing_resource_ = finishing_ = false;
+  pending_finish_error_.clear();
   active_route_.clear();
   route_index_ = 0;
   held_resource_.clear();

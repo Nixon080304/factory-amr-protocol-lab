@@ -43,6 +43,7 @@ class RobotMissionResult:
     message: str = ""
     payload_ownership: PayloadOwnership | None = None
     cancelled: bool = False
+    recovery_required: bool = False
 
 
 @dataclass(frozen=True)
@@ -284,6 +285,7 @@ class FleetCore:
             ownership = _ownership(record, result.payload_ownership)
         if (
             not result.success
+            and not result.recovery_required
             and result.error_code == "ROBOT_OFFLINE"
             and self._registry.get(result.robot_id, now).health == RobotHealth.OFFLINE
         ):
@@ -297,13 +299,24 @@ class FleetCore:
                 )
             self.handle_robot_offline(result.robot_id, now)
             return self._journal.get(mission_id)
-        target = MissionState.COMPLETED if result.success else MissionState.FAILED
-        if not result.success and self._cancellation_requested(record):
+        success = result.success and not result.recovery_required
+        target = (
+            MissionState.RECOVERY_REQUIRED
+            if result.recovery_required
+            else MissionState.COMPLETED
+            if success
+            else MissionState.FAILED
+        )
+        if (
+            not success
+            and not result.recovery_required
+            and self._cancellation_requested(record)
+        ):
             if ownership != PayloadOwnership.NOT_PICKED_UP:
                 target = MissionState.RECOVERY_REQUIRED
             elif result.cancelled:
                 target = MissionState.CANCELLED
-        if result.success:
+        if success:
             ownership = PayloadOwnership.DELIVERED
         return self._journal.transition(
             mission_id,
@@ -314,7 +327,7 @@ class FleetCore:
                 "result": self._result(
                     record,
                     target,
-                    result.success,
+                    success,
                     result.error_code or ("CANCELLED" if result.cancelled else ""),
                     result.message,
                 ),

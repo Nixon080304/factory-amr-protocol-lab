@@ -79,6 +79,40 @@ def test_acquire_creates_immutable_finite_lease_and_idempotent_retry():
         snapshots[0].capacity = 2
 
 
+def test_cancel_resolution_atomically_reports_exact_auto_handoff_without_release(
+    api, manager
+):
+    owner = manager.acquire(request(api), 100).lease
+    waiter = request(api, "r2", "cancelled")
+    assert not manager.acquire(waiter, 101).granted
+    assert manager.release(key(api, owner), 102)
+    resolver = getattr(manager, "resolve_waiter", None)
+    assert resolver is not None, "atomic cancellation ownership resolution missing"
+    resolution = resolver(waiter, 102)
+    assert not resolution.cancelled
+    assert resolution.lease is not None
+    assert resolution.lease.robot_id == "r2"
+    assert resolution.lease.mission_id == "cancelled"
+    assert manager.snapshot(102)[0].lease == resolution.lease
+    assert resolver(request(api, "r3", "other"), 102).lease is None
+    assert manager.release(key(api, resolution.lease), 102)
+    assert manager.snapshot(102)[0].lease is None
+
+
+def test_cancel_resolution_reports_matching_quarantine_without_exposing_foreign_token(
+    api, manager
+):
+    manager.acquire(request(api), 100)
+    resolver = getattr(manager, "resolve_waiter", None)
+    assert resolver is not None, "atomic cancellation ownership resolution missing"
+    resolution = resolver(request(api), 110)
+    assert resolution.reconciliation_required
+    assert resolution.lease is None
+    foreign = resolver(request(api, "r2", "m2"), 110)
+    assert foreign.lease is None
+    assert not foreign.reconciliation_required
+
+
 def test_queue_orders_time_then_robot_then_stable_insertion(api, manager):
     held = manager.acquire(request(api), 0.0).lease
     requests = (

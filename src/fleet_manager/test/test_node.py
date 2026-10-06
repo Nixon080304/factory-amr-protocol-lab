@@ -94,6 +94,25 @@ def test_cancel_wait_ros_handler_preserves_typed_result_and_offline_cleanup(rig)
     assert adapter.resources.snapshot(now[0])[0].lease.robot_id == "amr_01"
 
 
+def test_failed_cancel_wait_handler_never_reports_no_ownership_proof(rig):
+    from types import SimpleNamespace
+    from factory_interfaces.srv import CancelResourceWait
+    from fleet_manager.node import FleetManagerNode
+
+    _, adapter, _, _, _ = rig
+    response = FleetManagerNode._resource(
+        SimpleNamespace(adapter=adapter),
+        "cancel_wait",
+        CancelResourceWait.Request(
+            robot_id="unknown", mission_id="m1", resource_id="assembly"
+        ),
+        CancelResourceWait.Response(),
+    )
+    assert response.reconciliation_required
+    assert not response.cancelled
+    assert response.lease_id == ""
+
+
 def dispatch(rig, mission_id="m1", pin=None):
     _, adapter, _, robots, _ = rig
     adapter.submit(request(mission_id, pin))
@@ -442,6 +461,77 @@ def test_ros_terminal_status_preserves_typed_cancellation_outcome(rig, status, w
     assert journal.get("m1").result["error_code"] == (
         "CANCELLED" if status == 5 else ""
     )
+
+
+@pytest.mark.parametrize(
+    "error_code", ["RESOURCE_LEASE_LOST", "RESOURCE_RELEASE_FAILED"]
+)
+def test_ros_resource_recovery_result_retains_robot_reservation_before_pickup(
+    rig, error_code
+):
+    from factory_interfaces.action import ExecuteFactoryMission
+    from fleet_manager.node import FleetManagerNode
+    from rclpy.task import Future
+    from types import SimpleNamespace
+
+    _, adapter, journal, robots, _ = rig
+    response, completed = Future(), Future()
+    node = object.__new__(FleetManagerNode)
+    node.actions = {
+        "amr_01": SimpleNamespace(
+            server_is_ready=lambda: True,
+            send_goal_async=lambda *args, **kwargs: response,
+        )
+    }
+    robots.send_goal = node.send_goal
+    adapter.submit(request(pin="amr_01"))
+    adapter.tick()
+    adapter.tick()
+    response.set_result(
+        SimpleNamespace(accepted=True, get_result_async=lambda: completed)
+    )
+    adapter.tick()
+    completed.set_result(
+        SimpleNamespace(
+            status=6,
+            result=ExecuteFactoryMission.Result(
+                success=False,
+                final_state="RECOVERY_REQUIRED",
+                error_code=error_code,
+            ),
+        )
+    )
+    adapter.tick()
+    record = journal.get("m1")
+    assert record.state == "RECOVERY_REQUIRED"
+    assert record.payload_ownership == "NOT_PICKED_UP"
+    assert record.result["final_state"] == "RECOVERY_REQUIRED"
+    assert record.result["assigned_robot_id"] == "amr_01"
+    assert record in journal.load_active()
+    assert robots.statuses[-1][0].result["final_state"] == "RECOVERY_REQUIRED"
+    # Exercise the actual fleet action conversion and MQTT result consumer too.
+    from mqtt_gateway.node import MqttGatewayNode
+
+    handle = SimpleNamespace(abort=lambda: None, is_cancel_requested=False)
+    node._results = {id(handle): record}
+    fleet_reply = node._execute(handle)
+    assert fleet_reply.final_state == "RECOVERY_REQUIRED"
+    published = []
+    gateway = SimpleNamespace(
+        assigned_robots={}, publish_status=lambda *args: published.append(args)
+    )
+    mqtt_future = Future()
+    mqtt_future.set_result(SimpleNamespace(result=fleet_reply))
+    MqttGatewayNode._result(
+        gateway, SimpleNamespace(mission_id="m1", dropoff="inspection"), mqtt_future
+    )
+    assert published[0][1] == "RECOVERY_REQUIRED"
+    assert published[0][-1] == error_code
+    assert gateway.assigned_robots["m1"] == "amr_01"
+    adapter.submit(request("m2", pin="amr_01"))
+    adapter.tick()
+    adapter.tick()
+    assert journal.get("m2").assigned_robot_id is None
 
 
 def test_cancellation_persistence_failure_sends_no_robot_cancel(rig, tmp_path):

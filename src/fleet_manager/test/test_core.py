@@ -75,6 +75,22 @@ def result(api, decision, success=True, **changes):
     )
 
 
+def test_explicit_robot_recovery_overrides_pre_pickup_offline_reassignment(fleet):
+    api, core, journal, registry, *_ = fleet
+    decision, _ = assigned(fleet)
+    outcome = core.record_robot_result(
+        "m1",
+        result(
+            api, decision, False, error_code="ROBOT_OFFLINE", recovery_required=True
+        ),
+        110,
+    )
+    assert registry.get(decision.robot_id, 110).health == "OFFLINE"
+    assert outcome.state == "RECOVERY_REQUIRED"
+    assert outcome in journal.load_active()
+    assert core.assign("m1", ESTIMATES, 110).robot_id is None
+
+
 @pytest.mark.parametrize("pin,want", [(None, "r1"), ("r2", "r2")])
 def test_assignment_decision_is_durable_before_external_goal_can_start(
     fleet, pin, want
