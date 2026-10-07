@@ -50,6 +50,63 @@ def start(rig_):
     assert controller.start(80, feedback.append, results.append)
 
 
+@pytest.mark.parametrize("event", ["shutdown", "timeout", "health_loss", "cancel"])
+def test_throwing_navigation_cancel_always_finalizes_conservatively(event):
+    r = rig()
+    agent, wall, wire, results, _, controller = r
+
+    def broken_cancel():
+        raise RuntimeError("action client destroyed")
+
+    original = wire.navigate
+    wire.navigate = lambda *args: (original(*args), broken_cancel)[1]
+    start(r)
+    if event == "shutdown":
+        controller.shutdown()
+    elif event == "cancel":
+        controller.cancel()
+    elif event == "health_loss":
+        agent.odometry(2, float("nan"), 0, agent.frame_prefix + "odom")
+        controller.tick()
+    else:
+        wall[0] = controller._nav_deadline
+        agent.odometry(2, 0, 0, agent.frame_prefix + "odom")
+        agent.localization(2, 0, -3, 0, agent.frame_prefix + "map")
+        controller.tick()
+    assert not controller.active and controller.state == "RECOVERY_REQUIRED"
+    assert agent.mode == "RECOVERY_REQUIRED"
+    assert len(results) == 1 and not results[0].success
+    assert "action client destroyed" in results[0].message
+    assert not controller.can_start()
+
+
+@pytest.mark.parametrize(
+    "evidence", ["invalid_odom", "wrong_frame", "odom_jump", "invalid_pose"]
+)
+def test_invalid_health_evidence_stops_charge_at_exact_receipt_boundary(evidence):
+    r = rig()
+    enter(r)
+    agent, wall, _, results, _, controller = r
+    controller.contact(True)
+    wall[0] += 0.2
+    if evidence == "invalid_pose":
+        assert not agent.localization(
+            4, float("nan"), -3, 0, agent.frame_prefix + "map"
+        )
+    else:
+        values = {
+            "invalid_odom": (4, float("nan"), 0, agent.frame_prefix + "odom"),
+            "wrong_frame": (4, 0, 0, "wrong/odom"),
+            "odom_jump": (4, 1000, 0, agent.frame_prefix + "odom"),
+        }
+        assert not agent.odometry(*values[evidence])
+    assert agent.energy.battery_percent == pytest.approx(20.1998, abs=1e-9)
+    wall[0] += 0.5
+    controller.tick()
+    assert agent.energy.battery_percent == pytest.approx(20.1993, abs=1e-9)
+    assert agent.mode == "RECOVERY_REQUIRED" and len(results) == 1
+
+
 def arrive(rig_, index, pose):
     agent, wall, wire, *_, controller = rig_
     stamp = agent._pose_stamp + 1
@@ -90,6 +147,20 @@ def test_stage_without_lease_then_wait_before_entering():
     assert wire.requests[-1][1].resource_id == "charger"
 
 
+def test_cancel_at_shared_staging_clears_pose_before_reporting_safe_completion():
+    r = rig()
+    stage(r)
+    agent, _, wire, results, _, controller = r
+    wire.reply(granted=False, lease_id="", lease_ttl_sec=0.0)
+    controller.cancel()
+    wire.reply(lease_id="", lease_ttl_sec=0.0, reconciliation_required=False)
+    assert not results and agent.mode == "DOCKING"
+    assert wire.moves[-1][0] == (0, -3, 0)
+    assert not controller.key.lease_id
+    arrive(r, 1, (0, -3, 0))
+    assert results[0].error_code == "CANCELLED" and agent.mode == "AVAILABLE"
+
+
 def test_charge_requires_contact_pose_and_current_lease_then_verified_exit():
     r = rig()
     enter(r)
@@ -104,9 +175,9 @@ def test_charge_requires_contact_pose_and_current_lease_then_verified_exit():
     wall[0] += 0.6
     controller.contact(True)
     assert controller.state == "EXITING" and not results
-    assert wire.moves[-1][0] == (2, -3, 0)
+    assert wire.moves[-1][0] == (0, -3, 0)
     assert all(operation != "release" for operation, _, _ in wire.requests)
-    arrive(r, 2, (2, -3, 0))
+    arrive(r, 2, (0, -3, 0))
     assert wire.requests[-1][0] == "release"
     assert wire.requests[-1][1].lease_id == "lease-1"
     wire.reply(released=True)
@@ -131,8 +202,8 @@ def test_cancel_resolves_waiter_and_releases_only_after_safe_exit(when):
     controller.cancel()
     if when == "docked":
         assert agent.mode == "DOCKING" and not results
-        assert wire.moves[-1][0] == (2, -3, 0)
-        arrive(r, 2, (2, -3, 0))
+        assert wire.moves[-1][0] == (0, -3, 0)
+        arrive(r, 2, (0, -3, 0))
         wire.reply(released=True)
     elif when == "staging":
         # A cancellation acknowledgement must prove that navigation stopped.
@@ -152,6 +223,8 @@ def test_cancel_resolves_waiter_and_releases_only_after_safe_exit(when):
             wire.reply(released=True)
         else:
             wire.reply(lease_id="", lease_ttl_sec=0.0, reconciliation_required=False)
+        assert not results and agent.mode == "DOCKING"
+        arrive(r, 1, (0, -3, 0))
     assert len(results) == 1 and results[0].error_code == "CANCELLED"
     assert agent.mode == "AVAILABLE"
 
@@ -303,8 +376,8 @@ def test_cancel_during_entry_waits_for_navigation_stop_before_exit():
     controller.cancel()
     assert wire.cancelled == [1] and len(wire.moves) == 2 and not results
     wire.moves[1][2](False, "cancelled")
-    assert len(wire.moves) == 3 and wire.moves[-1][0] == (2, -3, 0)
-    arrive(r, 2, (2, -3, 0))
+    assert len(wire.moves) == 3 and wire.moves[-1][0] == (0, -3, 0)
+    arrive(r, 2, (0, -3, 0))
     wire.reply(released=True)
     assert results[0].error_code == "CANCELLED" and agent.mode == "AVAILABLE"
 
@@ -328,7 +401,7 @@ def test_release_failure_never_makes_robot_available():
     enter(r)
     agent, _, wire, results, _, controller = r
     controller.cancel()
-    arrive(r, 2, (2, -3, 0))
+    arrive(r, 2, (0, -3, 0))
     wire.reply(released=False)
     assert results[0].error_code == "RELEASE_FAILED"
     assert agent.mode == "RECOVERY_REQUIRED"
@@ -349,6 +422,8 @@ def test_multiple_late_acquires_of_same_identity_release_only_once():
     assert not results
     second(SimpleNamespace(granted=True, lease_id="same", lease_ttl_sec=10.0))
     assert len([call for call in wire.requests if call[0] == "release"]) == 1
+    assert not results
+    arrive(r, 1, (0, -3, 0))
     assert results[0].error_code == "CANCELLED" and agent.mode == "AVAILABLE"
 
 

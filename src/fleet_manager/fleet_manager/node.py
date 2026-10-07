@@ -2,6 +2,7 @@
 """ROS transport for durable fleet orchestration."""
 
 from pathlib import Path
+from dataclasses import replace
 
 from ament_index_python.packages import get_package_share_directory
 from action_msgs.msg import GoalStatus
@@ -48,6 +49,16 @@ def _request(goal):
     )
 
 
+def manager_config(fleet_file, legacy_single_robot=False):
+    """V1 simulation has one root-frame robot; normal fleet stays unchanged."""
+    if type(legacy_single_robot) is not bool:
+        raise ValueError("legacy_single_robot must be bool")
+    config = load_fleet_config(fleet_file)
+    if legacy_single_robot:
+        config = replace(config, robots=(replace(config.robots[0], frame_prefix=""),))
+    return config
+
+
 class FleetManagerNode(Node):
     """Run with a SingleThreadedExecutor: SQLite belongs to its creating thread.
 
@@ -73,7 +84,9 @@ class FleetManagerNode(Node):
             ).value
         ).expanduser()
         journal_path.parent.mkdir(parents=True, exist_ok=True)
-        config = load_fleet_config(fleet_file)
+        config = manager_config(
+            fleet_file, self.declare_parameter("legacy_single_robot", False).value
+        )
         self.protocol_group = MutuallyExclusiveCallbackGroup()
         self._waiters = {}
         self._results = {}
@@ -107,7 +120,7 @@ class FleetManagerNode(Node):
                     callback_group=self.protocol_group,
                 )
             )
-        self.services = [
+        self.resource_services = [
             self.create_service(
                 service,
                 f"/factory/resources/{operation}",

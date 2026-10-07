@@ -66,7 +66,7 @@ def create_ros_robot(context, robot_id, namespace, cost=1.0, *, cost_available=T
     node.goals = []
     node.finish = True
     node.stage = "NAVIGATING_TO_DROPOFF"
-    node.active = set()
+    node.active = {}
     publisher = node.create_publisher(RobotState, "factory/robot_state", 10)
 
     def heartbeat():
@@ -78,11 +78,11 @@ def create_ros_robot(context, robot_id, namespace, cost=1.0, *, cost_available=T
             payload_state="EMPTY",
         )
         if node.active:
-            handle = next(iter(node.active))
+            handle = next(iter(node.active.values()))
             message.mission_id = handle.request.mission_id
-        for handle in tuple(node.active):
+        for handle in tuple(node.active.values()):
             if node.finish or handle.is_cancel_requested:
-                node.active.remove(handle)
+                del node.active[id(handle)]
                 handle.execute()
         message.pose.orientation.w = 1.0
         publisher.publish(message)
@@ -102,7 +102,7 @@ def create_ros_robot(context, robot_id, namespace, cost=1.0, *, cost_available=T
 
     def accepted(handle):
         node.goals.append(handle.request)
-        node.active.add(handle)
+        node.active[id(handle)] = handle
         handle.publish_feedback(
             ExecuteFactoryMission.Feedback(
                 state=node.stage,

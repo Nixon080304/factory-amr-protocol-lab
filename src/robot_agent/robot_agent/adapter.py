@@ -164,6 +164,8 @@ class AgentAdapter:
         _, target, tolerance, yaw_tolerance = self._dock_geometry
         return (
             self._dock_contact
+            and self._odom_receipt is not None
+            and self._pose_receipt is not None
             and self.pose is not None
             and math.hypot(self.pose[0] - target[0], self.pose[1] - target[1])
             <= tolerance
@@ -176,8 +178,13 @@ class AgentAdapter:
         elapsed = max(0.0, now - self._wall)
         # Split at authorization expiry so a long timer gap cannot charge past it.
         deadline = min(self._lease_until, self._dock_contact_until)
-        if self._dock_geometry and self._odom_receipt is not None:
-            deadline = min(deadline, self._odom_receipt + self.stale_sec)
+        if self._dock_geometry:
+            deadline = min(
+                deadline,
+                self._odom_receipt + self.stale_sec
+                if self._odom_receipt is not None
+                else self._wall,
+            )
         authorized = min(elapsed, max(0.0, deadline - self._wall))
         self.energy.advance(
             authorized, 0, self.mode, lease_valid=True, contact=self.charge_authorized()

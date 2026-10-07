@@ -77,3 +77,48 @@ def test_demo_routes_gateway_through_fleet_and_configured_robot(
         "/compute_path_to_pose",
     ) in agent.expanded_remapping_rules
     assert ("navigate_to_pose", "/navigate_to_pose") in agent.expanded_remapping_rules
+    sensor = nodes.get("factory_simulation")
+    assert sensor is not None, "V1 demo requires independent simulation dock contact"
+    sensor._perform_substitutions(context)
+    assert sensor.expanded_node_namespace == namespace
+    sensor_values = evaluate_parameters(context, sensor._Node__parameters)[0]
+    assert sensor_values["entity_name"] == "factory_amr"
+    assert sensor_values["dock_id"] == "dock_01"
+    assert sensor_values["charging_pose"] == (4.0, -2.0, 0.0)
+
+
+def test_fleet_contact_publishers_follow_configured_namespaces_and_dock(monkeypatch):
+    from factory_bringup import fleet_launch
+    from fleet_manager.config import load_fleet_config
+    from dataclasses import replace
+
+    package = Path(__file__).resolve().parents[1]
+    monkeypatch.setattr(
+        fleet_launch,
+        "get_package_share_directory",
+        lambda name: str(package.parent / name),
+    )
+    config = load_fleet_config(package / "config/fleet.yaml")
+    config = replace(
+        config,
+        robots=tuple(
+            replace(robot, namespace="/warehouse/" + robot.robot_id)
+            for robot in config.robots
+        ),
+    )
+    nodes = [
+        node
+        for node in fleet_launch.fleet_launch_actions(config, gui="false", rviz="false")
+        if isinstance(node, Node) and node.node_package == "factory_simulation"
+    ]
+    assert len(nodes) == len(config.robots)
+    context = LaunchContext()
+    for node, robot in zip(nodes, config.robots):
+        node._perform_substitutions(context)
+        assert node.expanded_node_namespace == robot.namespace
+        values = evaluate_parameters(context, node._Node__parameters)[0]
+        assert (
+            values["entity_name"] == robot.robot_id
+            and values["dock_id"] == config.energy.dock_id
+        )
+        assert values["charging_pose"] == (4.0, -2.0, 0.0)

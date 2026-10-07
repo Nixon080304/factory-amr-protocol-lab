@@ -219,17 +219,37 @@ class DockTransport:
         if not self.navigation.server_is_ready():
             callback(False, "navigation unavailable")
             return lambda: None
-        handle, cancelled, finished = None, False, False
+        handle, cancelled, finished, stopped = None, False, False, False
 
-        def complete(success, reason):
-            nonlocal finished
+        def cancel():
+            nonlocal cancelled
+            if not cancelled and not stopped:
+                cancelled = True
+                if handle is not None and handle.accepted:
+                    handle.cancel_goal_async()
+
+        def complete(success, reason, terminal=True):
+            nonlocal finished, stopped
             if not finished:
                 finished = True
-                callback(success, reason)
+                stopped = terminal
+                if not terminal:
+                    try:
+                        cancel()
+                    except Exception as error:
+                        reason += "; cancel failed: " + str(error)
+                callback(success, reason, terminal)
 
         def result(future):
             try:
                 status = future.result().status
+                if status not in (
+                    GoalStatus.STATUS_SUCCEEDED,
+                    GoalStatus.STATUS_CANCELED,
+                    GoalStatus.STATUS_ABORTED,
+                ):
+                    complete(False, "navigation result is not terminal", False)
+                    return
                 complete(
                     not cancelled and status == GoalStatus.STATUS_SUCCEEDED,
                     "navigation cancelled"
@@ -239,7 +259,7 @@ class DockTransport:
                     else "navigation failed",
                 )
             except Exception as error:
-                complete(False, str(error))
+                complete(False, str(error), False)
 
         def accepted(future):
             nonlocal handle
@@ -252,7 +272,7 @@ class DockTransport:
                     handle.cancel_goal_async()
                 handle.get_result_async().add_done_callback(result)
             except Exception as error:
-                complete(False, str(error))
+                complete(False, str(error), False)
 
         future = self.navigation.send_goal_async(
             NavigateToPose.Goal(
@@ -260,13 +280,6 @@ class DockTransport:
             )
         )
         future.add_done_callback(accepted)
-
-        def cancel():
-            nonlocal cancelled
-            if not cancelled and not finished:
-                cancelled = True
-                if handle is not None and handle.accepted:
-                    handle.cancel_goal_async()
 
         return cancel
 

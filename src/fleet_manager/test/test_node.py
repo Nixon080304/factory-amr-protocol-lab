@@ -44,6 +44,40 @@ def request(mission_id="m1", pin=None):
     return MissionRequest(mission_id, "assembly", "inspection", "motor", pin)
 
 
+def test_real_ros_legacy_fleet_constructor_has_one_matching_robot(tmp_path):
+    import rclpy
+    from rclpy.context import Context
+    from rclpy.parameter import Parameter
+    from fleet_manager.node import FleetManagerNode
+
+    context = Context()
+    rclpy.init(context=context, domain_id=79)
+    node = None
+    try:
+        node = FleetManagerNode(
+            context=context,
+            parameter_overrides=[
+                Parameter(
+                    "fleet_file",
+                    value=str(
+                        Path(__file__).resolve().parents[2]
+                        / "factory_bringup/config/fleet.yaml"
+                    ),
+                ),
+                Parameter("journal_path", value=str(tmp_path / "legacy.sqlite3")),
+                Parameter("legacy_single_robot", value=True),
+            ],
+        )
+        assert len(node.adapter.config.robots) == 1
+        robot = node.adapter.config.robots[0]
+        assert robot.frame_prefix == "" and set(node.docks) == {robot.robot_id}
+        assert len(tuple(node.services)) >= 4
+    finally:
+        if node is not None:
+            node.destroy_node()
+        context.shutdown()
+
+
 def test_charging_action_endpoint_uses_configured_namespace(rig):
     api, adapter, *_ = rig
     robot = replace(
@@ -157,7 +191,7 @@ def test_safe_dock_cancel_releases_fleet_reservation_and_fences_late_callback(ri
     assert adapter.core.charging_snapshot() == ()
 
 
-def test_shared_staging_admits_next_robot_only_after_head_confirms_charging(rig):
+def test_shared_staging_admits_next_robot_only_after_head_confirms_exit(rig):
     from types import SimpleNamespace
 
     api, adapter, _, robots, _ = rig
@@ -184,6 +218,13 @@ def test_shared_staging_admits_next_robot_only_after_head_confirms_charging(rig)
     adapter.tick()
     assert len(goals) == 1
     goals[0].feedback(api.RobotFeedback("CHARGING"))
+    adapter.tick()
+    assert len(goals) == 1
+    goals[0].feedback(api.RobotFeedback("EXITING"))
+    adapter.tick()
+    assert len(goals) == 1
+    goals[0].result(api.RobotReply(True))
+    adapter.observe(RobotSnapshot("amr_01", "AVAILABLE", Pose2D(0, -3, 0), 80, "EMPTY"))
     adapter.tick()
     assert [goal.robot_id for goal in goals] == ["amr_01", "amr_02"]
 

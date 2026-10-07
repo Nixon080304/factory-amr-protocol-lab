@@ -249,9 +249,9 @@ class FleetAdapter:
             if (
                 charge.robot_id not in self._dock_flights
                 and charge.state == "CHARGE_QUEUED"
-                and (predecessor is None or predecessor.state == "CHARGING")
+                and predecessor is None
             ):
-                # One shared staging pose must be vacated before its next arrival.
+                # Serialize the whole cycle, including verified exit and release.
                 # Reserving all queued robots still fences mission assignment.
                 self._start_charging(charge)
             previous[charge.dock_id] = charge

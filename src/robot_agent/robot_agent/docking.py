@@ -105,6 +105,7 @@ class DockingController:
         self._nav_cancel, self._nav_done = None, False
         self._nav_sequence = 0
         self._contact, self._contact_until = False, 0.0
+        self.exit_pose = None
         self._next = 0.0
         self._feedback, self._result = None, None
         agent.configure_dock(dock_id, self.charging, tolerance, yaw_tolerance)
@@ -137,6 +138,17 @@ class DockingController:
         if self.at(self.charging):
             self.agent.mode = "RECOVERY_REQUIRED"
             return False
+        if (
+            math.hypot(
+                self.agent.pose[0] - self.staging[0],
+                self.agent.pose[1] - self.staging[1],
+            )
+            <= 2 * self.tolerance
+        ):
+            # A return pose inside shared staging cannot clear the next arrival.
+            self.agent.mode = "RECOVERY_REQUIRED"
+            return False
+        self.exit_pose = tuple(self.agent.pose)
         self._generation += 1
         self.active, self._cancelled, self._resolved = True, False, False
         self._feedback, self._result, self.target = feedback, result, target
@@ -174,7 +186,7 @@ class DockingController:
         self._nav_done, self._nav_cancel = False, None
         self._nav_deadline = self.clock() + self.nav_timeout
 
-        def completed(success, reason):
+        def completed(success, reason, terminal=True):
             if (
                 not self.active
                 or generation != self._generation
@@ -183,9 +195,12 @@ class DockingController:
             ):
                 return
             self._nav_done = True
-            self._nav_cancel = None
-            if self._cancelled and state == "STAGING":
-                self._finish(False, "CANCELLED", recovery=False)
+            if terminal:
+                self._nav_cancel = None
+            if not terminal:
+                self._finish(False, "NAVIGATION_UNKNOWN", reason, recovery=True)
+            elif self._cancelled and state == "STAGING":
+                self._clear_staging()
             elif self._cancelled and state == "ENTERING":
                 self._exit()
             elif not success:
@@ -202,7 +217,7 @@ class DockingController:
             if self.active and sequence == self._nav_sequence and not self._nav_done:
                 self._nav_cancel = cancel
         except Exception as error:
-            completed(False, str(error))
+            completed(False, str(error), False)
 
     @staticmethod
     def _ttl(reply, sent):
@@ -314,17 +329,28 @@ class DockingController:
 
     def _cleanup_complete(self):
         if self.active and self._resolved and not self._acquiring and not self._cleanup:
+            if self._cancelled:
+                self._clear_staging()
+                return
             self._finish(
                 not self._cancelled,
                 "CANCELLED" if self._cancelled else "",
                 recovery=False,
             )
 
+    def _clear_staging(self):
+        if self.at(self.exit_pose):
+            self._finish(False, "CANCELLED", recovery=False)
+        elif self.state != "CLEARING":
+            # Reconciled pre-entry cancellation needs no dock lease, but must
+            # vacate the shared approach before allowing another action.
+            self._navigate("CLEARING", self.exit_pose)
+
     def _exit(self):
         if self.clock() >= self.lease_until:
             self._finish(False, "LEASE_LOST", recovery=True)
         else:
-            self._navigate("EXITING", self.staging)
+            self._navigate("EXITING", self.exit_pose)
 
     def renew(self):
         if self.active and self.key.lease_id and self._pending is None:
@@ -349,18 +375,25 @@ class DockingController:
         self._authorize()
         if self.state == "STAGING":
             if self._nav_done:
-                self._finish(False, "CANCELLED", recovery=False)
+                self._clear_staging()
             elif self._nav_cancel:
-                self._nav_cancel()
+                self._request_stop()
         elif self.state == "WAITING_FOR_LEASE":
             self._state("CANCELLING")
             self._cleanup_deadline = self.clock() + 5.0
             self._send("cancel_wait")
         elif self.state == "ENTERING" and not self._nav_done:
             if self._nav_cancel:
-                self._nav_cancel()
+                self._request_stop()
         elif self.state != "EXITING":
             self._exit()
+
+    def _request_stop(self):
+        try:
+            self._nav_cancel()
+        except Exception as error:
+            self._nav_cancel = None
+            self._finish(False, "CANCEL_FAILED", str(error), recovery=True)
 
     def _finish(self, success, error_code="", message="", *, recovery):
         if not self.active:
@@ -371,7 +404,12 @@ class DockingController:
         self.lease_until = 0.0
         self._authorize()
         if self._nav_cancel:
-            self._nav_cancel()
+            try:
+                self._nav_cancel()
+            except Exception as error:
+                success, recovery = False, True
+                error_code = error_code or "CANCEL_FAILED"
+                message = (message + "; " if message else "") + str(error)
             self._nav_cancel = None
         self.agent.end_docking(recovery)
         self.state = (
@@ -417,11 +455,16 @@ class DockingController:
                     recovery=True,
                 )
                 return
-        if self.state in ("STAGING", "ENTERING", "EXITING"):
+        if self.state in ("STAGING", "ENTERING", "EXITING", "CLEARING"):
             if now >= self._nav_deadline:
                 self._finish(False, "NAVIGATION_TIMEOUT", recovery=True)
                 return
-            pose = self.charging if self.state == "ENTERING" else self.staging
+            pose = {
+                "ENTERING": self.charging,
+                "STAGING": self.staging,
+                "EXITING": self.exit_pose,
+                "CLEARING": self.exit_pose,
+            }[self.state]
             if self._nav_done and self.at(pose):
                 if self.state == "STAGING":
                     self._state("WAITING_FOR_LEASE")
@@ -429,6 +472,8 @@ class DockingController:
                 elif self.state == "ENTERING":
                     self._state("WAITING_FOR_CONTACT")
                     self._contact_deadline = now + 5.0
+                elif self.state == "CLEARING":
+                    self._finish(False, "CANCELLED", recovery=False)
                 else:
                     self._state("RELEASING")
                     self._resolved = True

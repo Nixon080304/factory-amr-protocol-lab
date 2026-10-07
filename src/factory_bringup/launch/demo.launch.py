@@ -4,7 +4,7 @@
 from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
-from factory_bringup.fleet_launch import agent_parameters
+from factory_bringup.fleet_launch import agent_parameters, dock_contact_action
 from fleet_manager.config import load_fleet_config
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
@@ -63,6 +63,7 @@ def generate_launch_description():
                 "journal_path", default_value="artifacts/fleet/missions.sqlite3"
             ),
             *launches,
+            dock_contact_action(fleet_config, robot, entity_name="factory_amr"),
             Node(
                 package="robot_agent",
                 executable="robot_agent",
@@ -107,6 +108,7 @@ def generate_launch_description():
                         "fleet_manager",
                         {
                             "fleet_file": str(fleet_file),
+                            "legacy_single_robot": True,
                             "journal_path": ParameterValue(
                                 LaunchConfiguration("journal_path"), value_type=str
                             ),

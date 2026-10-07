@@ -281,7 +281,7 @@ def test_dock_runtime_registers_action_and_requires_real_contact_before_charge(
     )
     wall[0] += 0.1
     docking.controller.tick()
-    runtime_.adapter.localization(4, 2, 0, 0, "floor/cart_1/map")
+    runtime_.adapter.localization(4, 0, 0, 0, "floor/cart_1/map")
     wire.moves[2][2](True, "")
     wire.reply(released=True)
     assert finished == [True]
@@ -322,8 +322,100 @@ def test_nav2_dock_transport_cancels_goal_accepted_after_cancel():
     )
     assert cancellations == [True] and results == []
     result_reply.set_result(SimpleNamespace(status=5))
-    assert results == [(False, "navigation cancelled")]
+    assert results == [(False, "navigation cancelled", True)]
     assert goals[0].pose.header.frame_id == "floor/cart_1/map"
+
+
+@pytest.mark.parametrize("phase", ["STAGING", "ENTERING", "EXITING"])
+@pytest.mark.parametrize("cancel_requested", [False, True])
+def test_dock_navigation_result_exception_is_unknown_motion(phase, cancel_requested):
+    from rclpy.task import Future
+    from test_docking import rig, start
+
+    agent, _, wire, outcomes, _, controller = r = rig()
+    pending, cancellations = [], []
+
+    def cancel_goal():
+        cancellations.append(True)
+        return Future()
+
+    def send(goal):
+        accepted, result = Future(), Future()
+        pending.append(result)
+        accepted.set_result(
+            SimpleNamespace(
+                accepted=True,
+                cancel_goal_async=cancel_goal,
+                get_result_async=lambda: result,
+            )
+        )
+        return accepted
+
+    transport = api().DockTransport(
+        Host("/cart_1"),
+        SimpleNamespace(server_is_ready=lambda: True, send_goal_async=send),
+        {},
+    )
+    wire.navigate = transport.navigate
+    start(r)
+
+    def terminal_at(pose):
+        stamp = agent._pose_stamp + 1
+        agent.odometry(stamp, 0, 0, agent.frame_prefix + "odom")
+        agent.localization(stamp, *pose, agent.frame_prefix + "map")
+        pending[-1].set_result(SimpleNamespace(status=4))
+
+    if phase != "STAGING":
+        terminal_at(controller.staging)
+        wire.reply(granted=True, lease_id="lease-1", lease_ttl_sec=10.0)
+    if phase == "EXITING":
+        terminal_at(controller.charging)
+        controller.contact(True)
+        controller.cancel()
+    elif cancel_requested:
+        controller.cancel()
+    before = len(pending)
+    pending[-1].set_exception(RuntimeError("result transport lost"))
+    assert agent.mode == "RECOVERY_REQUIRED"
+    assert controller.state == "RECOVERY_REQUIRED" and not controller.active
+    assert len(pending) == before  # Unknown old motion never permits another goal.
+    assert len(outcomes) == 1 and outcomes[0].error_code == "NAVIGATION_UNKNOWN"
+    assert cancellations == [True]  # Best effort stop, never terminal proof.
+    assert not any(operation == "release" for operation, *_ in wire.requests)
+
+
+def test_immediate_navigation_result_exception_still_requests_best_effort_stop():
+    from rclpy.task import Future
+    from test_docking import rig, start
+
+    r = rig()
+    agent, _, wire, outcomes, _, _ = r
+    accepted, result, cancellations = Future(), Future(), []
+    result.set_exception(RuntimeError("immediate result failure"))
+    accepted.set_result(
+        SimpleNamespace(
+            accepted=True,
+            get_result_async=lambda: result,
+            cancel_goal_async=lambda: (cancellations.append(True), Future())[1],
+        )
+    )
+    wire.navigate = (
+        api()
+        .DockTransport(
+            Host("/cart_1"),
+            SimpleNamespace(
+                server_is_ready=lambda: True, send_goal_async=lambda _: accepted
+            ),
+            {},
+        )
+        .navigate
+    )
+    start(r)
+    assert cancellations == [True]
+    assert (
+        agent.mode == "RECOVERY_REQUIRED"
+        and outcomes[0].error_code == "NAVIGATION_UNKNOWN"
+    )
 
 
 def test_missing_cancel_wait_service_is_not_ownership_clearance():

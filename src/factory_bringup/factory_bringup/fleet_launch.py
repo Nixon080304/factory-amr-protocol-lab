@@ -126,6 +126,24 @@ def agent_parameters(config, robot, stations):
     return result
 
 
+def dock_contact_action(config, robot, *, entity_name=None):
+    """Independent Gazebo world-pose contact sensor, scoped to this robot."""
+    pose = config.docks[config.energy.dock_id].charging_pose
+    return Node(
+        package="factory_simulation",
+        executable="simulated_dock_contact",
+        namespace=robot.namespace,
+        output="screen",
+        parameters=[
+            {
+                "entity_name": entity_name or robot.robot_id,
+                "dock_id": config.energy.dock_id,
+                "charging_pose": [pose.x, pose.y, pose.yaw],
+            }
+        ],
+    )
+
+
 def robot_launch_spec(robot: RobotConfig) -> RobotLaunchSpec:
     return RobotLaunchSpec(
         robot.robot_id,
@@ -334,4 +352,5 @@ def fleet_launch_actions(
                 parameters=[agent_parameters(config, robot, stations)],
             )
         )
+        actions.append(dock_contact_action(config, robot))
     return actions

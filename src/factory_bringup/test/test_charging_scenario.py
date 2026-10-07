@@ -3,6 +3,7 @@
 from dataclasses import replace
 import importlib
 import json
+import math
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -120,6 +121,27 @@ class Scenario:
     def arrive(self, robot_id, index):
         agent = self.agents[robot_id]
         pose, frame, callback = self.moves[robot_id][index]
+        # Sample the swept circular footprint, not just teleported endpoints.
+        # Current robots are 0.5 m wide; the 1 m initial separation is safe.
+        start = agent.pose
+        # A Nav2 obstacle-avoiding route uses the clear dock approach row;
+        # straight-line travel through another robot's initial pose is invalid.
+        waypoints = [start[:2], (start[0], -2.0), (pose[0], -2.0), pose[:2]]
+        for before, after in zip(waypoints, waypoints[1:]):
+            for step in range(101):
+                point = tuple(
+                    before[i] + (after[i] - before[i]) * step / 100 for i in range(2)
+                )
+                for other_id, other in self.agents.items():
+                    if other_id != robot_id:
+                        assert (
+                            math.hypot(
+                                point[0] - other.pose[0], point[1] - other.pose[1]
+                            )
+                            >= 0.5
+                        ), (
+                            f"overlapping swept footprints: {robot_id}, {other_id}, {point}"
+                        )
         stamp = agent._pose_stamp + 1
         agent.odometry(stamp, 0, 0, agent.frame_prefix + "odom")
         agent.localization(stamp, *pose, frame)
@@ -170,9 +192,8 @@ def test_two_robots_stage_without_lease_then_charge_and_handoff(tmp_path, rename
         scenario.arrive(first, 1)
         scenario.controllers[first].contact(True)
         scenario.fleet.tick()
-        assert scenario.starts == [first, second]
-        scenario.arrive(second, 0)
-        assert len(scenario.moves[second]) == 1  # Wait outside the held dock.
+        assert scenario.starts == [first]
+        assert second not in scenario.moves  # Keep its own safe pose throughout exit.
         scenario.agents[first].energy.battery_percent = 79.8
         scenario.fleet.submit(MissionRequest("work", "assembly", "inspection", "motor"))
         scenario.fleet.tick()
@@ -182,6 +203,8 @@ def test_two_robots_stage_without_lease_then_charge_and_handoff(tmp_path, rename
         scenario.controllers[first].contact(True)
         scenario.arrive(first, 2)
         scenario.fleet.tick()
+        assert scenario.starts == [first, second]
+        scenario.arrive(second, 0)
         scenario.controllers[second].tick()
         resource = next(
             r
@@ -208,3 +231,66 @@ def test_two_robots_stage_without_lease_then_charge_and_handoff(tmp_path, rename
         assert scenario.fleet.core.charging_snapshot() == ()
     finally:
         scenario.journal.close()
+
+
+def test_legacy_demo_effective_fleet_accepts_serialized_dock_goal_and_grants(
+    tmp_path, monkeypatch
+):
+    import importlib.util
+    from launch import LaunchContext
+    from launch_ros.actions import Node
+    from launch_ros.utilities import evaluate_parameters
+    from rclpy.action import GoalResponse
+    from rclpy.task import Future
+    from fleet_manager import node as fleet_node
+    from robot_agent.node import DockRuntime
+
+    spec = importlib.util.spec_from_file_location(
+        "charging_demo", ROOT / "src/factory_bringup/launch/demo.launch.py"
+    )
+    demo = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(demo)
+    monkeypatch.setattr(
+        demo, "get_package_share_directory", lambda package: str(ROOT / "src" / package)
+    )
+    nodes = [
+        n for n in demo.generate_launch_description().entities if isinstance(n, Node)
+    ]
+    manager_launch = next(n for n in nodes if n.node_package == "fleet_manager")
+    context = LaunchContext()
+    context.launch_configurations["journal_path"] = str(tmp_path / "demo.sqlite3")
+    parameters = evaluate_parameters(context, manager_launch._Node__parameters)
+    values = {key: value for group in parameters for key, value in group.items()}
+    assert values.get("legacy_single_robot") is True
+    config = fleet_node.manager_config(
+        values["fleet_file"], values["legacy_single_robot"]
+    )
+    assert len(config.robots) == 1 and config.robots[0].frame_prefix == ""
+    scenario = Scenario(config, tmp_path)
+    robot_id = config.robots[0].robot_id
+    scenario.fleet.core.queue_charging(config.energy, scenario.now)
+    charge = scenario.fleet.core.charging_snapshot()[0]
+    goals = []
+    host = object.__new__(fleet_node.FleetManagerNode)
+    host.adapter = scenario.fleet
+    host.docks = {
+        robot_id: SimpleNamespace(
+            server_is_ready=lambda: True,
+            send_goal_async=lambda goal, **kwargs: (goals.append(goal), Future())[1],
+        )
+    }
+    host.send_dock_goal(
+        robot_id, charge, lambda _: None, lambda _: None, lambda *_: None
+    )
+    runtime = object.__new__(DockRuntime)
+    runtime._reserved = False
+    # Goal validation is exercised on the actual legacy adapter with its controller.
+    runtime.controller = scenario.controllers[robot_id]
+    assert runtime.goal(goals[0]) == GoalResponse.ACCEPT
+    scenario.fleet.tick()
+    scenario.arrive(robot_id, 0)
+    resource = next(
+        r for r in scenario.fleet.resources.snapshot(scenario.now) if r.kind == "dock"
+    )
+    assert resource.lease.robot_id == robot_id
+    scenario.journal.close()
