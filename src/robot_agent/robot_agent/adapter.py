@@ -159,11 +159,15 @@ class AgentAdapter:
         self._dock_contact_until = contact_until
 
     def charge_authorized(self):
+        return self._charge_authorized_at(self.clock())
+
+    def _charge_authorized_at(self, at_time):
         if not self._dock_geometry:
             return False
         _, target, tolerance, yaw_tolerance = self._dock_geometry
         return (
             self._dock_contact
+            and not self._health(at_time)
             and self._odom_receipt is not None
             and self._pose_receipt is not None
             and self.pose is not None
@@ -185,9 +189,17 @@ class AgentAdapter:
                 if self._odom_receipt is not None
                 else self._wall,
             )
+            if self._pose_receipt is None:
+                deadline = min(deadline, self._wall)
+            elif self._distance - self._localized_distance > self.localization_movement:
+                deadline = min(deadline, self._pose_receipt + self.stale_sec)
         authorized = min(elapsed, max(0.0, deadline - self._wall))
         self.energy.advance(
-            authorized, 0, self.mode, lease_valid=True, contact=self.charge_authorized()
+            authorized,
+            0,
+            self.mode,
+            lease_valid=True,
+            contact=self._charge_authorized_at(self._wall),
         )
         self.energy.advance(elapsed - authorized, 0, self.mode)
         self._wall = max(self._wall, now)

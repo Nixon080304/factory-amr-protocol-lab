@@ -331,10 +331,19 @@ class DockRuntime:
         charging,
         *,
         server_factory=ActionServer,
+        robot_radius=0.15,
+        arrival_tolerance=0.15,
     ):
         self.node = node
         self.controller = DockingController(
-            agent, transport, dock_id, staging, charging, clock=agent.clock
+            agent,
+            transport,
+            dock_id,
+            staging,
+            charging,
+            clock=agent.clock,
+            robot_radius=robot_radius,
+            tolerance=arrival_tolerance,
         )
         self._reserved, self._handle, self._results = False, None, {}
         self.server = server_factory(
@@ -475,6 +484,12 @@ class RobotAgentNode(Node):
             }
         )
         self.dock_id = self.declare_parameter("dock_id", "dock_01", identity).value
+        self.dock_radius = self.declare_parameter(
+            "dock.robot_radius", 0.15, identity
+        ).value
+        self.dock_tolerance = self.declare_parameter(
+            "dock.arrival_tolerance", 0.15, identity
+        ).value
         self.dock_staging = self.declare_parameter(
             "dock.staging_pose", [3.5, -2.0, 0.0], identity
         ).value
@@ -520,6 +535,8 @@ class RobotAgentNode(Node):
             self.dock_id,
             self.dock_staging,
             self.dock_charging,
+            robot_radius=self.dock_radius,
+            arrival_tolerance=self.dock_tolerance,
         )
 
     def destroy_node(self):

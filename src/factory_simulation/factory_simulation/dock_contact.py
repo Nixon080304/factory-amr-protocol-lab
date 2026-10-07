@@ -62,7 +62,20 @@ class DockContactRuntime:
         self.publisher.publish(Bool(data=bool(valid and self._confirmed)))
 
     def _at_contact(self, response):
-        if not response.success:
+        if not response.success or self._pending is None:
+            return False
+        request = self._pending[3]
+        # gazebo_ros_state3.9 leaves state.name/reference_frame empty. Those
+        # upstream defaults are permitted only for this current exact query;
+        # a missing field or any conflicting nonempty identity fails closed.
+        state = response.state
+        if (
+            request.name != self.entity
+            or request.reference_frame != "world"
+            or getattr(getattr(response, "header", None), "frame_id", None) != "world"
+            or getattr(state, "name", None) not in ("", self.entity)
+            or getattr(state, "reference_frame", None) not in ("", "world")
+        ):
             return False
         p, q = response.state.pose.position, response.state.pose.orientation
         values = (p.x, p.y, p.z, q.x, q.y, q.z, q.w)
@@ -91,12 +104,16 @@ class DockContactRuntime:
         if self._pending is not None:
             return
         token = object()
-        self._pending = (token, now, None)
+        request = GetEntityState.Request(name=self.entity, reference_frame="world")
+        self._pending = (token, now, None, request)
 
         def completed(future):
-            if self._pending is None or self._pending[0] is not token:
+            if (
+                self._pending is None
+                or self._pending[0] is not token
+                or self._pending[2] is not future
+            ):
                 return
-            self._pending = None
             self._receipt = now
             try:
                 self._confirmed = (
@@ -105,13 +122,12 @@ class DockContactRuntime:
                 )
             except Exception:
                 self._confirmed = False
+            self._pending = None
             self.publish()
 
         try:
-            future = self.client.call_async(
-                GetEntityState.Request(name=self.entity, reference_frame="world")
-            )
-            self._pending = (token, now, future)
+            future = self.client.call_async(request)
+            self._pending = (token, now, future, request)
             future.add_done_callback(completed)
         except Exception:
             self._pending, self._receipt, self._confirmed = None, None, False

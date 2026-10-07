@@ -51,6 +51,7 @@ class DockingController:
         *,
         clock=time.monotonic,
         tolerance=0.15,
+        robot_radius=0.15,
         yaw_tolerance=0.2,
         contact_timeout=1.0,
         navigation_timeout=60.0,
@@ -64,6 +65,7 @@ class DockingController:
             raise ValueError("dock requires an identity and finite poses")
         bounds = (
             tolerance,
+            robot_radius,
             yaw_tolerance,
             contact_timeout,
             navigation_timeout,
@@ -88,6 +90,7 @@ class DockingController:
             tuple(charging_pose),
         )
         self.tolerance, self.yaw_tolerance = tolerance, yaw_tolerance
+        self.robot_radius = robot_radius
         self.contact_timeout, self.nav_timeout, self.service_timeout = (
             contact_timeout,
             navigation_timeout,
@@ -131,6 +134,17 @@ class DockingController:
             and state.pose is not None
         )
 
+    def _clear_for_handoff(self, pose, arrival_error=0.0):
+        """Exclude both footprints and every permitted dock arrival region."""
+        if pose is None:
+            return False
+        minimum = 2 * self.robot_radius + self.tolerance + arrival_error
+        for target in (self.staging, self.charging):
+            distance = math.hypot(pose[0] - target[0], pose[1] - target[1])
+            if distance <= minimum or math.isclose(distance, minimum):
+                return False
+        return True
+
     def start(self, target, feedback, result):
         target = percentage(target, "target_percent")
         if not self.can_start():
@@ -138,14 +152,8 @@ class DockingController:
         if self.at(self.charging):
             self.agent.mode = "RECOVERY_REQUIRED"
             return False
-        if (
-            math.hypot(
-                self.agent.pose[0] - self.staging[0],
-                self.agent.pose[1] - self.staging[1],
-            )
-            <= 2 * self.tolerance
-        ):
-            # A return pose inside shared staging cannot clear the next arrival.
+        if not self._clear_for_handoff(self.agent.pose, self.tolerance):
+            # The return arrival region must clear the next dock cycle.
             self.agent.mode = "RECOVERY_REQUIRED"
             return False
         self.exit_pose = tuple(self.agent.pose)
@@ -329,6 +337,11 @@ class DockingController:
 
     def _cleanup_complete(self):
         if self.active and self._resolved and not self._acquiring and not self._cleanup:
+            if self.state == "RELEASING" and not (
+                self.at(self.exit_pose) and self._clear_for_handoff(self.agent.pose)
+            ):
+                self._finish(False, "CLEARANCE_FAILED", recovery=True)
+                return
             if self._cancelled:
                 self._clear_staging()
                 return
@@ -339,7 +352,7 @@ class DockingController:
             )
 
     def _clear_staging(self):
-        if self.at(self.exit_pose):
+        if self.at(self.exit_pose) and self._clear_for_handoff(self.agent.pose):
             self._finish(False, "CANCELLED", recovery=False)
         elif self.state != "CLEARING":
             # Reconciled pre-entry cancellation needs no dock lease, but must
@@ -466,6 +479,12 @@ class DockingController:
                 "CLEARING": self.exit_pose,
             }[self.state]
             if self._nav_done and self.at(pose):
+                if self.state in (
+                    "EXITING",
+                    "CLEARING",
+                ) and not self._clear_for_handoff(self.agent.pose):
+                    self._finish(False, "CLEARANCE_FAILED", recovery=True)
+                    return
                 if self.state == "STAGING":
                     self._state("WAITING_FOR_LEASE")
                     self._send("acquire")

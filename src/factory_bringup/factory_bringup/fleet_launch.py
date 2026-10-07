@@ -111,6 +111,8 @@ def agent_parameters(config, robot, stations):
     for name, values in stations.items():
         result[f"stations.{name}.pose"] = [float(values[k]) for k in ("x", "y", "yaw")]
     dock = config.docks[config.energy.dock_id]
+    result["dock.robot_radius"] = dock.robot_radius
+    result["dock.arrival_tolerance"] = dock.arrival_tolerance
     for name in ("staging_pose", "charging_pose"):
         pose = getattr(dock, name)
         result[f"dock.{name}"] = [pose.x, pose.y, pose.yaw]

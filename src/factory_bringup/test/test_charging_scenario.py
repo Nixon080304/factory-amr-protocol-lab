@@ -77,6 +77,8 @@ class Scenario:
                 (dock.staging_pose.x, dock.staging_pose.y, dock.staging_pose.yaw),
                 (dock.charging_pose.x, dock.charging_pose.y, dock.charging_pose.yaw),
                 clock=lambda: self.now,
+                robot_radius=dock.robot_radius,
+                tolerance=dock.arrival_tolerance,
             )
         self.observe()
 

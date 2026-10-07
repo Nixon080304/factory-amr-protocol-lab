@@ -494,7 +494,9 @@ def test_actual_demo_parameters_construct_namespaced_agent_with_unprefixed_frame
     monkeypatch.setattr(
         module,
         "DockRuntime",
-        lambda *args: original(*args, server_factory=module.ActionServer),
+        lambda *args, **kwargs: original(
+            *args, **kwargs, server_factory=module.ActionServer
+        ),
     )
     node = module.RobotAgentNode(namespace=launch_node.expanded_node_namespace)
     assert node.runtime.adapter.frame_prefix == ""

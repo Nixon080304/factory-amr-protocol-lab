@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 from geometry_msgs.msg import Pose
+from gazebo_msgs.srv import GetEntityState
 from rclpy.task import Future
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -51,7 +52,70 @@ def reply(pose=(4, -2, 0), success=True):
     value = Pose()
     value.position.x, value.position.y, value.position.z = map(float, pose)
     value.orientation.w = 1.0
-    return SimpleNamespace(success=success, state=SimpleNamespace(pose=value))
+    # gazebo_ros_state3.9 sets header.frame_id but leaves both identity strings
+    # at their actual ROS defaults, even for a named world-frame request.
+    response = GetEntityState.Response(success=success)
+    response.header.frame_id = "world"
+    response.state.pose = value
+    return response
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [
+        "wrong_entity",
+        "wrong_reference",
+        "wrong_header",
+        "empty_header",
+        "missing_name",
+        "missing_reference",
+        "missing_header",
+    ],
+)
+def test_mismatched_or_malformed_response_identity_never_confirms_contact(identity):
+    runtime, host, _, _, futures, _ = sensor()
+    runtime.tick()
+    value = reply()
+    if identity == "wrong_entity":
+        value.state.name = "another_robot"
+    elif identity == "wrong_reference":
+        value.state.reference_frame = "another_frame"
+    elif identity == "wrong_header":
+        value.header.frame_id = "another_frame"
+    elif identity == "empty_header":
+        value.header.frame_id = ""
+    elif identity == "missing_header":
+        value = SimpleNamespace(success=True, state=value.state)
+    else:
+        fields = dict(pose=value.state.pose, name="", reference_frame="")
+        fields.pop("name" if identity == "missing_name" else "reference_frame")
+        value = SimpleNamespace(
+            success=True, header=value.header, state=SimpleNamespace(**fields)
+        )
+    futures[-1].set_result(value)
+    assert host.messages[-1] is False
+
+
+@pytest.mark.parametrize("explicit_identity", [False, True])
+def test_current_exact_world_request_accepts_real_upstream_empty_or_matching_identity(
+    explicit_identity,
+):
+    runtime, host, _, _, futures, requests = sensor()
+    runtime.tick()
+    assert (
+        requests[-1].name == "configured_cart"
+        and requests[-1].reference_frame == "world"
+    )
+    value = reply()
+    if explicit_identity:
+        value.state.name, value.state.reference_frame = "configured_cart", "world"
+    futures[-1].set_result(value)
+    assert host.messages[-1] is True
+
+
+def test_upstream_empty_identity_requires_current_exact_pending_query():
+    runtime, _, _, _, _, _ = sensor()
+    assert not runtime._at_contact(reply())
 
 
 def test_gazebo_world_pose_confirms_contact_and_physical_loss_clears_it():

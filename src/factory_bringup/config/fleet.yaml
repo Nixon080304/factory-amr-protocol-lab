@@ -55,6 +55,10 @@ docks:
   # Staging is outside dock ownership. Agents require fresh, independently
   # confirmed Bool contact on /<namespace>/factory/dock_contact to charge.
   dock_01:
+    # Conservative fleet-wide radius and arrival bound match supplied Nav2
+    # robot_radius/xy_goal_tolerance. Increase for larger robot footprints.
+    robot_radius: 0.15
+    arrival_tolerance: 0.15
     staging_pose: [3.5, -2.0, 0.0]
     charging_pose: [4.0, -2.0, 0.0]
 

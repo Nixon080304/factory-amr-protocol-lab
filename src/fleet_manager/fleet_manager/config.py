@@ -38,6 +38,8 @@ class ResourceConfig:
 class DockConfig:
     staging_pose: Pose2D
     charging_pose: Pose2D
+    robot_radius: float = 0.15
+    arrival_tolerance: float = 0.15
 
 
 @dataclass(frozen=True)
@@ -310,10 +312,23 @@ def _parse_config(data):
             raise ValueError(f"{path}: unknown resource {dock_id!r}")
         if dock_id not in dock_ids:
             raise ValueError(f"{path}: resource must have kind dock")
-        value = _mapping(value, path, ("staging_pose", "charging_pose"))
+        value = _mapping(value, path)
+        value = _mapping(
+            {"robot_radius": 0.15, "arrival_tolerance": 0.15, **value},
+            path,
+            ("staging_pose", "charging_pose", "robot_radius", "arrival_tolerance"),
+        )
+        bounds = tuple(
+            _number(value[name], f"{path}.{name}")
+            for name in ("robot_radius", "arrival_tolerance")
+        )
+        for name, bound in zip(("robot_radius", "arrival_tolerance"), bounds):
+            if bound <= 0:
+                raise ValueError(f"{path}.{name}: expected a positive number")
         docks[dock_id] = DockConfig(
             _pose(value["staging_pose"], f"{path}.staging_pose"),
             _pose(value["charging_pose"], f"{path}.charging_pose"),
+            *bounds,
         )
     for dock_id in sorted(dock_ids - docks.keys()):
         raise ValueError(

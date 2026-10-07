@@ -50,6 +50,96 @@ def start(rig_):
     assert controller.start(80, feedback.append, results.append)
 
 
+@pytest.mark.parametrize(
+    "distance,want", [(0.31, False), (0.5999, False), (0.60, False), (0.6001, True)]
+)
+def test_retreat_acceptance_covers_two_radii_and_both_arrival_errors(distance, want):
+    agent, _, wire, results, feedback, controller = rig()
+    agent.localization(2, 2 - distance, -3, 0, agent.frame_prefix + "map")
+    assert controller.start(80, feedback.append, results.append) is want
+    if not want:
+        assert not wire.moves and not wire.requests and not results
+        assert agent.mode == "RECOVERY_REQUIRED"
+
+
+def test_configured_larger_footprint_rejects_retreat_default_radius_would_accept():
+    agent, wall, wire, results, feedback, _ = rig()
+    agent.localization(2, 1.35, -3, 0, agent.frame_prefix + "map")
+    try:
+        controller = api().DockingController(
+            agent,
+            wire,
+            "charger",
+            (2, -3, 0),
+            (3, -3, 0),
+            clock=lambda: wall[0],
+            robot_radius=0.25,
+            tolerance=0.10,
+        )
+    except TypeError:
+        pytest.fail("production docking must consume configured robot radius")
+    assert not controller.start(80, feedback.append, results.append)
+    assert not wire.moves and agent.mode == "RECOVERY_REQUIRED"
+
+
+@pytest.mark.parametrize("docked", [False, True])
+def test_terminal_clearance_never_releases_into_permitted_staging_footprint(docked):
+    r = rig()
+    agent, _, wire, results, _, controller = r
+    agent.localization(2, 1.39, -3, 0, agent.frame_prefix + "map")
+    if docked:
+        enter(r)
+        controller.contact(True)
+        controller.cancel()
+        exit_index = 2
+    else:
+        stage(r)
+        wire.reply(granted=False, lease_id="", lease_ttl_sec=0.0)
+        controller.cancel()
+        wire.reply(lease_id="", lease_ttl_sec=0.0, reconciliation_required=False)
+        exit_index = 1
+    # Center distance0.45 leaves only0.30 after the next arrival error:
+    # two configured0.15-radius circles touch, so this is not safe clearance.
+    arrive(r, exit_index, (1.55, -3, 0))
+    assert not results and not any(op == "release" for op, *_ in wire.requests)
+    arrive(r, exit_index, (1.5399, -3, 0))
+    assert 1.85 - 1.5399 > 0.30
+    if docked:
+        assert wire.requests[-1][0] == "release"
+        wire.reply(released=True)
+    assert results[0].error_code == "CANCELLED" and agent.mode == "AVAILABLE"
+
+
+@pytest.mark.parametrize("x,want", [(3.31, False), (3.60, False), (3.6001, True)])
+def test_retreat_also_excludes_next_charging_occupancy(x, want):
+    agent, _, wire, results, feedback, controller = rig()
+    agent.localization(2, x, -3, 0, agent.frame_prefix + "map")
+    assert controller.start(80, feedback.append, results.append) is want
+    if not want:
+        assert not wire.moves and agent.mode == "RECOVERY_REQUIRED"
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_release_reply_after_clearance_loss_cannot_report_safe_completion(cancelled):
+    r = rig()
+    enter(r)
+    agent, _, wire, results, _, controller = r
+    controller.contact(True)
+    if cancelled:
+        controller.cancel()
+    else:
+        agent.energy.battery_percent = 80
+        controller.tick()
+    arrive(r, 2, (0, -3, 0))
+    assert wire.requests[-1][0] == "release"
+    agent.localization(10, 2.20, -3, 0, agent.frame_prefix + "map")
+    before = len(wire.moves)
+    wire.reply(released=True)
+    assert len(wire.moves) == before
+    assert agent.mode == "RECOVERY_REQUIRED" and not controller.active
+    assert results[0].error_code == "CLEARANCE_FAILED"
+
+
 @pytest.mark.parametrize("event", ["shutdown", "timeout", "health_loss", "cancel"])
 def test_throwing_navigation_cancel_always_finalizes_conservatively(event):
     r = rig()
@@ -104,6 +194,49 @@ def test_invalid_health_evidence_stops_charge_at_exact_receipt_boundary(evidence
     wall[0] += 0.5
     controller.tick()
     assert agent.energy.battery_percent == pytest.approx(20.1993, abs=1e-9)
+    assert agent.mode == "RECOVERY_REQUIRED" and len(results) == 1
+
+
+def test_stale_localization_after_movement_revokes_charge_at_movement_receipt():
+    r = rig()
+    enter(r)
+    agent, wall, _, results, _, controller = r
+    controller.contact(True)
+    for index in range(1, 7):
+        wall[0] = 100 + index * 0.5
+        agent.odometry(10 + index, 0, 0, agent.frame_prefix + "odom")
+        controller.contact(True)
+    wall[0] = 103.1
+    agent.odometry(20, 0.6, 0, agent.frame_prefix + "odom")
+    assert not agent.charge_authorized()
+    before = agent.energy.battery_percent
+    wall[0] += 0.2
+    controller.tick()
+    assert agent.energy.battery_percent == pytest.approx(before - 0.0002, abs=1e-9)
+    assert (
+        agent.mode == "RECOVERY_REQUIRED"
+        and results[0].error_code == "ROBOT_UNAVAILABLE"
+    )
+
+
+def test_elapsed_charging_splits_at_localization_deadline_when_robot_has_moved():
+    r = rig()
+    enter(r)
+    agent, wall, _, results, _, controller = r
+    controller.contact(True)
+    agent.odometry(10, 0.6, 0, agent.frame_prefix + "odom")
+    for index in range(1, 6):
+        wall[0] = 100 + index * 0.5
+        agent.odometry(10 + index, 0.6, 0, agent.frame_prefix + "odom")
+        controller.contact(True)
+    wall[0] = 102.9
+    agent.odometry(20, 0.6, 0, agent.frame_prefix + "odom")
+    controller.contact(True)
+    before = agent.energy.battery_percent
+    wall[0] = 103.2
+    controller.tick()
+    # The first0.1s was healthy; the next0.2s must drain idle only.
+    assert agent.energy.battery_percent == pytest.approx(before + 0.0997, abs=1e-9)
     assert agent.mode == "RECOVERY_REQUIRED" and len(results) == 1
 
 

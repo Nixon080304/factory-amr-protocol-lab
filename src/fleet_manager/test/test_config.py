@@ -141,6 +141,26 @@ def test_committed_fleet_file_loads():
     }
 
 
+@pytest.mark.parametrize("field", ["robot_radius", "arrival_tolerance"])
+@pytest.mark.parametrize("value", [0, -0.1, True, float("nan"), "0.15"])
+def test_dock_clearance_parameters_reject_invalid_numbers(tmp_path, data, field, value):
+    data["docks"]["dock_01"][field] = value
+    with pytest.raises(ValueError, match="docks.dock_01." + field):
+        load_data(tmp_path, data)
+
+
+def test_configured_dock_clearance_reaches_agent_launch(tmp_path, data):
+    from factory_bringup.fleet_launch import agent_parameters
+
+    data["docks"]["dock_01"].update(robot_radius=0.25, arrival_tolerance=0.10)
+    config = load_data(tmp_path, data)
+    values = agent_parameters(
+        config, config.robots[0], {"assembly": dict(x=0, y=0, yaw=0)}
+    )
+    assert values["dock.robot_radius"] == 0.25
+    assert values["dock.arrival_tolerance"] == 0.10
+
+
 def test_route_geometry_reaches_coordinator_without_changing_resource_order(
     tmp_path, data
 ):
