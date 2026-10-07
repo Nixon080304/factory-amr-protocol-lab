@@ -174,7 +174,7 @@ class FleetAdapter:
                         snapshot.pose.x - dock.charging_pose.x,
                         snapshot.pose.y - dock.charging_pose.y,
                     )
-                    <= 0.15
+                    <= dock.arrival_tolerance
                 )
                 delayed_completion = (
                     snapshot.robot_id in self._dock_completed

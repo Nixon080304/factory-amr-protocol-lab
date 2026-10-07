@@ -167,6 +167,72 @@ def test_restart_occupied_robot_never_receives_mission_even_above_charge_thresho
     assert decision.robot_id is None
 
 
+@pytest.mark.parametrize(
+    "tolerance,offset,occupied",
+    [
+        (0.20, 0.18, True),
+        (0.20, 0.20, True),
+        (0.20, 0.2001, False),
+        (0.10, 0.1001, False),
+    ],
+)
+def test_configured_restart_occupancy_controls_other_robot_dock_grant(
+    rig, tolerance, offset, occupied
+):
+    from types import SimpleNamespace
+
+    _, adapter, _, _, _ = rig
+    # An origin on the offset axis makes the exact tolerance boundary literal,
+    # without subtraction error from the original negative world coordinate.
+    dock = replace(
+        adapter.config.docks["dock_01"],
+        charging_pose=Pose2D(4, 0, 0),
+        arrival_tolerance=tolerance,
+    )
+    adapter.config = replace(adapter.config, docks={"dock_01": dock})
+    adapter.observe(
+        RobotSnapshot("amr_01", "AVAILABLE", Pose2D(4, offset, 0), 80, "EMPTY")
+    )
+    adapter.observe(RobotSnapshot("amr_02", "AVAILABLE", Pose2D(1, -3, 0), 20, "EMPTY"))
+    adapter.core.queue_charging(adapter.config.energy, 100)
+    response = adapter.resource(
+        "acquire",
+        SimpleNamespace(
+            robot_id="amr_02", mission_id="dock-new", resource_id="dock_01"
+        ),
+    )
+    assert response["granted"] is (not occupied)
+    if occupied:
+        assert response["reason"] == "dock reconciliation required"
+
+
+@pytest.mark.parametrize(
+    "tolerance,offset,occupied",
+    [
+        (0.20, 0.18, True),
+        (0.20, 0.20, True),
+        (0.20, 0.2001, False),
+        (0.10, 0.1001, False),
+    ],
+)
+def test_configured_restart_occupancy_excludes_only_inside_robot_from_assignment(
+    rig, tolerance, offset, occupied
+):
+    _, adapter, _, _, _ = rig
+    dock = replace(
+        adapter.config.docks["dock_01"],
+        charging_pose=Pose2D(4, 0, 0),
+        arrival_tolerance=tolerance,
+    )
+    adapter.config = replace(adapter.config, docks={"dock_01": dock})
+    adapter.observe(
+        RobotSnapshot("amr_01", "AVAILABLE", Pose2D(4, offset, 0), 80, "EMPTY")
+    )
+    adapter.core.submit(request(pin="amr_01"), 100)
+    decision = adapter.core.assign("m1", {"amr_01": CostEstimate(True, 1, 40)}, 100)
+    assert decision.robot_id == (None if occupied else "amr_01")
+
+
 def test_safe_dock_cancel_releases_fleet_reservation_and_fences_late_callback(rig):
     from types import SimpleNamespace
 
