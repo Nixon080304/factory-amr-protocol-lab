@@ -1,0 +1,108 @@
+// SPDX-License-Identifier: Apache-2.0
+import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { createInterface } from 'node:readline';
+import { mkdir, writeFile, readFile } from 'node:fs/promises';
+import { chrome, waitFor } from './chrome_cdp.mjs';
+
+const fixture = spawn('.venv/bin/python3', ['tests/browser/dashboard_fixture.py'], { stdio: ['pipe', 'pipe', 'pipe'] });
+let fixtureErrors = '';
+fixture.stderr.on('data', chunk => { fixtureErrors += chunk; });
+const lines = [];
+createInterface({ input: fixture.stdout }).on('line', line => lines.push(JSON.parse(line)));
+let browser;
+const exceptions = [];
+const consoleErrors = [];
+const networkErrors = [];
+const requests = [];
+let expectedOutage = false;
+const evidence = '.superpowers/sdd/2026-10-05-scalable-multi-robot-fleet/task-15-browser';
+
+async function command(command) {
+  fixture.stdin.write(JSON.stringify({ command }) + '\n');
+  await waitFor(() => lines.some(line => line.done === command), `fixture ${command}`);
+}
+
+try {
+  const source = await readFile('src/fleet_manager/fleet_manager/static/app.js', 'utf8');
+  const client = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+  const order = new client.SnapshotOrder();
+  const value = { robots: [], missions: [], resources: [], dock_queue: [], events: [], updated_at: 1000, sequence: 10, session_id: 'session-one' };
+  assert.equal(order.accept(value, true), 'new');
+  assert.equal(order.accept({ ...value, sequence: 9 }), 'old');
+  assert.equal(order.accept(value), 'duplicate');
+  assert.equal(order.accept({ ...value, robots: {} }), 'invalid');
+  assert.equal(order.accept({ ...value, resources: [{ resource_id: 'dock_01', kind: 2, waiters: 'bad' }] }), 'invalid');
+  assert.equal(order.accept({ ...value, dock_queue: [null] }), 'invalid');
+  assert.equal(order.accept({ ...value, sequence: 11, robots: [{ robot_id: '<script>', battery_percent: 'broken' }] }), 'invalid');
+  assert.equal(order.accept({ ...value, session_id: 'session-two', sequence: 1 }), 'refresh');
+  assert.equal(order.accept({ ...value, session_id: 'session-two', sequence: 1 }, true), 'new');
+  assert.equal(client.retryDelay(0, () => 0.5), 500);
+  assert.equal(client.retryDelay(3, () => 0.5), 4000);
+  assert.equal(client.retryDelay(100, () => 1), 8000);
+  assert.ok(client.retryDelay(2, () => 0) < client.retryDelay(2, () => 1));
+  await waitFor(() => lines.some(line => line.ready) || fixture.exitCode !== null, 'production server startup');
+  assert.equal(fixture.exitCode, null, fixtureErrors || 'dashboard fixture exited');
+  const { url } = lines.find(line => line.ready);
+  browser = await chrome();
+  browser.onEvent(message => {
+    if (message.method === 'Runtime.exceptionThrown') exceptions.push(message.params.exceptionDetails);
+    if (message.method === 'Runtime.consoleAPICalled' && message.params.type === 'error') consoleErrors.push(message.params.args);
+    if (message.method === 'Network.loadingFailed' && !expectedOutage) networkErrors.push(message.params.errorText);
+    if (message.method === 'Network.requestWillBeSent') requests.push(message.params.request.url);
+    if (message.method === 'Network.responseReceived' && message.params.response.status >= 400 && !expectedOutage) networkErrors.push(message.params.response);
+  });
+  await browser.send('Runtime.enable');
+  await browser.send('Network.enable');
+  await browser.send('Page.enable');
+  await browser.send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 1100, deviceScaleFactor: 1, mobile: false });
+  await browser.send('Page.navigate', { url });
+  await waitFor(() => browser.evaluate("document.querySelector('#connection')?.dataset.state === 'live'"), 'dashboard live');
+  const text = await browser.evaluate('document.body.innerText');
+  assert.match(text, /amr_01/);
+  assert.match(text, /amr_02/);
+  assert.match(text, /dock_01/);
+  assert.match(text, /CHARGING/);
+  assert.match(text, /delivery-042/);
+  assert.equal(await browser.evaluate("document.querySelectorAll('[data-robot-id]').length"), 2);
+  assert.equal(await browser.evaluate("document.querySelector('[data-resource-id=\"dock_01\"]').textContent.includes('amr_01')"), true);
+  assert.equal(requests.findIndex(value => value.endsWith('/api/snapshot')) < requests.findIndex(value => value.endsWith('/api/events')), true);
+  await command('update');
+  await waitFor(() => browser.evaluate("document.querySelector('[data-robot-id=\"amr_02\"]').textContent.includes('WAITING_FOR_RESOURCE')"), 'live state transition');
+  await mkdir(evidence, { recursive: true });
+  const desktop = await browser.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: true });
+  await writeFile(`${evidence}/desktop.png`, Buffer.from(desktop.data, 'base64'));
+  expectedOutage = true;
+  await command('stop');
+  await waitFor(() => browser.evaluate("['stale', 'reconnecting'].includes(document.querySelector('#connection').dataset.state)"), 'visible stale/reconnecting state');
+  assert.doesNotMatch(await browser.evaluate("document.querySelector('#connection').textContent"), /^Connected/);
+  const stale = await browser.send('Page.captureScreenshot', { format: 'png' });
+  await writeFile(`${evidence}/stale.png`, Buffer.from(stale.data, 'base64'));
+  await command('restart');
+  await waitFor(() => browser.evaluate("document.querySelector('#connection').dataset.state === 'live' && document.querySelector('[data-robot-id=\"amr_01\"]').textContent.includes('35%')"), 'fresh snapshot after reconnect', 15000);
+  expectedOutage = false;
+  assert.ok(requests.filter(value => value.endsWith('/api/snapshot')).length >= 2, 'reconnect must fetch snapshot again');
+  assert.ok(requests.every(value => value.startsWith(url)), 'no external runtime requests');
+  await browser.send('Emulation.setDeviceMetricsOverride', { width: 360, height: 800, deviceScaleFactor: 1, mobile: true });
+  assert.equal(await browser.evaluate('document.documentElement.scrollWidth <= innerWidth'), true, 'phone overflow');
+  const phone = await browser.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: true });
+  await writeFile(`${evidence}/phone.png`, Buffer.from(phone.data, 'base64'));
+  await command('quarantine');
+  await waitFor(() => browser.evaluate("document.querySelector('[data-resource-id=\"central_aisle\"]').textContent.includes('Reconciliation required')"), 'quarantined resource evidence');
+  assert.equal(await browser.evaluate("document.querySelector('[data-resource-id=\"central_aisle\"]').textContent.includes('Waiters: amr_01')"), true, 'quarantine must retain visible waiters');
+  await waitFor(() => browser.evaluate("document.querySelector('#connection').dataset.state === 'stale'"), 'frozen ROS capture becomes stale despite SSE heartbeats');
+  assert.equal(await browser.evaluate("document.querySelectorAll('h1').length === 1 && document.querySelector('main') !== null && document.querySelector('#connection').getAttribute('role') === 'status'"), true);
+  assert.deepEqual(exceptions, [], 'uncaught browser exceptions');
+  assert.deepEqual(consoleErrors, [], 'browser console errors');
+  assert.deepEqual(networkErrors, [], 'unexpected browser network errors');
+  console.log(`PASS real Chrome: two robots, dock owner, SSE transition, stale/reconnect, fresh snapshot, desktop/360px phone, no console/network exceptions. Screenshots: ${evidence}`);
+} finally {
+  if (browser) await browser.close();
+  if (fixture.exitCode === null) {
+    fixture.stdin.end(JSON.stringify({ command: 'quit' }) + '\n');
+    await Promise.race([
+      new Promise(resolve => fixture.once('exit', resolve)),
+      new Promise(resolve => setTimeout(() => { fixture.kill('SIGKILL'); resolve(); }, 2000)),
+    ]);
+  }
+}

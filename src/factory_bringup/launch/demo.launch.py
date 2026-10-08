@@ -59,6 +59,8 @@ def generate_launch_description():
             DeclareLaunchArgument("broker_port", default_value="1883"),
             DeclareLaunchArgument("plc_port", default_value="1502"),
             DeclareLaunchArgument("output_dir", default_value="artifacts/traces"),
+            DeclareLaunchArgument("dashboard_enabled", default_value="true"),
+            DeclareLaunchArgument("dashboard_port", default_value="8080"),
             DeclareLaunchArgument(
                 "journal_path", default_value="artifacts/fleet/missions.sqlite3"
             ),
@@ -109,6 +111,16 @@ def generate_launch_description():
                         {
                             "fleet_file": str(fleet_file),
                             "legacy_single_robot": True,
+                            "dashboard_enabled": ParameterValue(
+                                LaunchConfiguration(
+                                    "dashboard_enabled", default="true"
+                                ),
+                                value_type=bool,
+                            ),
+                            "dashboard_port": ParameterValue(
+                                LaunchConfiguration("dashboard_port", default="8080"),
+                                value_type=int,
+                            ),
                             "journal_path": ParameterValue(
                                 LaunchConfiguration("journal_path"), value_type=str
                             ),

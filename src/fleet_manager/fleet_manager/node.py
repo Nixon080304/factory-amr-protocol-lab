@@ -15,7 +15,7 @@ from factory_interfaces.action import (
 )
 from geometry_msgs.msg import PoseStamped
 import math
-from factory_interfaces.msg import RobotState
+from factory_interfaces.msg import ProtocolEvent, RobotState
 from factory_interfaces.srv import (
     AcquireResource,
     CancelResourceWait,
@@ -40,6 +40,7 @@ from fleet_manager.adapter import (
 from fleet_manager.config import load_fleet_config
 from fleet_manager.journal import MissionJournal, MissionState
 from fleet_manager.models import CostEstimate, MissionRequest
+from fleet_manager.web import FleetDashboard
 
 
 def _request(goal):
@@ -203,6 +204,38 @@ class FleetManagerNode(Node):
             callback_group=self.protocol_group,
             clock=Clock(clock_type=ClockType.STEADY_TIME),
         )
+        self.dashboard = None
+        enabled = self.declare_parameter("dashboard_enabled", False).value
+        host = self.declare_parameter("dashboard_host", "127.0.0.1").value
+        port = self.declare_parameter("dashboard_port", 8080).value
+        if enabled:
+            dashboard = None
+            try:
+                dashboard = FleetDashboard(
+                    host=host, port=port, journal_path=journal_path
+                )
+                dashboard.capture(self.adapter)
+                dashboard.start()
+                self.dashboard = dashboard
+                self.dashboard_events = self.create_subscription(
+                    ProtocolEvent,
+                    "/factory/protocol_events",
+                    self._dashboard_event,
+                    100,
+                    callback_group=self.protocol_group,
+                )
+            except Exception as error:
+                if dashboard is not None:
+                    dashboard.stop()
+                self.dashboard = None
+                self.get_logger().warning(f"Dashboard unavailable: {error}")
+
+    def _dashboard_event(self, message):
+        try:
+            if self.dashboard is not None:
+                self.dashboard.observe_event(message)
+        except Exception as error:
+            self.get_logger().warning(f"Dashboard observation failed: {error}")
 
     def _tick(self):
         for robot, subscription in zip(self.adapter.config.robots, self.contacts):
@@ -227,6 +260,11 @@ class FleetManagerNode(Node):
             self.adapter.tick()
         except sqlite3.Error as error:
             self.get_logger().error(str(error))
+        try:
+            if self.dashboard is not None:
+                self.dashboard.capture(self.adapter)
+        except Exception as error:
+            self.get_logger().warning(f"Dashboard observation failed: {error}")
 
     def _observe(self, robot_id, message, info=None):
         try:
@@ -517,6 +555,11 @@ class FleetManagerNode(Node):
         return response
 
     def destroy_node(self):
+        if getattr(self, "dashboard", None) is not None:
+            try:
+                self.dashboard.stop()
+            except Exception as error:
+                self.get_logger().warning(f"Dashboard cleanup failed: {error}")
         self.server.destroy()
         for client in self.actions.values():
             client.destroy()

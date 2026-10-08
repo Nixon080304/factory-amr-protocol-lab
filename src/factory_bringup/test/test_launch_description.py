@@ -122,3 +122,33 @@ def test_fleet_contact_publishers_follow_configured_namespaces_and_dock(monkeypa
             and values["dock_id"] == config.energy.dock_id
         )
         assert values["charging_pose"] == (4.0, -2.0, 0.0)
+
+
+@pytest.mark.parametrize("enabled,port", [("true", "8080"), ("false", "9090")])
+def test_demo_has_one_configurable_node_owned_dashboard(monkeypatch, enabled, port):
+    package = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "dashboard_demo_launch", package / "launch/demo.launch.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(
+        module, "get_package_share_directory", lambda name: str(package.parent / name)
+    )
+    description = module.generate_launch_description()
+    managers = [
+        node
+        for node in description.entities
+        if isinstance(node, Node) and node.node_package == "fleet_manager"
+    ]
+    assert len(managers) == 1
+    context = LaunchContext()
+    context.launch_configurations.update(journal_path="artifacts/fleet/test.sqlite3")
+    if enabled == "false":
+        context.launch_configurations.update(
+            dashboard_enabled=enabled, dashboard_port=port
+        )
+    values = evaluate_parameters(context, managers[0]._Node__parameters)
+    merged = {key: value for parameter in values for key, value in parameter.items()}
+    assert merged["dashboard_enabled"] is (enabled == "true")
+    assert merged["dashboard_port"] == int(port)

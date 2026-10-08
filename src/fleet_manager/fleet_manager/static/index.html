@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Factory fleet · Live operations</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/styles.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to fleet state</a>
+  <header class="masthead">
+    <div class="brand"><span class="brand-mark" aria-hidden="true">F</span><span>FACTORY / FLEET LAB</span></div>
+    <span class="observer-label">READ-ONLY OBSERVER</span>
+  </header>
+  <main id="main">
+    <section class="intro" aria-labelledby="page-title">
+      <div><p class="eyebrow">OPERATIONS OVERVIEW</p><h1 id="page-title">One factory.<br>Every robot in view.</h1><p class="lede">Assignments, shared resources and modeled energy.<br>Live evidence from the fleet manager.</p></div>
+      <div class="connection-panel"><p id="connection" role="status" aria-live="polite" data-state="connecting">Connecting…</p><p id="last-update">Waiting for first snapshot</p><p id="sequence">No sequence received</p></div>
+    </section>
+    <div class="summary" aria-label="Fleet summary"><div><span>REGISTERED ROBOTS</span><strong id="robot-count">—</strong></div><div><span>ACTIVE MISSIONS</span><strong id="mission-count">—</strong></div><div><span>MANAGER STATE</span><strong id="fleet-state">STARTING</strong></div></div>
+    <section aria-labelledby="robots-title"><div class="section-heading"><h2 id="robots-title">Robot fleet</h2><p>Battery uses deterministic simulation model</p></div><div id="robots" class="robot-grid"><p class="empty">Waiting for robot observations.</p></div></section>
+    <div class="operations-grid">
+      <section aria-labelledby="resources-title"><div class="section-heading"><h2 id="resources-title">Shared resources</h2><p>Capacity one · explicit ownership</p></div><div id="resources" class="resource-list"><p class="empty">Waiting for resource state.</p></div></section>
+      <section aria-labelledby="dock-title"><div class="section-heading"><h2 id="dock-title">Dock &amp; charging</h2><p>Target 80% · reserve 20%</p></div><div id="dock" class="dock-panel"><p class="empty">Waiting for dock state.</p></div></section>
+    </div>
+    <section aria-labelledby="missions-title"><div class="section-heading"><h2 id="missions-title">Mission journal</h2><p>Latest 100 persisted missions · includes restart history</p></div><div id="missions" class="mission-list"><p class="empty">No missions recorded.</p></div></section>
+    <section aria-labelledby="events-title"><div class="section-heading"><h2 id="events-title">Recent activity</h2><p>Latest 50 mission and protocol events</p></div><ol id="events" class="event-list"><li class="empty">No events received.</li></ol></section>
+  </main>
+  <footer><span>MQTT · ROS 2 / DDS · Modbus TCP</span><span>Simulation lab · no physical safety claim</span></footer>
+</body>
+</html>

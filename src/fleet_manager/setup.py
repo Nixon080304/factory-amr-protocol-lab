@@ -5,6 +5,14 @@ setup(
     name="fleet_manager",
     version="0.1.0",
     packages=find_packages(exclude=["test"]),
+    package_data={
+        "fleet_manager": [
+            "static/*.html",
+            "static/*.css",
+            "static/*.js",
+            "static/*.svg",
+        ]
+    },
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/fleet_manager"]),
         ("share/fleet_manager", ["package.xml"]),

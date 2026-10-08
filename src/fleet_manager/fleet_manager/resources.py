@@ -2,6 +2,7 @@
 """Coordinate shared resources without transport or clock side effects."""
 
 from dataclasses import dataclass, replace
+from itertools import islice
 import math
 import secrets
 from threading import Lock
@@ -388,3 +389,31 @@ class ResourceManager:
                 )
                 for resource in self._resources.values()
             )
+
+    def observer_snapshot(self) -> tuple[ResourceSnapshot, ...] | None:
+        """Read detached evidence without expiring authority or waiting for a writer.
+
+        The web observer projects expired authority as uncertain. It never invokes
+        snapshot(), whose expiry behavior belongs to the fleet control path.
+        """
+        if not self._lock.acquire(blocking=False):
+            return None
+        try:
+            return tuple(
+                ResourceSnapshot(
+                    resource.resource_id,
+                    resource.kind,
+                    resource.capacity,
+                    self._leases.get(resource.resource_id),
+                    tuple(
+                        waiter.request
+                        for waiter in self._queues[resource.resource_id][:100]
+                    ),
+                    resource.resource_id in self._former,
+                    next(iter(self._former.get(resource.resource_id, ())), None),
+                    self._former.get(resource.resource_id, ())[:100],
+                )
+                for resource in islice(self._resources.values(), 100)
+            )
+        finally:
+            self._lock.release()
