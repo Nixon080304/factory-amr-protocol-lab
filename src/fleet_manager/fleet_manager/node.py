@@ -226,7 +226,12 @@ class FleetManagerNode(Node):
                 )
             except Exception as error:
                 if dashboard is not None:
-                    dashboard.stop()
+                    try:
+                        dashboard.stop()
+                    except Exception as cleanup_error:
+                        self.get_logger().warning(
+                            f"Dashboard cleanup failed: {cleanup_error}"
+                        )
                 self.dashboard = None
                 self.get_logger().warning(f"Dashboard unavailable: {error}")
 

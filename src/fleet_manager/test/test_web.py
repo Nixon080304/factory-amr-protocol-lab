@@ -699,3 +699,321 @@ def test_observer_resource_collection_stops_iteration_at_its_bound():
     assert len(projected) == 100
     assert projected[0].resource_id == "zone-0"
     assert projected[-1].resource_id == "zone-99"
+
+
+@pytest.mark.parametrize("path", ["/", "/api/snapshot", "/api/events", "/app.js"])
+@pytest.mark.parametrize(
+    "authority",
+    [
+        None,
+        "attacker.example",
+        "localhost",
+        "localhost:1",
+        "localhost.:PORT",
+        "user@localhost:PORT",
+        "127.0.0.1:PORT:80",
+        "[::1]:PORT",
+        "LOCALHOST:PORT",
+        "localhost:PORT\r\nHost: 127.0.0.1:PORT",
+    ],
+)
+def test_rebinding_authorities_fail_before_every_route(dashboard, path, authority):
+    headers = (
+        ""
+        if authority is None
+        else "Host: " + authority.replace("PORT", str(dashboard.address[1])) + "\r\n"
+    )
+    with socket.create_connection(dashboard.address, timeout=2) as connection:
+        connection.sendall(f"GET {path} HTTP/1.1\r\n{headers}\r\n".encode())
+        response = connection.recv(4096)
+    assert response.startswith(b"HTTP/1.0 400 "), response
+    assert dashboard.hub.client_count == 0
+
+
+@pytest.mark.parametrize("name", ["localhost", "127.0.0.1"])
+def test_exact_bound_authority_is_accepted(dashboard, name):
+    connection = http.client.HTTPConnection(*dashboard.address, timeout=2)
+    connection.request(
+        "GET", "/api/snapshot", headers={"Host": f"{name}:{dashboard.address[1]}"}
+    )
+    assert connection.getresponse().status == 200
+    connection.close()
+
+
+@pytest.mark.parametrize("failure", ["bind", "start-and-stop"])
+def test_observer_runtime_failure_keeps_real_fleet_journal_and_tick_operational(
+    tmp_path, monkeypatch, failure
+):
+    import rclpy
+    from rclpy.context import Context
+    from rclpy.parameter import Parameter
+    from fleet_manager.node import FleetManagerNode
+
+    occupied = socket.socket()
+    occupied.bind(("127.0.0.1", 0))
+    occupied.listen()
+    dashboards = []
+    if failure == "start-and-stop":
+        real_stop = api().FleetDashboard.stop
+
+        def failed_start(dashboard):
+            dashboards.append(dashboard)
+            raise RuntimeError("observer thread unavailable")
+
+        def failed_stop(dashboard):
+            real_stop(dashboard)
+            raise OSError("observer cleanup unavailable")
+
+        monkeypatch.setattr(api().FleetDashboard, "start", failed_start)
+        monkeypatch.setattr(api().FleetDashboard, "stop", failed_stop)
+    context = Context()
+    rclpy.init(context=context, domain_id=88)
+    node = None
+    journal_path = tmp_path / "runtime.sqlite3"
+    try:
+        node = FleetManagerNode(
+            context=context,
+            parameter_overrides=[
+                Parameter(
+                    "fleet_file",
+                    value=str(
+                        Path(__file__).resolve().parents[2]
+                        / "factory_bringup/config/fleet.yaml"
+                    ),
+                ),
+                Parameter("journal_path", value=str(journal_path)),
+                Parameter("dashboard_enabled", value=True),
+                Parameter("dashboard_port", value=occupied.getsockname()[1]),
+            ],
+        )
+        assert node.dashboard is None
+        assert len(node.actions) == 2 and not node._journal_lock.closed
+        node.journal.register(
+            MissionRequest("still-operational", "assembly", "inspection", "motor"),
+            "hash",
+            100,
+        )
+        node._tick()
+        assert node.journal.get("still-operational") is not None
+        assert len(node.adapter.resources.observer_snapshot()) == 4
+        node.destroy_node()
+        assert node._journal_lock.closed
+        with pytest.raises(sqlite3.ProgrammingError):
+            node.journal.get("still-operational")
+        for dashboard in dashboards:
+            assert dashboard._server is None
+            assert dashboard.hub.client_count == 0
+    finally:
+        if node is not None and not node._journal_lock.closed:
+            node.destroy_node()
+        occupied.close()
+        context.shutdown()
+
+
+def test_all_quarantine_claimants_remain_distinct_from_live_authority(tmp_path):
+    from fleet_manager.resources import Lease
+
+    path, journal, adapter = rig(tmp_path)
+    adapter.resources.quarantine_evidence(
+        Lease("amr_01", "former-1", "central_aisle", "old-1", 90)
+    )
+    adapter.resources.quarantine_evidence(
+        Lease("amr_02", "former-2", "central_aisle", "old-2", 90)
+    )
+    server = api().FleetDashboard(port=0, journal_path=path)
+    server.capture(adapter)
+    server.start()
+    try:
+        wait_for(lambda: json.loads(request(server)[1])["robots"])
+        value = json.loads(request(server)[1])
+        aisle = next(
+            row for row in value["resources"] if row["resource_id"] == "central_aisle"
+        )
+        assert aisle["owner"] is None
+        assert aisle["unresolved_claimants"] == ["amr_01", "amr_02"]
+        assert [claim["mission_id"] for claim in aisle["former_leases"]] == [
+            "former-1",
+            "former-2",
+        ]
+        robots = {robot["robot_id"]: robot for robot in value["robots"]}
+        assert robots["amr_01"]["current_resource"] == "dock_01"
+        assert robots["amr_02"]["current_resource"] is None
+        assert robots["amr_02"]["unresolved_resources"] == ["central_aisle"]
+    finally:
+        server.stop()
+        journal.close()
+
+
+def test_dense_waiters_never_poison_schema_or_hide_truncation(dashboard):
+    value = snapshot()
+    value["resources"] = [
+        {
+            "resource_id": f"zone-{number}",
+            "kind": "traffic_zone",
+            "owner": None,
+            "waiters": [f"amr-{waiter}" for waiter in range(15)],
+        }
+        for number in range(100)
+    ]
+    dashboard.hub.publish(value)
+    result = json.loads(request(dashboard)[1])
+    assert len(result["resources"]) == 100
+    assert all(
+        isinstance(row, dict)
+        and isinstance(row["resource_id"], str)
+        and all(isinstance(waiter, str) for waiter in row["waiters"])
+        for row in result["resources"]
+    )
+    assert result["truncation"]["resources"] == 0
+    value["resources"] *= 2
+    dashboard.hub.publish(value)
+    result = json.loads(request(dashboard)[1])
+    assert result["truncation"]["resources"] == 100
+
+
+def test_active_equal_timestamp_query_has_bounded_index_work_and_no_sort(tmp_path):
+    path, journal, adapter = rig(tmp_path)
+    columns = [
+        row[1] for row in journal._connection.execute("PRAGMA table_info(missions)")
+    ]
+    template = dict(
+        journal._connection.execute("SELECT * FROM missions LIMIT 1").fetchone()
+    )
+    values = []
+    for number in range(10000):
+        row = dict(
+            template, mission_id=f"active-{number:05}", state="QUEUED", created_at=100
+        )
+        values.append(tuple(row[column] for column in columns))
+    journal._connection.execute("BEGIN")
+    journal._connection.executemany(
+        "INSERT INTO missions ("
+        + ",".join(columns)
+        + ") VALUES ("
+        + ",".join("?" for _ in columns)
+        + ")",
+        values,
+    )
+    journal._connection.commit()
+    journal.close()
+    with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=0) as connection:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only=ON")
+        plans = []
+
+        class Queries:
+            def execute(self, sql, parameters=()):
+                plans.append(
+                    [
+                        row[3]
+                        for row in connection.execute(
+                            "EXPLAIN QUERY PLAN " + sql, parameters
+                        )
+                    ]
+                )
+                return connection.execute(sql, parameters)
+
+        steps = [0]
+
+        def progress():
+            steps[0] += 1
+            return int(steps[0] > 200)
+
+        connection.set_progress_handler(progress, 100)
+        try:
+            missions, _ = api().FleetDashboard(port=0)._read_journal(Queries())
+        except sqlite3.OperationalError as error:
+            pytest.fail(
+                f"observer exceeds 20,000 VM instruction budget: {error}; {plans}"
+            )
+        assert len(missions) == 100 and missions[0]["mission_id"] == "active-00000"
+        assert any("missions_active" in plan for plan in plans[0])
+        assert not any(
+            "TEMP B-TREE" in plan or plan == "SCAN missions" for plan in plans[0]
+        )
+
+
+def test_all_advertised_maxima_and_bad_optional_data_stay_browser_acceptable(dashboard):
+    text = "界" * 300
+    value = snapshot()
+    value["fleet_state"] = {"bad": list(range(100))}
+    value["robots"] = [
+        {
+            "robot_id": str(number),
+            "health_detail": text,
+            "unresolved_resources": [text] * 100,
+        }
+        for number in range(100)
+    ]
+    value["resources"] = [
+        {
+            "resource_id": str(number),
+            "kind": text,
+            "owner": None,
+            "waiters": [text] * 100,
+            "former_leases": [
+                {
+                    "robot_id": text,
+                    "mission_id": text,
+                    "resource_id": text,
+                    "lease_id": text,
+                    "expires_at": 100,
+                }
+            ]
+            * 100,
+            "unresolved_claimants": [text] * 100,
+        }
+        for number in range(100)
+    ]
+    value["missions"] = [
+        {"mission_id": str(number), "part": text} for number in range(100)
+    ]
+    value["dock_queue"] = [
+        {"robot_id": str(number), "dock_id": text, "state": text}
+        for number in range(100)
+    ]
+    value["events"] = [{"detail": text} for _ in range(50)]
+    dashboard.hub.publish(value)
+    body = request(dashboard)[1]
+    assert len(body) <= 512000
+    result = json.loads(body)
+    assert result["fleet_state"] == "UNKNOWN"
+    assert result["truncation"]["strings"] > 0
+    assert (
+        sum(
+            result["truncation"][key]
+            for key in ("robots", "resources", "missions", "dock_queue", "events")
+        )
+        > 0
+    )
+    script = """
+const fs = require('node:fs');
+(async () => {
+  const source = fs.readFileSync('src/fleet_manager/fleet_manager/static/app.js', 'utf8');
+  const {SnapshotOrder} = await import('data:text/javascript;base64,' + Buffer.from(source).toString('base64'));
+  const value = JSON.parse(fs.readFileSync(0, 'utf8'));
+  if (new SnapshotOrder().accept(value, true) !== 'new') process.exit(1);
+})().catch(error => { console.error(error); process.exit(2); });
+"""
+    process = subprocess.run(
+        ["node", "-e", script],
+        input=body,
+        capture_output=True,
+        timeout=10,
+        cwd=Path(__file__).resolve().parents[3],
+    )
+    assert process.returncode == 0, process.stderr
+
+
+def test_invalid_former_claim_entries_are_omitted_whole_with_visible_count(dashboard):
+    value = snapshot()
+    value["resources"] = [
+        {
+            "resource_id": "central_aisle",
+            "former_leases": [None, {"robot_id": "amr_02"}],
+        }
+    ]
+    dashboard.hub.publish(value)
+    result = json.loads(request(dashboard)[1])
+    assert result["resources"][0]["former_leases"] == []
+    assert result["truncation"]["fields"] == 2

@@ -33,6 +33,7 @@ try {
   assert.equal(order.accept(value), 'duplicate');
   assert.equal(order.accept({ ...value, robots: {} }), 'invalid');
   assert.equal(order.accept({ ...value, resources: [{ resource_id: 'dock_01', kind: 2, waiters: 'bad' }] }), 'invalid');
+  assert.equal(order.accept({ ...value, resources: [{ resource_id: 'dock_01', former_leases: [null] }] }), 'invalid');
   assert.equal(order.accept({ ...value, dock_queue: [null] }), 'invalid');
   assert.equal(order.accept({ ...value, sequence: 11, robots: [{ robot_id: '<script>', battery_percent: 'broken' }] }), 'invalid');
   assert.equal(order.accept({ ...value, session_id: 'session-two', sequence: 1 }), 'refresh');
@@ -90,11 +91,39 @@ try {
   await command('quarantine');
   await waitFor(() => browser.evaluate("document.querySelector('[data-resource-id=\"central_aisle\"]').textContent.includes('Reconciliation required')"), 'quarantined resource evidence');
   assert.equal(await browser.evaluate("document.querySelector('[data-resource-id=\"central_aisle\"]').textContent.includes('Waiters: amr_01')"), true, 'quarantine must retain visible waiters');
+  assert.equal(await browser.evaluate("document.querySelector('[data-resource-id=\"central_aisle\"]').textContent.includes('Unresolved claims: amr_02, amr_01')"), true, 'all claimants must remain visible');
+  assert.equal(await browser.evaluate("document.querySelector('[data-robot-id=\"amr_02\"]').textContent.includes('Unresolved: central_aisle')"), true, 'quarantine is not None held');
+  assert.equal(await browser.evaluate("document.querySelector('[data-resource-id=\"central_aisle\"] strong').textContent"), 'No live authority', 'quarantine is not proof of unoccupied physical space');
+  assert.equal(await browser.evaluate("Array.from(document.querySelector('[data-resource-id=\"central_aisle\"] .resource-state').querySelectorAll('span')).every((span, index, rows) => index === 0 || span.getBoundingClientRect().top >= rows[index - 1].getBoundingClientRect().bottom)"), true, 'waiters and claimant identities need separate readable lines');
+  const quarantinePhone = await browser.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: true });
+  await writeFile(`${evidence}/phone-quarantine.png`, Buffer.from(quarantinePhone.data, 'base64'));
+  await browser.send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 1100, deviceScaleFactor: 1, mobile: false });
+  const quarantineDesktop = await browser.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: true });
+  await writeFile(`${evidence}/desktop-quarantine.png`, Buffer.from(quarantineDesktop.data, 'base64'));
+  await browser.send('Emulation.setDeviceMetricsOverride', { width: 360, height: 800, deviceScaleFactor: 1, mobile: true });
+  await command('dense');
+  await waitFor(() => browser.evaluate("document.querySelectorAll('[data-resource-id]').length === 100"), 'dense waiter snapshot remains schema-valid');
+  await command('truncated');
+  await waitFor(() => browser.evaluate("document.querySelector('#truncation')?.textContent.includes('resources: 100')"), 'visible bounded snapshot truncation');
+  assert.equal(await browser.evaluate('document.documentElement.scrollWidth <= innerWidth'), true, 'dense phone overflow');
+  const truncatedPhone = await browser.send('Page.captureScreenshot', { format: 'png' });
+  await writeFile(`${evidence}/phone-truncated.png`, Buffer.from(truncatedPhone.data, 'base64'));
   await waitFor(() => browser.evaluate("document.querySelector('#connection').dataset.state === 'stale'"), 'frozen ROS capture becomes stale despite SSE heartbeats');
   assert.equal(await browser.evaluate("document.querySelectorAll('h1').length === 1 && document.querySelector('main') !== null && document.querySelector('#connection').getAttribute('role') === 'status'"), true);
   assert.deepEqual(exceptions, [], 'uncaught browser exceptions');
   assert.deepEqual(consoleErrors, [], 'browser console errors');
   assert.deepEqual(networkErrors, [], 'unexpected browser network errors');
+  const attacker = await chrome(['--host-resolver-rules=MAP dashboard.attacker.test 127.0.0.1', '--no-proxy-server']);
+  try {
+    const responses = [];
+    attacker.onEvent(message => { if (message.method === 'Network.responseReceived') responses.push(message.params.response); });
+    await attacker.send('Network.enable');
+    await attacker.send('Page.enable');
+    await attacker.send('Page.navigate', { url: url.replace('127.0.0.1', 'dashboard.attacker.test') + '/api/snapshot' });
+    await waitFor(() => responses.length > 0, 'browser rebinding response');
+    assert.equal(responses[0].status, 400, 'attacker origin must not read loopback snapshot');
+    assert.ok(!responses.some(response => response.status === 200), 'no observer route exposed to attacker origin');
+  } finally { await attacker.close(); }
   console.log(`PASS real Chrome: two robots, dock owner, SSE transition, stale/reconnect, fresh snapshot, desktop/360px phone, no console/network exceptions. Screenshots: ${evidence}`);
 } finally {
   if (browser) await browser.close();

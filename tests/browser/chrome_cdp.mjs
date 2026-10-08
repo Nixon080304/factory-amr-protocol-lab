@@ -5,12 +5,12 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-export async function chrome() {
+export async function chrome(extraArguments = []) {
   const profile = await mkdtemp(join(tmpdir(), 'fleet-dashboard-chrome-'));
   const process = spawn(globalThis.process.env.CHROME ?? '/usr/bin/google-chrome', [
     '--headless=new', '--no-sandbox', '--disable-dev-shm-usage',
     '--disable-background-networking', '--no-first-run', '--no-default-browser-check',
-    '--remote-debugging-pipe', `--user-data-dir=${profile}`, 'about:blank',
+    '--remote-debugging-pipe', `--user-data-dir=${profile}`, ...extraArguments, 'about:blank',
   ], { stdio: ['ignore', 'ignore', 'pipe', 'pipe', 'pipe'] });
   let next = 0;
   let buffered = '';

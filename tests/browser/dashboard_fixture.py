@@ -12,7 +12,7 @@ from fleet_manager.adapter import FleetAdapter
 from fleet_manager.config import Pose2D, load_fleet_config
 from fleet_manager.journal import MissionJournal, MissionState
 from fleet_manager.models import MissionRequest, RobotSnapshot
-from fleet_manager.resources import LeaseRequest
+from fleet_manager.resources import Lease, LeaseRequest
 
 
 def main():
@@ -94,7 +94,31 @@ def main():
                     server.start()
                 elif command["command"] == "quarantine":
                     adapter.resources.expire(200)
+                    adapter.resources.quarantine_evidence(
+                        Lease(
+                            "amr_01", "former-aisle", "central_aisle", "old-aisle", 90
+                        )
+                    )
                     server.capture(adapter)
+                elif command["command"] == "dense":
+                    with server._capture_lock:
+                        server._capture = None
+                    snapshot = json.loads(server.hub.snapshot_bytes())
+                    snapshot["updated_at"] = __import__("time").time()
+                    snapshot["resources"] = [
+                        {
+                            "resource_id": f"zone-{number}",
+                            "kind": "traffic_zone",
+                            "owner": None,
+                            "waiters": [f"amr-{waiter}" for waiter in range(15)],
+                        }
+                        for number in range(100)
+                    ]
+                    server.hub.publish(snapshot)
+                elif command["command"] == "truncated":
+                    snapshot = json.loads(server.hub.snapshot_bytes())
+                    snapshot["resources"] *= 2
+                    server.hub.publish(snapshot)
                 elif command["command"] == "quit":
                     break
                 print(json.dumps({"done": command["command"]}), flush=True)

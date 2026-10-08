@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 const lists = ['robots', 'missions', 'resources', 'dock_queue', 'events'];
 const optionalString = value => value == null || typeof value === 'string';
+const stringList = value => value == null || Array.isArray(value) && value.length <= 100 && value.every(item => typeof item === 'string' && item.length <= 256);
 
 export class SnapshotOrder {
   constructor() { this.session = null; this.sequence = -1; }
@@ -13,14 +14,18 @@ export class SnapshotOrder {
         && robot.robot_id.length <= 256 && (robot.battery_percent == null ||
           (Number.isFinite(robot.battery_percent) && robot.battery_percent >= 0 && robot.battery_percent <= 100))
         && ['mode', 'health', 'payload_state', 'mission_id', 'health_detail', 'fault', 'current_resource'].every(key => optionalString(robot[key]))
+        && stringList(robot.unresolved_resources)
         && (robot.pose == null || ['x', 'y', 'yaw'].every(key => Number.isFinite(robot.pose[key]))))
       || !value.resources.every(resource => resource && typeof resource.resource_id === 'string'
         && optionalString(resource.kind) && optionalString(resource.owner)
-        && (resource.waiters == null || Array.isArray(resource.waiters) && resource.waiters.every(waiter => typeof waiter === 'string')))
+        && stringList(resource.waiters) && stringList(resource.unresolved_claimants)
+        && (resource.former_leases == null || Array.isArray(resource.former_leases) && resource.former_leases.length <= 100 && resource.former_leases.every(claim => claim && ['robot_id', 'mission_id', 'resource_id', 'lease_id'].every(key => typeof claim[key] === 'string' && claim[key].length <= 256))))
       || !value.missions.every(mission => mission && typeof mission.mission_id === 'string'
         && ['state', 'assigned_robot_id', 'pickup_station', 'dropoff_station', 'part'].every(key => optionalString(mission[key])))
       || !value.dock_queue.every(charge => charge && typeof charge.robot_id === 'string' && typeof charge.dock_id === 'string' && typeof charge.state === 'string')
       || !value.events.every(event => event && typeof event === 'object')) return 'invalid';
+    if (value.truncation != null && (typeof value.truncation !== 'object' || Array.isArray(value.truncation)
+      || !Object.values(value.truncation).every(count => Number.isSafeInteger(count) && count >= 0))) return 'invalid';
     if (!refresh && this.session !== null && this.session !== value.session_id) return 'refresh';
     if (this.session === value.session_id && value.sequence < this.sequence) return 'old';
     if (this.session === value.session_id && value.sequence === this.sequence) return 'duplicate';
@@ -48,6 +53,10 @@ function fields(entries) {
 }
 
 function render(value) {
+  const truncation = document.querySelector('#truncation');
+  const dropped = Object.entries(value.truncation ?? {}).filter(([, count]) => count > 0);
+  truncation.hidden = dropped.length === 0;
+  truncation.textContent = dropped.length ? `Bounded observation · omitted or shortened ${dropped.map(([key, count]) => `${key}: ${count}`).join(' · ')}` : '';
   const robots = document.querySelector('#robots');
   robots.replaceChildren();
   for (const robot of value.robots) {
@@ -66,7 +75,8 @@ function render(value) {
       card.append(meter);
     }
     const pose = robot.pose ? `${Number(robot.pose.x).toFixed(2)}, ${Number(robot.pose.y).toFixed(2)} m` : 'Unknown';
-    card.append(fields([['HEALTH', robot.health ?? 'UNKNOWN'], ['ASSIGNMENT', robot.mission_id ?? 'Unassigned'], ['PAYLOAD', robot.payload_state ?? 'UNKNOWN'], ['RESOURCE', robot.current_resource ?? 'None held'], ['POSE', pose]]));
+    const resourceText = robot.unresolved_resources?.length ? `${robot.current_resource ? 'Held: ' + robot.current_resource : 'No live authority'} · Unresolved: ${robot.unresolved_resources.join(', ')}` : robot.current_resource ?? 'None held';
+    card.append(fields([['HEALTH', robot.health ?? 'UNKNOWN'], ['ASSIGNMENT', robot.mission_id ?? 'Unassigned'], ['PAYLOAD', robot.payload_state ?? 'UNKNOWN'], ['RESOURCE', resourceText], ['POSE', pose]]));
     if (robot.health_detail || robot.fault) card.append(element('p', robot.health_detail || robot.fault, 'health-detail'));
     robots.append(card);
   }
@@ -78,8 +88,10 @@ function render(value) {
     const name = element('div', resource.resource_id, 'resource-name');
     name.append(element('small', resource.kind?.replaceAll('_', ' ') ?? 'resource'));
     const state = element('div', undefined, 'resource-state');
-    state.append(element('strong', resource.owner ?? 'Unoccupied'));
+    state.append(element('strong', resource.owner ?? (resource.reconciliation_required || resource.unresolved_claimants?.length ? 'No live authority' : 'Unoccupied')));
     state.append(element('span', `Waiters: ${(resource.waiters ?? []).join(', ') || 'none'}`));
+    if (resource.unresolved_claimants?.length) state.append(element('span', `Unresolved claims: ${resource.unresolved_claimants.join(', ')}`, 'uncertain'));
+    for (const claim of resource.former_leases ?? []) state.append(element('span', `${claim.robot_id} / ${claim.mission_id} / ${claim.lease_id}`, 'meta'));
     if (resource.reconciliation_required) state.append(element('span', ' · Reconciliation required', 'uncertain'));
     row.append(name, state); resources.append(row);
   }

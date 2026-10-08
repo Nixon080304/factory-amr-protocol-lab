@@ -23,14 +23,16 @@ import threading
 import time
 
 
-def _plain(value, budget, depth=0):
+def _plain(value, budget, depth=0, truncation=None):
     """Copy only bounded plain data, including broken Unicode and nonfinite floats."""
     if budget[0] <= 0 or depth > 6:
-        return None
+        raise ValueError("plain row exceeds serialization bound")
     budget[0] -= 1
     if value is None or type(value) is bool:
         return value
     if isinstance(value, str):
+        if truncation is not None and len(value) > 256:
+            truncation["strings"] += 1
         return value[:256].encode("utf-8", "replace").decode("utf-8")
     if type(value) in (float, int):
         try:
@@ -38,13 +40,17 @@ def _plain(value, budget, depth=0):
         except OverflowError:
             return None
     if type(value) is dict:
+        if truncation is not None:
+            truncation["fields"] += max(0, len(value) - 32)
         return {
-            key[:64]: _plain(item, budget, depth + 1)
+            key[:64]: _plain(item, budget, depth + 1, truncation)
             for key, item in islice(value.items(), 32)
             if type(key) is str and key.isascii()
         }
     if type(value) in (list, tuple):
-        return [_plain(item, budget, depth + 1) for item in value[:100]]
+        if truncation is not None:
+            truncation["fields"] += max(0, len(value) - 100)
+        return [_plain(item, budget, depth + 1, truncation) for item in value[:100]]
     return None
 
 
@@ -86,13 +92,133 @@ class SnapshotHub:
             return len(self._clients)
 
     def publish(self, snapshot):
-        value = {
-            key: _plain(snapshot.get(key, default), [2000])
-            for key, default in _empty().items()
+        value = _empty()
+        truncation = {
+            key: 0
+            for key in (
+                "robots",
+                "missions",
+                "resources",
+                "dock_queue",
+                "events",
+                "fields",
+                "strings",
+            )
         }
-        value["events"] = (
-            value["events"][-50:] if isinstance(value["events"], list) else []
-        )
+        for key in ("updated_at", "fleet_state"):
+            raw = snapshot.get(key, value[key])
+            value[key] = (
+                _plain(raw, [8], truncation=truncation)
+                if type(raw) in (str, int, float, type(None))
+                else None
+            )
+        if type(value["updated_at"]) not in (int, float):
+            value["updated_at"] = None
+        if not isinstance(value["fleet_state"], str):
+            value["fleet_state"] = "UNKNOWN"
+        required = {
+            "robots": ("robot_id",),
+            "missions": ("mission_id",),
+            "resources": ("resource_id",),
+            "dock_queue": ("robot_id", "dock_id", "state"),
+            "events": (),
+        }
+        wire_size = 4096  # Reserve scalar fields, sequence, session and counts.
+        for key, identifiers in required.items():
+            rows = snapshot.get(key, [])
+            if type(rows) not in (list, tuple):
+                continue
+            limit = 50 if key == "events" else 100
+            truncation[key] = max(0, len(rows) - limit)
+            for row in rows[-limit:] if key == "events" else rows[:limit]:
+                try:
+                    item = _plain(row, [4096], truncation=truncation)
+                except ValueError:
+                    item = None
+                if not isinstance(item, dict) or any(
+                    not isinstance(item.get(name), str) for name in identifiers
+                ):
+                    truncation[key] += 1
+                    continue
+                # Rows are emitted atomically. Invalid optional scalar evidence is
+                # unknown, never a partial container that poisons the whole page.
+                for name in (
+                    "mode",
+                    "health",
+                    "payload_state",
+                    "mission_id",
+                    "health_detail",
+                    "fault",
+                    "current_resource",
+                    "kind",
+                    "owner",
+                    "state",
+                    "assigned_robot_id",
+                    "pickup_station",
+                    "dropoff_station",
+                    "part",
+                ):
+                    if (
+                        name in item
+                        and item[name] is not None
+                        and not isinstance(item[name], str)
+                    ):
+                        item[name] = None
+                for name in ("waiters", "unresolved_claimants", "unresolved_resources"):
+                    if name in item:
+                        members = item[name] if isinstance(item[name], list) else []
+                        item[name] = [
+                            member for member in members if isinstance(member, str)
+                        ]
+                        truncation["fields"] += len(members) - len(item[name])
+                if "former_leases" in item:
+                    claims = (
+                        item["former_leases"]
+                        if isinstance(item["former_leases"], list)
+                        else []
+                    )
+                    item["former_leases"] = [
+                        claim
+                        for claim in claims
+                        if isinstance(claim, dict)
+                        and all(
+                            isinstance(claim.get(name), str)
+                            for name in (
+                                "robot_id",
+                                "mission_id",
+                                "resource_id",
+                                "lease_id",
+                            )
+                        )
+                    ]
+                    truncation["fields"] += len(claims) - len(item["former_leases"])
+                if key == "robots":
+                    battery = item.get("battery_percent")
+                    if type(battery) not in (int, float) or not 0 <= battery <= 100:
+                        item["battery_percent"] = None
+                    pose = item.get("pose")
+                    if not isinstance(pose, dict) or any(
+                        type(pose.get(axis)) not in (int, float)
+                        for axis in ("x", "y", "yaw")
+                    ):
+                        item["pose"] = None
+                row_size = (
+                    len(
+                        json.dumps(
+                            item,
+                            ensure_ascii=True,
+                            allow_nan=False,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    )
+                    + 1
+                )
+                if wire_size + row_size > 512000:
+                    truncation[key] += 1
+                    continue
+                wire_size += row_size
+                value[key].append(item)
+        value["truncation"] = truncation
         with self._lock:
             self._sequence += 1
             value.update(sequence=self._sequence, session_id=self._session)
@@ -104,7 +230,13 @@ class SnapshotHub:
                 largest = max(
                     (
                         key
-                        for key in ("missions", "events", "resources", "robots")
+                        for key in (
+                            "missions",
+                            "events",
+                            "resources",
+                            "robots",
+                            "dock_queue",
+                        )
                         if isinstance(value[key], list) and value[key]
                     ),
                     key=lambda key: len(json.dumps(value[key])),
@@ -112,7 +244,8 @@ class SnapshotHub:
                 )
                 if largest is None:
                     break
-                value[largest] = value[largest][: len(value[largest]) // 2]
+                value[largest].pop()
+                truncation[largest] += 1
                 body = json.dumps(
                     value, ensure_ascii=True, allow_nan=False, separators=(",", ":")
                 ).encode("utf-8")
@@ -210,6 +343,20 @@ class _Handler(BaseHTTPRequestHandler):
 
     def log_message(self, *_):
         pass
+
+    def parse_request(self):
+        if not super().parse_request():
+            return False
+        port = self.server.server_port
+        allowed = {f"127.0.0.1:{port}", f"localhost:{port}"}
+        if port == 80:
+            allowed.update(("127.0.0.1", "localhost"))
+        hosts = self.headers.get_all("Host", [])
+        if len(hosts) != 1 or hosts[0] not in allowed:
+            self._reply(400, b"", "text/plain; charset=utf-8")
+            self.close_connection = True
+            return False
+        return True
 
     def __getattr__(self, name):
         if name.startswith("do_"):
@@ -416,7 +563,7 @@ class FleetDashboard:
             dict(row)
             for row in connection.execute(
                 columns + "WHERE state NOT IN ('COMPLETED','FAILED','CANCELLED') "
-                "ORDER BY created_at,mission_id LIMIT 100"
+                "ORDER BY missions.created_at,missions.mission_id LIMIT 100"
             )
         ]
         missions.extend(
@@ -459,21 +606,37 @@ class FleetDashboard:
                     value = _empty()
                     value.update(fleet_state=state, updated_at=updated_at)
                     owners = {}
+                    unresolved = {}
                     for resource in resources:
                         expired = (
                             resource.lease is not None
                             and resource.lease.expires_at <= now
                         )
-                        owner = resource.lease or resource.former_lease
+                        owner = resource.lease if not expired else None
+                        claims = resource.former_leases or (
+                            (resource.former_lease,) if resource.former_lease else ()
+                        )
+                        if expired:
+                            claims = (resource.lease,) + claims
                         if owner:
                             owners.setdefault(owner.robot_id, []).append(
                                 resource.resource_id
                             )
+                        for claim in claims:
+                            resources_for_robot = unresolved.setdefault(
+                                claim.robot_id, []
+                            )
+                            if resource.resource_id not in resources_for_robot:
+                                resources_for_robot.append(resource.resource_id)
                         value["resources"].append(
                             {
                                 "resource_id": resource.resource_id,
                                 "kind": resource.kind,
                                 "owner": owner.robot_id if owner else None,
+                                "former_leases": [asdict(claim) for claim in claims],
+                                "unresolved_claimants": list(
+                                    dict.fromkeys(claim.robot_id for claim in claims)
+                                ),
                                 "waiters": [
                                     waiter.robot_id for waiter in resource.waiters
                                 ],
@@ -485,6 +648,9 @@ class FleetDashboard:
                         item = asdict(robot)
                         item["current_resource"] = (
                             ", ".join(owners.get(robot.robot_id, ())) or None
+                        )
+                        item["unresolved_resources"] = unresolved.get(
+                            robot.robot_id, []
                         )
                         value["robots"].append(item)
                     value["dock_queue"] = [asdict(charge) for charge in charging]
