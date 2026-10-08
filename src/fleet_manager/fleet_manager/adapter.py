@@ -185,6 +185,7 @@ class FleetAdapter:
         self._startup_observed = set()
         self._source_times = {}
         self._contacts = {}
+        self._resource_clearances = []
 
     def _reconcile_startup(self, now):
         if self.state != "RECONCILING":
@@ -229,7 +230,8 @@ class FleetAdapter:
                     robots[robot_id] = replace(robot, mode=mode)
                     self.registry.observe(robots[robot_id], now)
         decisions = policy.plan(active, robots, snapshots)
-        self.journal.reconcile(decisions, snapshots, now)
+        self.journal.reconcile(decisions, snapshots, now, self._resource_clearances)
+        self._resource_clearances.clear()
         self.state = "RUNNING"
         for decision in decisions:
             self._emit(self.journal.get(decision.mission_id))
@@ -246,6 +248,15 @@ class FleetAdapter:
             owners.update(self.journal.recovery_carriers(record.request.mission_id))
             if record.assigned_robot_id is not None:
                 owners.add(record.assigned_robot_id)
+            physical = list(
+                self.journal.recovery_physical_claims(record.request.mission_id)
+            )
+            known = {owner for owner, _ in physical}
+            physical.extend(
+                (owner, f"restart-assignment-{record.request.mission_id}-{owner}")
+                for owner in sorted(owners - known)
+            )
+            owners.update(owner for owner, _ in physical)
             if not owners or (
                 record.state
                 not in (
@@ -266,10 +277,20 @@ class FleetAdapter:
                 if resource.resource_id in related and resource.lease is None:
                     # This identity names quarantine evidence, not an issued
                     # authority token. No live lease is created or restored.
-                    for robot_id in sorted(owners):
+                    for robot_id, evidence_id in physical:
+                        if self.journal.claim_resolved(
+                            LeaseKey(
+                                robot_id,
+                                record.request.mission_id,
+                                resource.resource_id,
+                                evidence_id,
+                            )
+                        ):
+                            continue
                         if any(
                             lease.robot_id == robot_id
                             and lease.mission_id == record.request.mission_id
+                            and lease.lease_id == evidence_id
                             for lease in resource.former_leases
                         ):
                             continue
@@ -278,7 +299,7 @@ class FleetAdapter:
                                 robot_id,
                                 record.request.mission_id,
                                 resource.resource_id,
-                                "restart-evidence-" + secrets.token_urlsafe(32),
+                                evidence_id,
                                 now,
                             )
                         )
@@ -316,15 +337,15 @@ class FleetAdapter:
                     )
                     for robot in robots.values()
                 ):
-                    self.resources.clear_reconciliation(
-                        LeaseKey(
-                            former.robot_id,
-                            former.mission_id,
-                            former.resource_id,
-                            former.lease_id,
-                        ),
-                        now,
+                    key = LeaseKey(
+                        former.robot_id,
+                        former.mission_id,
+                        former.resource_id,
+                        former.lease_id,
                     )
+                    if self.resources.clear_reconciliation(key, now):
+                        self._resource_clearances.append(key)
+
         for dock_id in tuple(self._dock_restart_unsafe):
             dock = self.config.docks[dock_id]
             margin = 2 * dock.robot_radius + dock.arrival_tolerance
@@ -340,6 +361,12 @@ class FleetAdapter:
                 for robot in robots.values()
             ):
                 self._dock_restart_unsafe.discard(dock_id)
+
+    def _persist_resources(self, now):
+        self.journal.save_resources(
+            self.resources.snapshot(now), now, self._resource_clearances
+        )
+        self._resource_clearances.clear()
 
     def submit(self, request):
         if self.state == "STORAGE_FAILED":
@@ -526,9 +553,7 @@ class FleetAdapter:
             if self.state != "RUNNING":
                 return
             self._tick()
-            self.journal.save_resources(
-                self.resources.snapshot(self.clock()), self.clock()
-            )
+            self._persist_resources(self.clock())
         except sqlite3.Error:
             self._fail_storage()
             raise
@@ -559,7 +584,7 @@ class FleetAdapter:
             },
             now,
         )
-        self.journal.save_resources(self.resources.snapshot(now), now)
+        self._persist_resources(now)
         reserved = {flight.robot_id for flight in self._flights.values()}
         self.core.queue_charging(self.config.energy, now, reserved)
         previous = {}
@@ -898,9 +923,7 @@ class FleetAdapter:
             )
         try:
             response = self._resource(operation, request)
-            self.journal.save_resources(
-                self.resources.snapshot(self.clock()), self.clock()
-            )
+            self._persist_resources(self.clock())
             return response
         except sqlite3.Error:
             self._fail_storage()

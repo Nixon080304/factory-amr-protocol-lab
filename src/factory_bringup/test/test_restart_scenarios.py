@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src/fleet_manager"
 from fleet_manager.config import load_fleet_config
 from fleet_manager.journal import MissionJournal, MissionState
 from fleet_manager.models import MissionRequest, RobotSnapshot
-from fleet_manager.resources import LeaseRequest, ResourceManager
+from fleet_manager.resources import LeaseKey, LeaseRequest, ResourceManager
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -76,6 +76,14 @@ MATRIX = [
         "NOT_PICKED_UP",
         None,
         "HISTORICAL_MULTI",
+        (-3, -3),
+        "RECOVERY_REQUIRED",
+    ),
+    (
+        "EXECUTING",
+        "NOT_PICKED_UP",
+        None,
+        "WEAK_EXECUTOR",
         (-3, -3),
         "RECOVERY_REQUIRED",
     ),
@@ -152,6 +160,18 @@ def test_actual_kill_restart_failure_matrix(
                 ),
                 timestamp,
             )
+    if mode == "WEAK_EXECUTOR":
+        journal.transition(
+            "old",
+            MissionState.EXECUTING,
+            MissionState.EXECUTING,
+            {"assigned_robot_id": "amr_03"},
+            3,
+        )
+        journal.record_observation(
+            RobotSnapshot("amr_01", "EXECUTING", None, 80, "LOADED", mission_id="old"),
+            4,
+        )
     old_lease = None
     if held:
         resources = ResourceManager(config.resources)
@@ -230,7 +250,7 @@ def test_actual_kill_restart_failure_matrix(
             executor.spin_once(timeout_sec=0.02)
         assert predicate(), "bounded restart predicate timed out"
 
-    def start():
+    def start(expected_state=None):
         env = dict(os.environ, ROS_DOMAIN_ID=str(domain_id))
         manager_source = os.environ.get(
             "TASK14_MANAGER_SOURCE", str(ROOT / "src/fleet_manager")
@@ -276,13 +296,19 @@ def test_actual_kill_restart_failure_matrix(
         # Real process is killed at the exact persisted boundary before fresh
         # observations. Paused /clock must not bypass the startup barrier.
         spin(0.1)
-        assert read()[0] == (seed_state if len(processes) == 1 else state)
+        assert read()[0] == (
+            expected_state
+            if expected_state is not None
+            else seed_state
+            if len(processes) == 1
+            else state
+        )
         return process
 
     def heartbeat(robot_id):
         first = robot_id == "amr_01"
         observed_mode = mode
-        if mode in ("LEGACY_MULTI", "HISTORICAL_MULTI"):
+        if mode in ("LEGACY_MULTI", "HISTORICAL_MULTI", "WEAK_EXECUTOR"):
             observed_mode = "AVAILABLE"
         if live:
             observed_mode = (
@@ -447,7 +473,7 @@ def test_actual_kill_restart_failure_matrix(
                 ).fetchone()[0]
                 assert '"robot_id":"amr_01"' in evidence
                 assert '"lease":null' in evidence
-        if mode in ("LEGACY_MULTI", "HISTORICAL_MULTI"):
+        if mode in ("LEGACY_MULTI", "HISTORICAL_MULTI", "WEAK_EXECUTOR"):
             overlap = call(
                 acquire,
                 AcquireResource.Request(
@@ -463,6 +489,79 @@ def test_actual_kill_restart_failure_matrix(
                 ).fetchone()[0]
                 assert '"robot_id":"amr_03"' in evidence
                 assert '"lease":null' in evidence
+        if mode == "WEAK_EXECUTOR":
+            assert read() == ("RECOVERY_REQUIRED", "amr_01", "PICKED_UP")
+            processes[-1].kill()
+            processes[-1].wait(timeout=3)
+            operator = MissionJournal(path)
+            try:
+                resources = ResourceManager(config.resources)
+                resources.restore_evidence(operator.load_resources())
+                for snapshot in resources.snapshot(100):
+                    for claim in snapshot.former_leases:
+                        assert resources.clear_reconciliation(
+                            LeaseKey(
+                                claim.robot_id,
+                                claim.mission_id,
+                                claim.resource_id,
+                                claim.lease_id,
+                            ),
+                            100,
+                        )
+                operator.save_resources(resources.snapshot(100), 100)
+            finally:
+                operator.close()
+            start(expected_state="RECOVERY_REQUIRED")
+            observe_robot("amr_01")
+            observe_robot("amr_02")
+            cleared = call(
+                acquire,
+                AcquireResource.Request(
+                    robot_id="amr_02", mission_id="probe", resource_id="assembly"
+                ),
+            )
+            assert cleared.granted, (
+                "exact operator resolution must survive another real process restart"
+            )
+            assert read() == ("RECOVERY_REQUIRED", "amr_01", "PICKED_UP")
+            processes[-1].kill()
+            processes[-1].wait(timeout=3)
+            operator = MissionJournal(path)
+            try:
+                operator.register(
+                    MissionRequest("new", "assembly", "inspection", "motor"),
+                    "new-hash",
+                    101,
+                )
+                operator.transition(
+                    "new",
+                    MissionState.QUEUED,
+                    MissionState.EXECUTING,
+                    {"assigned_robot_id": "amr_03"},
+                    102,
+                )
+            finally:
+                operator.close()
+            start(expected_state="RECOVERY_REQUIRED")
+            observe_robot("amr_01")
+            observe_robot("amr_02")
+            refenced = call(
+                acquire,
+                AcquireResource.Request(
+                    robot_id="amr_02", mission_id="new-probe", resource_id="assembly"
+                ),
+            )
+            assert not refenced.granted, (
+                "new executor evidence must not inherit old resolution"
+            )
+            with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as connection:
+                evidence = connection.execute(
+                    "SELECT evidence_json FROM resource_snapshots WHERE resource_id='assembly'"
+                ).fetchone()[0]
+                assert (
+                    '"mission_id":"new"' in evidence
+                    and '"robot_id":"amr_03"' in evidence
+                )
         assert len(goals) == goals_before
         if mode == "OFFLINE":
             assert read()[2] == "UNKNOWN"

@@ -1295,3 +1295,294 @@ def test_removed_conflicting_durable_carrier_keeps_related_resources_fenced(
         assert {claim.robot_id for claim in claims} == {"amr_03"}
     finally:
         journal.close()
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_original_removed_executor_survives_carrier_projection_and_repeated_restart(
+    config, tmp_path, legacy
+):
+    path = tmp_path / "weak-executor.sqlite3"
+    journal = MissionJournal(path)
+    try:
+        seed(journal)
+        journal.transition(
+            "m1",
+            MissionState.EXECUTING,
+            MissionState.EXECUTING,
+            {"assigned_robot_id": "amr_03"},
+            3,
+        )
+        journal.record_observation(safe(mission_id="m1", payload_state="LOADED"), 4)
+        if legacy:
+            journal._connection.execute("DROP TABLE recovery_physical_claims")
+            journal._connection.execute(
+                "DELETE FROM journal_schema WHERE name='physical_claims'"
+            )
+        previous = None
+        for now in (100, 200, 300):
+            journal.close()
+            journal = MissionJournal(path)
+            adapter = FleetAdapter(
+                config, journal, FakeRobots(journal), clock=lambda: now
+            )
+            adapter.observe(safe())
+            adapter.observe(safe("amr_02"))
+            record = journal.get("m1")
+            assert record.state == "RECOVERY_REQUIRED"
+            assert (
+                record.assigned_robot_id == "amr_01"
+                and record.payload_ownership == "PICKED_UP"
+            )
+            response = adapter.resource(
+                "acquire",
+                SimpleNamespace(
+                    robot_id="amr_02", mission_id="probe", resource_id="assembly"
+                ),
+            )
+            assert not response["granted"], (
+                "original removed executor is not physical payload-carrier proof"
+            )
+            current = (journal.events("m1"), journal.load_resources())
+            if previous is not None:
+                assert current == previous
+            previous = current
+    finally:
+        journal.close()
+
+
+def test_exact_operator_clearance_survives_restart_and_new_claim_refences(
+    config, tmp_path
+):
+    from types import MappingProxyType
+
+    config = replace(config, resource_bounds=MappingProxyType({}))
+    path = tmp_path / "resolved-generations.sqlite3"
+    journal = MissionJournal(path)
+    try:
+        seed(journal)
+        journal.transition(
+            "m1",
+            MissionState.EXECUTING,
+            MissionState.EXECUTING,
+            {"assigned_robot_id": "amr_03"},
+            3,
+        )
+        journal.record_observation(safe(mission_id="m1", payload_state="LOADED"), 4)
+        adapter = FleetAdapter(config, journal, FakeRobots(journal), clock=lambda: 100)
+        adapter.observe(safe())
+        adapter.observe(safe("amr_02"))
+        claims = next(
+            s.former_leases
+            for s in adapter.resources.snapshot(100)
+            if s.resource_id == "assembly"
+        )
+        assert {lease.robot_id for lease in claims} == {"amr_01", "amr_03"}
+        adapter.resources.acquire(LeaseRequest("amr_02", "probe", "assembly"), 100)
+        for index, claim in enumerate(claims):
+            wrong = LeaseKey(
+                claim.robot_id, claim.mission_id, claim.resource_id, "wrong-token"
+            )
+            assert not adapter.resources.clear_reconciliation(wrong, 101)
+            assert adapter.resources.clear_reconciliation(
+                LeaseKey(
+                    claim.robot_id, claim.mission_id, claim.resource_id, claim.lease_id
+                ),
+                101,
+            )
+            snapshot = next(
+                s
+                for s in adapter.resources.snapshot(101)
+                if s.resource_id == "assembly"
+            )
+            assert (snapshot.lease is not None) == (index == len(claims) - 1)
+        # Drop the new test owner's authority before persisting operator clearance.
+        lease = snapshot.lease
+        assert adapter.resources.release(
+            LeaseKey(
+                lease.robot_id, lease.mission_id, lease.resource_id, lease.lease_id
+            ),
+            102,
+        )
+        journal.save_resources(adapter.resources.snapshot(102), 102)
+        before = journal.events("m1")
+        journal.close()
+        journal = MissionJournal(path)
+        adapter = FleetAdapter(config, journal, FakeRobots(journal), clock=lambda: 200)
+        adapter.observe(safe())
+        adapter.observe(safe("amr_02"))
+        assert (
+            journal.get("m1").state == "RECOVERY_REQUIRED"
+            and journal.events("m1") == before
+        )
+        assert adapter.resource(
+            "acquire",
+            SimpleNamespace(
+                robot_id="amr_02", mission_id="probe", resource_id="assembly"
+            ),
+        )["granted"]
+        # Different mission/evidence must not inherit an exemption for amr_03.
+        seed(journal, mission_id="new")
+        journal.transition(
+            "new",
+            MissionState.EXECUTING,
+            MissionState.EXECUTING,
+            {"assigned_robot_id": "amr_03"},
+            201,
+        )
+        journal.close()
+        journal = MissionJournal(path)
+        adapter = FleetAdapter(config, journal, FakeRobots(journal), clock=lambda: 300)
+        adapter.observe(safe())
+        adapter.observe(safe("amr_02"))
+        assert not adapter.resource(
+            "acquire",
+            SimpleNamespace(
+                robot_id="amr_02", mission_id="another", resource_id="assembly"
+            ),
+        )["granted"]
+        assert any(
+            s.former_leases
+            for s in adapter.resources.snapshot(300)
+            if s.resource_id == "assembly"
+        )
+    finally:
+        journal.close()
+
+
+def test_resolution_identity_includes_owner_even_when_evidence_tokens_collide(
+    config, tmp_path
+):
+    journal = MissionJournal(tmp_path / "exact-resolution.sqlite3")
+    try:
+        manager = ResourceManager(config.resources)
+        first = Lease("amr_01", "m1", "assembly", "same-evidence", 0)
+        second = Lease("amr_03", "m2", "assembly", "same-evidence", 0)
+        manager.quarantine_evidence(first)
+        manager.quarantine_evidence(second)
+        journal.save_resources(manager.snapshot(1), 1)
+        key = LeaseKey(
+            first.robot_id, first.mission_id, first.resource_id, first.lease_id
+        )
+        assert manager.clear_reconciliation(key, 2)
+        journal.save_resources(manager.snapshot(2), 2)
+        assert journal.claim_resolved(key)
+        assert not journal.claim_resolved(
+            LeaseKey(
+                second.robot_id, second.mission_id, second.resource_id, second.lease_id
+            )
+        )
+    finally:
+        journal.close()
+
+
+def test_new_same_mission_evidence_does_not_inherit_operator_clearance(
+    config, tmp_path
+):
+    from types import MappingProxyType
+
+    config = replace(config, resource_bounds=MappingProxyType({}))
+    path = tmp_path / "new-evidence.sqlite3"
+    journal = MissionJournal(path)
+    try:
+        seed(journal)
+        journal.record_observation(safe(mission_id="m1", payload_state="LOADED"), 3)
+        adapter = FleetAdapter(config, journal, FakeRobots(journal), clock=lambda: 100)
+        adapter.observe(safe())
+        adapter.observe(safe("amr_02"))
+        claims = next(
+            s.former_leases
+            for s in adapter.resources.snapshot(100)
+            if s.resource_id == "assembly"
+        )
+        old_ids = {claim.lease_id for claim in claims}
+        for claim in claims:
+            assert adapter.resources.clear_reconciliation(
+                LeaseKey(
+                    claim.robot_id, claim.mission_id, claim.resource_id, claim.lease_id
+                ),
+                101,
+            )
+        journal.save_resources(adapter.resources.snapshot(101), 101)
+        journal.record_observation(
+            safe(mode="EXECUTING", mission_id="m1", payload_state="LOADED"), 102
+        )
+        journal.close()
+        journal = MissionJournal(path)
+        adapter = FleetAdapter(config, journal, FakeRobots(journal), clock=lambda: 200)
+        adapter.observe(safe())
+        adapter.observe(safe("amr_02"))
+        claims = next(
+            s.former_leases
+            for s in adapter.resources.snapshot(200)
+            if s.resource_id == "assembly"
+        )
+        assert claims and all(claim.lease_id not in old_ids for claim in claims)
+        assert not adapter.resource(
+            "acquire",
+            SimpleNamespace(
+                robot_id="amr_02", mission_id="probe", resource_id="assembly"
+            ),
+        )["granted"]
+        assert journal.get("m1").state == "RECOVERY_REQUIRED"
+    finally:
+        journal.close()
+
+
+def test_clearance_write_failure_rolls_back_mission_and_resource_proof(
+    config, tmp_path
+):
+    journal = MissionJournal(tmp_path / "clearance-rollback.sqlite3")
+    try:
+        before = seed(journal)
+        events = journal.events("m1")
+        journal._connection.execute(
+            "CREATE TRIGGER reject_clearance BEFORE INSERT ON resource_claim_resolutions "
+            "BEGIN SELECT RAISE(ABORT,'clearance failed'); END"
+        )
+        wire = FakeRobots(journal)
+        adapter = FleetAdapter(config, journal, wire, clock=lambda: 100)
+        adapter.observe(safe())
+        # Startup reconciliation reports failure through the permanent adapter
+        # latch; its existing callback contract does not propagate this error.
+        adapter.observe(safe("amr_02"))
+        assert adapter.state == "STORAGE_FAILED"
+        assert journal.get("m1") == before and journal.events("m1") == events
+        assert (
+            journal._connection.execute(
+                "SELECT COUNT(*) FROM resource_claim_resolutions"
+            ).fetchone()[0]
+            == 0
+        )
+        assert journal.load_resources() == ()
+        assert not adapter.resource(
+            "acquire",
+            SimpleNamespace(
+                robot_id="amr_02", mission_id="probe", resource_id="assembly"
+            ),
+        )["granted"]
+        assert not wire.goals
+    finally:
+        journal.close()
+
+
+def test_legacy_snapshot_former_owner_is_not_mistaken_for_clearance(tmp_path):
+    from fleet_manager.resources import ResourceSnapshot
+
+    journal = MissionJournal(tmp_path / "legacy-former.sqlite3")
+    try:
+        former = Lease("amr_03", "m1", "assembly", "old-token", 0)
+        snapshot = ResourceSnapshot("assembly", "station", 1, None, (), True, former)
+        journal.save_resources((snapshot,), 1)
+        journal.save_resources(
+            (
+                replace(
+                    snapshot, waiters=(LeaseRequest("amr_01", "queued", "assembly"),)
+                ),
+            ),
+            2,
+        )
+        assert not journal.claim_resolved(
+            LeaseKey("amr_03", "m1", "assembly", "old-token")
+        )
+    finally:
+        journal.close()

@@ -7,6 +7,7 @@ from enum import Enum
 import json
 import math
 from pathlib import Path
+import secrets
 import sqlite3
 from types import MappingProxyType
 from typing import Mapping
@@ -219,6 +220,17 @@ class MissionJournal:
                     "mission_id TEXT NOT NULL REFERENCES missions(mission_id), "
                     "robot_id TEXT NOT NULL, PRIMARY KEY(mission_id, robot_id))"
                 )
+                self._connection.execute(
+                    "CREATE TABLE IF NOT EXISTS recovery_physical_claims ("
+                    "mission_id TEXT NOT NULL REFERENCES missions(mission_id), "
+                    "robot_id TEXT NOT NULL, role TEXT NOT NULL, evidence_id TEXT NOT NULL, "
+                    "last_payload TEXT, PRIMARY KEY(mission_id, robot_id, role))"
+                )
+                self._connection.execute(
+                    "CREATE TABLE IF NOT EXISTS resource_claim_resolutions ("
+                    "resource_id TEXT NOT NULL, robot_id TEXT NOT NULL, mission_id TEXT NOT NULL, "
+                    "evidence_id TEXT NOT NULL, PRIMARY KEY(resource_id,robot_id,mission_id,evidence_id))"
+                )
                 version = self._connection.execute(
                     "SELECT version FROM journal_schema WHERE name='payload_evidence'"
                 ).fetchone()
@@ -237,6 +249,40 @@ class MissionJournal:
                     self._connection.execute(
                         "INSERT INTO journal_schema VALUES ('payload_evidence', 2) "
                         "ON CONFLICT(name) DO UPDATE SET version=excluded.version"
+                    )
+                if (
+                    self._connection.execute(
+                        "SELECT version FROM journal_schema WHERE name='physical_claims'"
+                    ).fetchone()
+                    is None
+                ):
+                    for record in self.load_active():
+                        mission_id = record.request.mission_id
+                        for robot_id in self.recovery_carriers(mission_id):
+                            self._physical_claim(mission_id, robot_id, "CARRIER")
+                        # The mission/event indexes bound this one-time migration
+                        # to unresolved work. Pose telemetry is not replayed.
+                        for event in self.events(mission_id):
+                            owner = event.detail.get("assigned_robot_id")
+                            if owner and event.state in (
+                                MissionState.ASSIGNED,
+                                MissionState.EXECUTING,
+                            ):
+                                self._physical_claim(
+                                    mission_id,
+                                    owner,
+                                    "EXECUTOR",
+                                    evidence_id=f"executor-event-{event.sequence}",
+                                )
+                        if record.assigned_robot_id and record.state in (
+                            MissionState.ASSIGNED,
+                            MissionState.EXECUTING,
+                        ):
+                            self._physical_claim(
+                                mission_id, record.assigned_robot_id, "EXECUTOR"
+                            )
+                    self._connection.execute(
+                        "INSERT INTO journal_schema VALUES ('physical_claims', 1)"
                     )
         except BaseException:
             self._connection.close()
@@ -266,12 +312,13 @@ class MissionJournal:
         return record
 
     def _event(self, mission_id, previous_state, state, detail_json, now):
-        self._connection.execute(
+        cursor = self._connection.execute(
             "INSERT INTO mission_events "
             "(mission_id, previous_state, state, detail_json, timestamp) "
             "VALUES (?, ?, ?, ?, ?)",
             (mission_id, previous_state, state, detail_json, now),
         )
+        return cursor.lastrowid
 
     def register(
         self, request: MissionRequest, payload_hash: str, now: float
@@ -324,7 +371,30 @@ class MissionJournal:
                 record.state,
             ),
         )
-        self._event(record.request.mission_id, record.state, target, detail_json, now)
+        if record.assigned_robot_id and record.state in (
+            MissionState.ASSIGNED,
+            MissionState.EXECUTING,
+        ):
+            self._physical_claim(
+                record.request.mission_id, record.assigned_robot_id, "EXECUTOR"
+            )
+        sequence = self._event(
+            record.request.mission_id, record.state, target, detail_json, now
+        )
+        if assigned_robot_id and target in (
+            MissionState.ASSIGNED,
+            MissionState.EXECUTING,
+        ):
+            new_execution = (
+                record.assigned_robot_id != assigned_robot_id
+                or record.state not in (MissionState.ASSIGNED, MissionState.EXECUTING)
+            )
+            self._physical_claim(
+                record.request.mission_id,
+                assigned_robot_id,
+                "EXECUTOR",
+                evidence_id=f"executor-event-{sequence}" if new_execution else None,
+            )
         return self._require(record.request.mission_id)
 
     def transition(
@@ -429,6 +499,46 @@ class MissionJournal:
             )
         )
 
+    def _physical_claim(
+        self, mission_id, robot_id, role, evidence_id=None, payload=None
+    ):
+        row = self._connection.execute(
+            "SELECT evidence_id,last_payload FROM recovery_physical_claims "
+            "WHERE mission_id=? AND robot_id=? AND role=?",
+            (mission_id, robot_id, role),
+        ).fetchone()
+        if evidence_id is None:
+            evidence_id = (
+                row[0]
+                if row is not None
+                else "restart-work-" + secrets.token_urlsafe(32)
+            )
+        if (
+            role == "CARRIER"
+            and payload in ("LOADED", "UNKNOWN")
+            and row is not None
+            and row[1] == "EMPTY"
+        ):
+            evidence_id = "restart-work-" + secrets.token_urlsafe(32)
+        self._connection.execute(
+            "INSERT INTO recovery_physical_claims VALUES (?,?,?,?,?) "
+            "ON CONFLICT(mission_id,robot_id,role) DO UPDATE SET "
+            "evidence_id=excluded.evidence_id,last_payload=COALESCE(excluded.last_payload,last_payload)",
+            (mission_id, robot_id, role, evidence_id, payload),
+        )
+
+    def recovery_physical_claims(self, mission_id):
+        """Separate physical executors/observed owners from payload carrier choice."""
+        return tuple(
+            (row[0], row[1])
+            for row in self._connection.execute(
+                "SELECT c.robot_id,c.evidence_id FROM recovery_physical_claims c "
+                "JOIN missions m USING(mission_id) WHERE c.mission_id=? "
+                "AND m.state NOT IN ('COMPLETED','FAILED','CANCELLED') ORDER BY c.robot_id,c.role",
+                (mission_id,),
+            )
+        )
+
     def _merge_payload_evidence(self, robot_id, evidence):
         """Fold ordered carrying claims into one durable summary per mission.
 
@@ -439,6 +549,12 @@ class MissionJournal:
         """
         payload = evidence.get("payload_state")
         mission_id = evidence.get("mission_id")
+        if payload == "EMPTY" and mission_id:
+            self._connection.execute(
+                "UPDATE recovery_physical_claims SET last_payload='EMPTY' "
+                "WHERE mission_id=? AND robot_id=? AND role='CARRIER'",
+                (mission_id, robot_id),
+            )
         if payload not in ("LOADED", "UNKNOWN") or not mission_id:
             return
         record = self._find(mission_id)
@@ -477,6 +593,12 @@ class MissionJournal:
                 "INSERT INTO payload_carrier_claims VALUES (?, ?) ON CONFLICT DO NOTHING",
                 (mission_id, owner),
             )
+            self._physical_claim(
+                mission_id,
+                owner,
+                "CARRIER",
+                payload=payload if owner == robot_id else None,
+            )
 
     def events(self, mission_id: str) -> tuple[MissionEvent, ...]:
         rows = self._connection.execute(
@@ -501,7 +623,26 @@ class MissionJournal:
         """Read the current snapshot, including terminal missions."""
         return self._require(mission_id)
 
+    def claim_resolved(self, key):
+        return (
+            self._connection.execute(
+                "SELECT 1 FROM resource_claim_resolutions WHERE resource_id=? AND robot_id=? "
+                "AND mission_id=? AND evidence_id=?",
+                (key.resource_id, key.robot_id, key.mission_id, key.lease_id),
+            ).fetchone()
+            is not None
+        )
+
+    def _save_clearances(self, clearances):
+        for key in clearances:
+            self._connection.execute(
+                "INSERT INTO resource_claim_resolutions VALUES (?,?,?,?) ON CONFLICT DO NOTHING",
+                (key.resource_id, key.robot_id, key.mission_id, key.lease_id),
+            )
+
     def _save_resources(self, snapshots, now):
+        from fleet_manager.resources import Lease
+
         for snapshot in snapshots:
             evidence = _json(asdict(snapshot))
             row = self._connection.execute(
@@ -510,6 +651,26 @@ class MissionJournal:
             ).fetchone()
             if row is not None and row[0] == evidence:
                 continue
+            if row is not None:
+                previous = json.loads(row[0])
+                old_claims = previous.get("former_leases") or (
+                    (previous["former_lease"],) if previous.get("former_lease") else ()
+                )
+                fields = ("robot_id", "mission_id", "resource_id", "lease_id")
+                current_claims = snapshot.former_leases or (
+                    (snapshot.former_lease,)
+                    if snapshot.former_lease is not None
+                    else ()
+                )
+                remaining = {
+                    tuple(getattr(lease, field) for field in fields)
+                    for lease in current_claims
+                }
+                self._save_clearances(
+                    Lease(**claim)
+                    for claim in old_claims
+                    if tuple(claim[field] for field in fields) not in remaining
+                )
             self._connection.execute(
                 "INSERT INTO resource_snapshots VALUES (?, ?) "
                 "ON CONFLICT(resource_id) DO UPDATE SET evidence_json=excluded.evidence_json",
@@ -520,11 +681,12 @@ class MissionJournal:
                 (snapshot.resource_id, evidence, now),
             )
 
-    def save_resources(self, snapshots, now):
+    def save_resources(self, snapshots, now, clearances=()):
         """Persist authority evidence before a service can report a grant."""
         now = _timestamp(now)
         with self._transaction():
             self._save_resources(snapshots, now)
+            self._save_clearances(clearances)
 
     def load_resources(self):
         """Read persisted snapshots without treating tokens as authority."""
@@ -548,12 +710,19 @@ class MissionJournal:
     def record_observation(self, robot, received_at, source_time_ns=None):
         evidence = _json(asdict(robot))
         with self._transaction():
-            self._connection.execute(
+            cursor = self._connection.execute(
                 "INSERT INTO robot_observations(robot_id, evidence_json, source_time_ns, received_at) "
                 "VALUES (?, ?, ?, ?)",
                 (robot.robot_id, evidence, source_time_ns, _timestamp(received_at)),
             )
             self._merge_payload_evidence(robot.robot_id, json.loads(evidence))
+            if robot.mission_id and self._find(robot.mission_id) is not None:
+                self._physical_claim(
+                    robot.mission_id,
+                    robot.robot_id,
+                    "OBSERVED",
+                    evidence_id=f"observation-{cursor.lastrowid}",
+                )
 
     def record_contact(self, robot_id, contact, received_at, source_time_ns):
         with self._transaction():
@@ -562,7 +731,7 @@ class MissionJournal:
                 (robot_id, int(contact), source_time_ns, _timestamp(received_at)),
             )
 
-    def reconcile(self, decisions, snapshots, now):
+    def reconcile(self, decisions, snapshots, now, clearances=()):
         """Commit mission decisions and physical resource clearance atomically.
 
         Repeated identical decisions do not append duplicate mission events.
@@ -592,6 +761,7 @@ class MissionJournal:
                     decision.robot_id,
                 )
             self._save_resources(snapshots, now)
+            self._save_clearances(clearances)
 
     def close(self) -> None:
         self._connection.close()
