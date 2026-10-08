@@ -37,6 +37,12 @@ routes:
 traffic_bounds:
   central_aisle: [-0.8, -2.65, 0.8, -1.75]
 
+# Regions include stations.yaml approach poses and the factory_floor.world
+# station bodies. Clearance adds the configured conservative robot footprint.
+resource_bounds:
+  assembly: [-3.5, 0.3, -2.5, 2.5]
+  inspection: [2.5, 0.3, 3.5, 2.5]
+
 route_segments:
   to_assembly:
     - resource_id: central_aisle

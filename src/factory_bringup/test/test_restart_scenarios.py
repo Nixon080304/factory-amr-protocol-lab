@@ -9,6 +9,7 @@ import sys
 import time
 
 import pytest
+import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src/fleet_manager"))
 
@@ -60,6 +61,15 @@ MATRIX = [
     ("EXECUTING", "NOT_PICKED_UP", None, "OFFLINE", (-3, -3), "RECOVERY_REQUIRED"),
     ("EXECUTING", "NOT_PICKED_UP", None, "LIVE_BEFORE", (-3, -3), "QUEUED"),
     ("EXECUTING", "PICKED_UP", None, "LIVE_AFTER", (-3, -3), "RECOVERY_REQUIRED"),
+    ("EXECUTING", "PICKED_UP", None, "LIVE_WRITE_FAIL", (-3, -3), "RECOVERY_REQUIRED"),
+    (
+        "EXECUTING",
+        "UNKNOWN",
+        None,
+        "WAITING_FOR_RESOURCE",
+        (-3, 1),
+        "RECOVERY_REQUIRED",
+    ),
 ]
 
 
@@ -79,7 +89,14 @@ def test_actual_kill_restart_failure_matrix(
     from rclpy.context import Context
     from rclpy.executors import SingleThreadedExecutor
 
-    config = load_fleet_config(ROOT / "src/factory_bringup/config/fleet.yaml")
+    fleet_file = ROOT / "src/factory_bringup/config/fleet.yaml"
+    if mode == "WAITING_FOR_RESOURCE" and held is None:
+        # Migration from Task 13 has neither station geometry nor lease history.
+        data = yaml.safe_load(fleet_file.read_text())
+        data.pop("resource_bounds", None)
+        fleet_file = tmp_path / "legacy-fleet.yaml"
+        fleet_file.write_text(yaml.safe_dump(data))
+    config = load_fleet_config(fleet_file)
     live = mode.startswith("LIVE_")
     seed_state = "QUEUED" if live else state
     path = tmp_path / "restart.sqlite3"
@@ -196,7 +213,7 @@ def test_actual_kill_restart_failure_matrix(
                 "import faulthandler, signal; faulthandler.register(signal.SIGUSR1); from fleet_manager.main import main; main()",
                 "--ros-args",
                 "-p",
-                "fleet_file:=" + str(ROOT / "src/factory_bringup/config/fleet.yaml"),
+                "fleet_file:=" + str(fleet_file),
                 "-p",
                 "journal_path:=" + str(path),
                 "-p",
@@ -234,12 +251,18 @@ def test_actual_kill_restart_failure_matrix(
         observed_mode = mode
         if live:
             observed_mode = (
-                "EXECUTING" if phase[0] and mode == "LIVE_AFTER" else "AVAILABLE"
+                "EXECUTING"
+                if phase[0]
+                and mode == "LIVE_AFTER"
+                or phase[0] == 1
+                and mode == "LIVE_WRITE_FAIL"
+                else "AVAILABLE"
             )
         loaded = (
             first
             and ownership in ("PICKED_UP", "UNKNOWN")
             and (not live or phase[0] > 0)
+            and not (mode == "LIVE_WRITE_FAIL" and phase[0] == 2)
         )
         message = RobotState(
             robot_id=robot_id,
@@ -256,7 +279,11 @@ def test_actual_kill_restart_failure_matrix(
         # ROS stamp deliberately remains 0 with a paused clock. Freshness comes
         # from DDS publish evidence, never fabricated advancing simulation time.
         message.pose.position.x, message.pose.position.y = map(
-            float, position if first else (1.0, -3.0)
+            # Both robots must clear the configured expanded aisle region. The
+            # old second pose (1, -3) was only 0.403 m outside, below the 0.45 m
+            # conservative footprint bound, and correctly prevented recovery.
+            float,
+            position if first else (1.5, -3.0),
         )
         message.pose.orientation.w = 1.0
         publishers[robot_id].publish(message)
@@ -301,10 +328,26 @@ def test_actual_kill_restart_failure_matrix(
                     ExecuteFactoryMission.Feedback(state="NAVIGATING_TO_DROPOFF")
                 )
                 wait(lambda: read()[2] == "PICKED_UP")
+            elif mode == "LIVE_WRITE_FAIL":
+                # Real SQLite failure preserves the correlated observation but
+                # rolls back the mission transition. The fresh empty robot after
+                # restart must not erase this durable carrying evidence.
+                with sqlite3.connect(path) as connection:
+                    connection.execute(
+                        "CREATE TRIGGER fail_pickup BEFORE UPDATE ON missions "
+                        "WHEN NEW.payload_ownership = 'PICKED_UP' "
+                        "BEGIN SELECT RAISE(ABORT, 'pickup write failed'); END"
+                    )
+                phase[0] = 1
+                observe_robot("amr_01")
+                spin(0.1)
+                assert read()[2] == "NOT_PICKED_UP"
+                with sqlite3.connect(path) as connection:
+                    connection.execute("DROP TRIGGER fail_pickup")
         first.kill()
         first.wait(timeout=3)
         if live:
-            phase[0] = 1
+            phase[0] = 2 if mode == "LIVE_WRITE_FAIL" else 1
             permit_cost[0] = False
             costs.clear()
             if mode == "LIVE_BEFORE":
@@ -354,6 +397,20 @@ def test_actual_kill_restart_failure_matrix(
                     (held,),
                 ).fetchone()[0]
                 assert old_lease.lease_id in evidence
+        if mode == "WAITING_FOR_RESOURCE" and held is None:
+            overlap = call(
+                acquire,
+                AcquireResource.Request(
+                    robot_id="amr_02", mission_id="probe", resource_id="assembly"
+                ),
+            )
+            assert not overlap.granted
+            with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as connection:
+                evidence = connection.execute(
+                    "SELECT evidence_json FROM resource_snapshots WHERE resource_id='assembly'"
+                ).fetchone()[0]
+                assert '"robot_id":"amr_01"' in evidence
+                assert '"lease":null' in evidence
         assert len(goals) == goals_before
         if mode == "OFFLINE":
             assert read()[2] == "UNKNOWN"

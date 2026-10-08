@@ -130,6 +130,9 @@ def test_malformed_or_offline_pose_never_clears(config, robot):
 
 
 def test_station_without_configured_geometry_stays_quarantined(config):
+    from types import MappingProxyType
+
+    config = replace(config, resource_bounds=MappingProxyType({}))
     lease = Lease("amr_01", "m1", "assembly", "old-token", 10)
     assert not planner(config).proves_outside(lease, safe())
 
@@ -651,5 +654,373 @@ def test_failed_runtime_mission_write_latches_storage_and_blocks_new_work(
         assert journal.get("waiting").state == "QUEUED"
         assert journal.get("running") == before
         assert goal.cancel_ack is None
+    finally:
+        journal.close()
+
+
+@pytest.mark.parametrize(
+    "payload,want", [("LOADED", "PICKED_UP"), ("UNKNOWN", "UNKNOWN")]
+)
+def test_restart_preserves_durable_correlated_payload_after_failed_mission_write(
+    config, tmp_path, payload, want
+):
+    import sqlite3
+
+    path = tmp_path / "durable-payload.sqlite3"
+    journal = MissionJournal(path)
+    try:
+        wire = FakeRobots(journal)
+        adapter = FleetAdapter(config, journal, wire, clock=lambda: 100)
+        adapter.observe(safe())
+        adapter.observe(safe("amr_02"))
+        adapter.submit(
+            MissionRequest("carried", "assembly", "inspection", "motor", "amr_01")
+        )
+        for _ in range(3):
+            adapter.tick()
+        journal._connection.execute(
+            "CREATE TRIGGER fail_payload BEFORE UPDATE ON missions "
+            "BEGIN SELECT RAISE(ABORT, 'payload write failed'); END"
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="payload write failed"):
+            adapter.observe(
+                safe(mode="EXECUTING", mission_id="carried", payload_state=payload)
+            )
+        journal._connection.execute("DROP TRIGGER fail_payload")
+        assert journal.get("carried").payload_ownership == "NOT_PICKED_UP"
+        journal.close()
+        journal = MissionJournal(path)
+        restarted_wire = FakeRobots(journal)
+        adapter = FleetAdapter(config, journal, restarted_wire, clock=lambda: 200)
+        adapter.observe(safe())
+        adapter.observe(safe("amr_02"))
+        for _ in range(3):
+            adapter.tick()
+        record = journal.get("carried")
+        assert record.state == "RECOVERY_REQUIRED"
+        assert record.assigned_robot_id == "amr_01" and record.payload_ownership == want
+        assert restarted_wire.goals == []
+        events = journal.events("carried")
+        journal.close()
+        journal = MissionJournal(path)
+        adapter = FleetAdapter(config, journal, FakeRobots(journal), clock=lambda: 300)
+        adapter.observe(safe())
+        adapter.observe(safe("amr_02"))
+        adapter.tick()
+        assert journal.get("carried") == record and journal.events("carried") == events
+    finally:
+        journal.close()
+
+
+@pytest.mark.parametrize("legacy_geometry", [True, False])
+def test_unresolved_station_work_without_lease_history_never_grants_overlap(
+    config, tmp_path, legacy_geometry
+):
+    from types import MappingProxyType
+
+    if legacy_geometry:
+        config = replace(config, resource_bounds=MappingProxyType({}))
+    journal = MissionJournal(tmp_path / "old-station.sqlite3")
+    try:
+        seed(journal, ownership="UNKNOWN")
+        adapter = FleetAdapter(config, journal, FakeRobots(journal), clock=lambda: 100)
+        adapter.observe(
+            safe(
+                mode="WAITING_FOR_RESOURCE",
+                payload_state="UNKNOWN",
+                mission_id="m1",
+                pose=Pose2D(-3, 1, 0),
+            )
+        )
+        adapter.observe(safe("amr_02"))
+        response = adapter.resource(
+            "acquire",
+            SimpleNamespace(
+                robot_id="amr_02", mission_id="other", resource_id="assembly"
+            ),
+        )
+        assert journal.get("m1").state == "RECOVERY_REQUIRED"
+        assert not response["granted"]
+        snapshot = next(
+            value
+            for value in adapter.resources.snapshot(100)
+            if value.resource_id == "assembly"
+        )
+        assert snapshot.lease is None and snapshot.reconciliation_required
+        assert (
+            snapshot.former_lease.robot_id == "amr_01"
+            and snapshot.former_lease.mission_id == "m1"
+        )
+        # A pose from another robot cannot clear the exact former owner. Missing
+        # station geometry remains insufficient even once the former owner leaves.
+        adapter.observe(safe())
+        adapter.tick()
+        if legacy_geometry:
+            assert next(
+                value
+                for value in adapter.resources.snapshot(100)
+                if value.resource_id == "assembly"
+            ).reconciliation_required
+        else:
+            assert not next(
+                value
+                for value in adapter.resources.snapshot(100)
+                if value.resource_id == "assembly"
+            ).reconciliation_required
+    finally:
+        journal.close()
+
+
+def test_unresolved_route_evidence_does_not_quarantine_unrelated_resource(
+    config, tmp_path
+):
+    from types import MappingProxyType
+    from fleet_manager.config import ResourceConfig
+
+    config = replace(
+        config,
+        resources=(*config.resources, ResourceConfig("other_station", "station", 1)),
+        resource_bounds=MappingProxyType({}),
+    )
+    journal = MissionJournal(tmp_path / "scoped-station.sqlite3")
+    try:
+        seed(journal, ownership="UNKNOWN")
+        adapter = FleetAdapter(config, journal, FakeRobots(journal), clock=lambda: 100)
+        adapter.observe(
+            safe(
+                mode="WAITING_FOR_RESOURCE",
+                payload_state="UNKNOWN",
+                mission_id="m1",
+                pose=Pose2D(-3, 1, 0),
+            )
+        )
+        adapter.observe(safe("amr_02"))
+        related = adapter.resource(
+            "acquire",
+            SimpleNamespace(
+                robot_id="amr_02", mission_id="other", resource_id="assembly"
+            ),
+        )
+        assert not related["granted"]
+        unrelated = adapter.resource(
+            "acquire",
+            SimpleNamespace(
+                robot_id="amr_02", mission_id="other", resource_id="other_station"
+            ),
+        )
+        assert unrelated["granted"]
+    finally:
+        journal.close()
+
+
+@pytest.mark.parametrize("late_acceptance", [False, True])
+def test_storage_failure_bounds_late_callbacks_and_cleans_action_handles(
+    config, tmp_path, late_acceptance
+):
+    import sqlite3
+    from fleet_manager.adapter import RobotReply
+
+    journal = MissionJournal(tmp_path / "failed-callbacks.sqlite3")
+    try:
+        wire = FakeRobots(journal)
+        cancelled_handles = []
+        original_cancel = wire.cancel
+
+        def cancel(handle, callback):
+            cancelled_handles.append(handle)
+            original_cancel(handle, callback)
+
+        wire.cancel = cancel
+        wire.auto_accept = not late_acceptance
+        adapter = FleetAdapter(config, journal, wire, clock=lambda: 100)
+        adapter.observe(safe())
+        adapter.observe(safe("amr_02"))
+        adapter.submit(
+            MissionRequest("active", "assembly", "inspection", "motor", "amr_01")
+        )
+        for _ in range(3):
+            adapter.tick()
+        goal = wire.goals[0]
+        flight = adapter._flights["active"]
+        before, events = journal.get("active"), journal.events("active")
+        # Include an accepted response already queued when a journal write fails.
+        if late_acceptance:
+            goal.accepted(goal, "")
+        journal._connection.execute("PRAGMA query_only = ON")
+        with pytest.raises(sqlite3.OperationalError):
+            adapter.submit(
+                MissionRequest("rejected", "assembly", "inspection", "motor")
+            )
+        journal._connection.execute("PRAGMA query_only = OFF")
+        for batch in range(2):
+            for _ in range(1000):
+                goal.feedback(
+                    SimpleNamespace(state="COMPLETED", detail="", progress=1.0)
+                )
+                goal.result(RobotReply(True))
+                goal.accepted(goal, "")
+                # An obsolete acknowledgement is still an asynchronous callback;
+                # it cannot authorize transport cancellation or a terminal write.
+                adapter._enqueue(adapter._cancelled, "active", flight, True)
+            adapter.tick()
+            assert adapter._callbacks.qsize() <= 200, (
+                f"failed callback queue grew in batch {batch}"
+            )
+        assert goal.cancel_ack is None
+        assert cancelled_handles == []
+        adapter.tick()
+        assert adapter._callbacks.empty()
+        assert len(adapter._flights) <= len(config.robots)
+        assert journal.get("active") == before and journal.events("active") == events
+        assert adapter.state == "STORAGE_FAILED" and len(wire.goals) == 1
+        assert not adapter.resource(
+            "acquire",
+            SimpleNamespace(
+                robot_id="amr_02", mission_id="probe", resource_id="assembly"
+            ),
+        )["granted"]
+    finally:
+        journal.close()
+
+
+def test_durable_payload_evidence_requires_correlation_and_preserves_delivery(
+    config, tmp_path
+):
+    journal = MissionJournal(tmp_path / "correlated-payload.sqlite3")
+    try:
+        seed(journal, state="QUEUED", mission_id="queued")
+        seed(journal, ownership="PICKED_UP", mission_id="done")
+        journal.record_observation(
+            safe(mode="EXECUTING", mission_id="other", payload_state="LOADED"), 5
+        )
+        journal.record_observation(
+            safe(mode="EXECUTING", mission_id="done", payload_state="LOADED"), 6
+        )
+        journal.transition(
+            "done",
+            MissionState.EXECUTING,
+            MissionState.COMPLETED,
+            {"payload_ownership": "DELIVERED"},
+            7,
+        )
+        # A genuinely ordered, correlated completed delivery is terminal. It must
+        # not be undone by the carrying evidence from before that delivery.
+        done = journal.get("done")
+        adapter = FleetAdapter(config, journal, FakeRobots(journal), clock=lambda: 100)
+        adapter.observe(safe())
+        adapter.observe(safe("amr_02"))
+        assert journal.get("queued").state == "QUEUED"
+        assert journal.get("queued").payload_ownership == "NOT_PICKED_UP"
+        assert journal.get("done") == done
+    finally:
+        journal.close()
+
+
+def test_prior_correlated_pickup_cannot_be_lost_by_a_later_assignment(config, tmp_path):
+    journal = MissionJournal(tmp_path / "prior-assignment.sqlite3")
+    try:
+        seed(journal)
+        journal.record_observation(
+            safe(mode="EXECUTING", mission_id="m1", payload_state="LOADED"), 5
+        )
+        # A journal from the previously unsafe recovery can already contain a
+        # later assignment. Its new empty robot cannot erase the former payload.
+        journal.transition(
+            "m1",
+            MissionState.EXECUTING,
+            MissionState.ASSIGNED,
+            {"assigned_robot_id": "amr_02"},
+            6,
+        )
+        adapter = FleetAdapter(config, journal, FakeRobots(journal), clock=lambda: 100)
+        adapter.observe(safe())
+        adapter.observe(safe("amr_02"))
+        assert journal.get("m1").state == "RECOVERY_REQUIRED"
+        assert journal.get("m1").payload_ownership != "NOT_PICKED_UP"
+        assert journal.get("m1").assigned_robot_id == "amr_01"
+    finally:
+        journal.close()
+
+
+def test_unresolved_live_claim_fences_station_when_old_assignment_was_cleared(
+    config, tmp_path
+):
+    from types import MappingProxyType
+
+    config = replace(config, resource_bounds=MappingProxyType({}))
+    journal = MissionJournal(tmp_path / "cleared-assignment.sqlite3")
+    try:
+        seed(journal, state="REASSIGNING")
+        journal.transition(
+            "m1",
+            MissionState.REASSIGNING,
+            MissionState.REASSIGNING,
+            {"assigned_robot_id": None},
+            3,
+        )
+        adapter = FleetAdapter(config, journal, FakeRobots(journal), clock=lambda: 100)
+        adapter.observe(
+            safe(mode="WAITING_FOR_RESOURCE", mission_id="m1", pose=Pose2D(-3, 1, 0))
+        )
+        adapter.observe(safe("amr_02"))
+        assert journal.get("m1").state == "RECOVERY_REQUIRED"
+        response = adapter.resource(
+            "acquire",
+            SimpleNamespace(
+                robot_id="amr_02", mission_id="other", resource_id="assembly"
+            ),
+        )
+        assert not response["granted"]
+        snapshot = next(
+            value
+            for value in adapter.resources.snapshot(100)
+            if value.resource_id == "assembly"
+        )
+        assert snapshot.former_lease.robot_id == "amr_01" and snapshot.lease is None
+    finally:
+        journal.close()
+
+
+def test_conflicting_durable_carriers_stay_unknown_without_delivery(config, tmp_path):
+    journal = MissionJournal(tmp_path / "conflicting-carriers.sqlite3")
+    try:
+        seed(journal)
+        for sequence, robot_id in enumerate(("amr_01", "amr_02", "amr_01"), 3):
+            journal.record_observation(
+                safe(
+                    robot_id, mode="EXECUTING", mission_id="m1", payload_state="LOADED"
+                ),
+                sequence,
+            )
+        adapter = FleetAdapter(config, journal, FakeRobots(journal), clock=lambda: 100)
+        adapter.observe(safe())
+        adapter.observe(safe("amr_02"))
+        record = journal.get("m1")
+        assert (
+            record.state == "RECOVERY_REQUIRED"
+            and record.payload_ownership == "UNKNOWN"
+        )
+        assert record.assigned_robot_id == "amr_01"
+    finally:
+        journal.close()
+
+
+def test_conflicting_observation_preserves_durable_former_payload_owner(
+    config, tmp_path
+):
+    journal = MissionJournal(tmp_path / "durable-owner.sqlite3")
+    try:
+        seed(journal, ownership="PICKED_UP")
+        journal.record_observation(
+            safe("amr_02", mode="EXECUTING", mission_id="m1", payload_state="LOADED"), 3
+        )
+        adapter = FleetAdapter(config, journal, FakeRobots(journal), clock=lambda: 100)
+        adapter.observe(safe())
+        adapter.observe(safe("amr_02"))
+        record = journal.get("m1")
+        assert (
+            record.state == "RECOVERY_REQUIRED" and record.assigned_robot_id == "amr_01"
+        )
+        assert record.payload_ownership == "UNKNOWN"
     finally:
         journal.close()

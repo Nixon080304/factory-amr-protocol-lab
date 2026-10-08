@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Serialized fleet orchestration with asynchronous transport boundaries.
 
-Transport callbacks only enqueue work. The owning executor thread drains that
-work in tick(), keeping the journal and FleetCore on their creating thread.
+Transport callbacks enqueue work while storage is healthy. After permanent
+storage failure they only discard work or perform bounded local handle cleanup.
+The owning executor thread drains work in tick(), keeping the journal and
+FleetCore on their creating thread.
 """
 
 from dataclasses import dataclass, field, replace
@@ -39,7 +41,7 @@ def _storage_boundary(method):
         try:
             return method(self, *args, **kwargs)
         except sqlite3.Error:
-            self.state = "STORAGE_FAILED"
+            self._fail_storage()
             raise
 
     return guarded
@@ -197,6 +199,8 @@ class FleetAdapter:
             robot.robot_id: self.registry.get(robot.robot_id, now)
             for robot in self.config.robots
         }
+        active = self.journal.load_recovery()
+        self._fence_unresolved_work(active, robots, now)
         self._fence_observed_resources(policy, robots, now)
         self._clear_resources(policy, robots, now)
         snapshots = self.resources.snapshot(now)
@@ -224,11 +228,54 @@ class FleetAdapter:
                     )
                     robots[robot_id] = replace(robot, mode=mode)
                     self.registry.observe(robots[robot_id], now)
-        decisions = policy.plan(self.journal.load_active(), robots, snapshots)
+        decisions = policy.plan(active, robots, snapshots)
         self.journal.reconcile(decisions, snapshots, now)
         self.state = "RUNNING"
         for decision in decisions:
             self._emit(self.journal.get(decision.mission_id))
+
+    def _fence_unresolved_work(self, active, robots, now):
+        """Recover missing lease history from unresolved mission route evidence."""
+        for record in active:
+            claims = [
+                robot.robot_id
+                for robot in robots.values()
+                if robot.mission_id == record.request.mission_id
+            ]
+            robot_id = record.assigned_robot_id or (claims[0] if claims else None)
+            if robot_id is None or (
+                record.state
+                not in (
+                    MissionState.ASSIGNED,
+                    MissionState.EXECUTING,
+                    MissionState.RECOVERY_REQUIRED,
+                )
+                and record.payload_ownership == PayloadOwnership.NOT_PICKED_UP
+                and not claims
+            ):
+                continue
+            stations = {record.request.pickup_station, record.request.dropoff_station}
+            related = set(stations)
+            for route in self.config.routes.values():
+                if stations.intersection(route):
+                    related.update(route)
+            for resource in self.resources.snapshot(now):
+                if (
+                    resource.resource_id in related
+                    and resource.lease is None
+                    and resource.former_lease is None
+                ):
+                    # This identity names quarantine evidence, not an issued
+                    # authority token. No live lease is created or restored.
+                    self.resources.quarantine_evidence(
+                        Lease(
+                            robot_id,
+                            record.request.mission_id,
+                            resource.resource_id,
+                            "restart-evidence-" + secrets.token_urlsafe(32),
+                            now,
+                        )
+                    )
 
     def _fence_observed_resources(self, policy, robots, now):
         for resource in self.resources.snapshot(now):
@@ -303,7 +350,7 @@ class FleetAdapter:
         try:
             record = self.core.submit(request, self.clock())
         except sqlite3.Error:
-            self.state = "STORAGE_FAILED"
+            self._fail_storage()
             raise
         self._emit(record)
         return record
@@ -324,7 +371,7 @@ class FleetAdapter:
         try:
             self.journal.record_contact(robot_id, contact, now, source_time_ns)
         except sqlite3.Error:
-            self.state = "STORAGE_FAILED"
+            self._fail_storage()
             return
         self._contacts[robot_id] = (contact, now, source_time_ns)
 
@@ -343,7 +390,7 @@ class FleetAdapter:
         try:
             self.journal.record_observation(snapshot, now, source_time_ns)
         except sqlite3.Error:
-            self.state = "STORAGE_FAILED"
+            self._fail_storage()
             return
         if (
             snapshot.robot_id in self._dock_flights
@@ -415,9 +462,44 @@ class FleetAdapter:
         try:
             self._reconcile_startup(now)
         except sqlite3.Error:
-            self.state = "STORAGE_FAILED"
+            self._fail_storage()
+
+    def _discard_failed_callback(self, callback, args):
+        if callback in (self._accepted, self._dock_accepted):
+            # Both callbacks carry (mission/charge, flight, handle, error).
+            flight, handle = args[1:3]
+            if not flight.retired and flight.handle is None:
+                flight.handle = handle
+        elif callback in (self._result, self._dock_result):
+            # A transport terminal callback permits local handle retirement,
+            # never a journal terminal transition or resource release.
+            flight = args[1]
+            flight.retired = True
+            flights = self._flights if callback == self._result else self._dock_flights
+            identity = args[0] if callback == self._result else args[0].robot_id
+            if flights.get(identity) is flight:
+                flights.pop(identity)
+
+    def _fail_storage(self):
+        """Stop mutation and new callbacks; retain bounded active reservations.
+
+        Failed intent persistence cannot authorize a robot cancellation. Active
+        agents retain their local safe-action behavior; only terminal transport
+        callbacks or shutdown retire their bounded local handle references.
+        """
+        if self.state == "STORAGE_FAILED":
+            return
+        self.state = "STORAGE_FAILED"
+        for mission_id in tuple(self._rounds):
+            try:
+                self._close_round(mission_id)
+            except Exception:
+                pass  # Transport cleanup must not mask the original DB error.
 
     def _enqueue(self, callback, *args):
+        if self.state == "STORAGE_FAILED":
+            self._discard_failed_callback(callback, args)
+            return
         self._callbacks.put((callback, args))
 
     def _emit(self, record, state=None, detail="", progress=0.0):
@@ -429,10 +511,14 @@ class FleetAdapter:
                 callback, args = self._callbacks.get_nowait()
             except queue.Empty:
                 break
-            callback(*args)
+            if self.state == "STORAGE_FAILED":
+                self._discard_failed_callback(callback, args)
+            else:
+                callback(*args)
 
     def tick(self):
         if self.state == "STORAGE_FAILED":
+            self._drain_callbacks(200)
             return
         try:
             self._reconcile_startup(self.clock())
@@ -443,7 +529,7 @@ class FleetAdapter:
                 self.resources.snapshot(self.clock()), self.clock()
             )
         except sqlite3.Error:
-            self.state = "STORAGE_FAILED"
+            self._fail_storage()
             raise
 
     def _tick(self):
@@ -801,7 +887,7 @@ class FleetAdapter:
             try:
                 self._reconcile_startup(self.clock())
             except sqlite3.Error:
-                self.state = "STORAGE_FAILED"
+                self._fail_storage()
         if self.state != "RUNNING":
             return self._resource_denial(
                 operation,
@@ -816,7 +902,7 @@ class FleetAdapter:
             )
             return response
         except sqlite3.Error:
-            self.state = "STORAGE_FAILED"
+            self._fail_storage()
             return self._resource_denial(operation, "fleet storage failed")
 
     @staticmethod

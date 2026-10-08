@@ -2,7 +2,7 @@
 """Thread-owned SQLite journal for the fleet manager's durable mission state."""
 
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from enum import Enum
 import json
 import math
@@ -338,6 +338,55 @@ class MissionJournal:
             (MissionState.COMPLETED, MissionState.FAILED, MissionState.CANCELLED),
         ).fetchall()
         return tuple(_record(row) for row in rows)
+
+    def load_recovery(self) -> tuple[MissionRecord, ...]:
+        """Merge durable correlated carrying evidence, never replay pose authority.
+
+        An observation can commit before its corresponding mission transition
+        fails. EMPTY is not an ordered delivery proof and cannot erase carrying
+        evidence. Completed delivery rows are excluded by load_active().
+        """
+        active = {record.request.mission_id: record for record in self.load_active()}
+        carriers = {
+            mission_id: record.assigned_robot_id
+            for mission_id, record in active.items()
+            if record.assigned_robot_id is not None
+            and record.payload_ownership
+            in (PayloadOwnership.PICKED_UP, PayloadOwnership.UNKNOWN)
+        }
+        conflicts = set()
+        for row in self._connection.execute(
+            "SELECT robot_id, evidence_json FROM robot_observations "
+            "WHERE json_extract(evidence_json, '$.payload_state') IN ('LOADED', 'UNKNOWN') "
+            "ORDER BY sequence"
+        ):
+            evidence = json.loads(row["evidence_json"])
+            record = active.get(evidence.get("mission_id"))
+            if record is None:
+                continue
+            carrier = carriers.setdefault(record.request.mission_id, row["robot_id"])
+            ownership = record.payload_ownership
+            if ownership == PayloadOwnership.NOT_PICKED_UP:
+                ownership = (
+                    PayloadOwnership.PICKED_UP
+                    if evidence["payload_state"] == "LOADED"
+                    else PayloadOwnership.UNKNOWN
+                )
+            elif (
+                ownership == PayloadOwnership.UNKNOWN
+                and evidence["payload_state"] == "LOADED"
+            ):
+                ownership = PayloadOwnership.PICKED_UP
+            if carrier != row["robot_id"]:
+                conflicts.add(record.request.mission_id)
+            if record.request.mission_id in conflicts:
+                ownership = PayloadOwnership.UNKNOWN
+            active[record.request.mission_id] = replace(
+                record,
+                assigned_robot_id=carrier,
+                payload_ownership=ownership,
+            )
+        return tuple(active.values())
 
     def events(self, mission_id: str) -> tuple[MissionEvent, ...]:
         rows = self._connection.execute(
