@@ -5,14 +5,16 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src/fleet_manager"))
 
 from fleet_manager.adapter import FleetAdapter
 from fleet_manager.config import Pose2D, load_fleet_config
+from fleet_manager.config import ResourceConfig
 from fleet_manager.journal import MissionJournal, MissionState
 from fleet_manager.models import MissionRequest, RobotSnapshot
-from fleet_manager.resources import Lease, LeaseRequest
+from fleet_manager.resources import Lease, LeaseRequest, ResourceManager
 
 
 def main():
@@ -98,6 +100,61 @@ def main():
                         Lease(
                             "amr_01", "former-aisle", "central_aisle", "old-aisle", 90
                         )
+                    )
+                    server.capture(adapter)
+                elif command["command"] == "astral":
+                    astral = "😀" * 256
+                    adapter.resources = ResourceManager(
+                        [ResourceConfig(astral, "traffic_zone", 1)]
+                    )
+                    adapter.resources.quarantine_evidence(
+                        Lease("amr_02", astral, astral, astral, 90)
+                    )
+                    adapter.registry.observe(
+                        replace(
+                            adapter.registry.get("amr_02", 100), health_detail=astral
+                        ),
+                        100,
+                    )
+                    server.observe_event(
+                        SimpleNamespace(
+                            protocol="TEST",
+                            event=astral,
+                            detail='<img src=x onerror="window.dashboardInjected=true">'
+                            + "😀" * 200,
+                        )
+                    )
+                    server.capture(adapter)
+                elif command["command"] == "overcap":
+                    adapter.resources = ResourceManager(
+                        [ResourceConfig("central_aisle", "traffic_zone", 1)]
+                        + [
+                            ResourceConfig(f"zone-{number}", "traffic_zone", 1)
+                            for number in range(100)
+                        ]
+                    )
+                    for number in range(101):
+                        adapter.resources.quarantine_evidence(
+                            Lease(
+                                "amr_02" if number == 100 else "amr_01",
+                                f"claim-{number}",
+                                "central_aisle",
+                                f"token-{number}",
+                                90,
+                            )
+                        )
+                        adapter.resources.acquire(
+                            LeaseRequest(
+                                "amr_01", f"waiting-{number}", "central_aisle"
+                            ),
+                            100,
+                        )
+                    adapter.registry.observe(
+                        replace(
+                            adapter.registry.get("amr_02", 100),
+                            health_detail="Bounded observer cannot rule out hidden ownership evidence",
+                        ),
+                        100,
                     )
                     server.capture(adapter)
                 elif command["command"] == "dense":

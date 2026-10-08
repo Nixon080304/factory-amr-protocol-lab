@@ -57,6 +57,21 @@ class ResourceSnapshot:
 
 
 @dataclass(frozen=True)
+class ResourceProjection:
+    """Bounded observer rows and exact omissions at each applied source cap.
+
+    Whole omitted resources are counted once; their nested state is not read.
+    Waiter/claim counts correspond positionally to the retained resource rows.
+    This observer-only type never enters the persisted control snapshot.
+    """
+
+    snapshots: tuple[ResourceSnapshot, ...]
+    omitted_resources: int
+    omitted_waiters: tuple[int, ...]
+    omitted_claims: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class WaiterResolution:
     cancelled: bool
     lease: Lease | None
@@ -390,7 +405,9 @@ class ResourceManager:
                 for resource in self._resources.values()
             )
 
-    def observer_snapshot(self) -> tuple[ResourceSnapshot, ...] | None:
+    def observer_snapshot(
+        self, *, with_omissions=False
+    ) -> tuple[ResourceSnapshot, ...] | ResourceProjection | None:
         """Read detached evidence without expiring authority or waiting for a writer.
 
         The web observer projects expired authority as uncertain. It never invokes
@@ -399,7 +416,7 @@ class ResourceManager:
         if not self._lock.acquire(blocking=False):
             return None
         try:
-            return tuple(
+            rows = tuple(
                 ResourceSnapshot(
                     resource.resource_id,
                     resource.kind,
@@ -414,6 +431,20 @@ class ResourceManager:
                     self._former.get(resource.resource_id, ())[:100],
                 )
                 for resource in islice(self._resources.values(), 100)
+            )
+            if not with_omissions:
+                return rows
+            return ResourceProjection(
+                rows,
+                max(0, len(self._resources) - len(rows)),
+                tuple(
+                    len(self._queues[row.resource_id]) - len(row.waiters)
+                    for row in rows
+                ),
+                tuple(
+                    len(self._former.get(row.resource_id, ())) - len(row.former_leases)
+                    for row in rows
+                ),
             )
         finally:
             self._lock.release()

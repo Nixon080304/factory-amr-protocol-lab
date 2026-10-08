@@ -42,6 +42,19 @@ try {
   assert.equal(client.retryDelay(3, () => 0.5), 4000);
   assert.equal(client.retryDelay(100, () => 1), 8000);
   assert.ok(client.retryDelay(2, () => 0) < client.retryDelay(2, () => 1));
+  const astral = '😀'.repeat(256);
+  const boundedCases = [
+    { robots: [{ robot_id: astral, health_detail: astral, unresolved_resources: [astral] }] },
+    { resources: [{ resource_id: astral, kind: astral, owner: astral, waiters: [astral], unresolved_claimants: [astral], former_leases: [{ robot_id: astral, mission_id: astral, resource_id: astral, lease_id: astral }] }] },
+    { missions: [{ mission_id: astral, part: astral, pickup_station: astral, dropoff_station: astral }] },
+    { dock_queue: [{ robot_id: astral, dock_id: astral, state: astral }] },
+    { events: [{ event_id: astral, mission_id: astral, robot_id: astral, protocol: astral, event: astral, outcome: astral, detail: astral }] },
+  ];
+  assert.deepEqual(boundedCases.map(fields => new client.SnapshotOrder().accept({ ...value, ...fields }, true)), Array(5).fill('new'));
+  assert.deepEqual([
+    { robots: [{ robot_id: 'amr_01', health_detail: astral + '😀' }] },
+    { events: [{ detail: astral + '😀' }] },
+  ].map(fields => new client.SnapshotOrder().accept({ ...value, ...fields }, true)), ['invalid', 'invalid']);
   await waitFor(() => lines.some(line => line.ready) || fixture.exitCode !== null, 'production server startup');
   assert.equal(fixture.exitCode, null, fixtureErrors || 'dashboard fixture exited');
   const { url } = lines.find(line => line.ready);
@@ -100,6 +113,24 @@ try {
   await browser.send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 1100, deviceScaleFactor: 1, mobile: false });
   const quarantineDesktop = await browser.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: true });
   await writeFile(`${evidence}/desktop-quarantine.png`, Buffer.from(quarantineDesktop.data, 'base64'));
+  await browser.send('Emulation.setDeviceMetricsOverride', { width: 360, height: 800, deviceScaleFactor: 1, mobile: true });
+  await command('astral');
+  await waitFor(() => browser.evaluate("document.querySelector('#connection').dataset.state === 'live' && document.querySelector('[data-robot-id=\"amr_02\"]').textContent.includes('😀'.repeat(256))"), 'astral observer snapshot stays live');
+  assert.equal(await browser.evaluate("document.querySelectorAll('[data-resource-id]').length"), 1);
+  assert.equal(await browser.evaluate("Array.from(document.querySelector('[data-resource-id]').dataset.resourceId).length"), 256);
+  assert.equal(await browser.evaluate('document.documentElement.scrollWidth <= innerWidth'), true, 'astral phone overflow');
+  assert.equal(await browser.evaluate("document.querySelector('#events').textContent.includes('<img src=x') && document.querySelector('#events img') === null && window.dashboardInjected !== true"), true, 'astral and markup stay inert textContent');
+  await command('overcap');
+  await waitFor(() => browser.evaluate("document.querySelector('#truncation').textContent.includes('former_leases: 1') && document.querySelector('#truncation').textContent.includes('waiters: 1') && document.querySelector('#truncation').textContent.includes('resources: 1')"), 'upstream cap counts remain visible');
+  const incompleteRobot = await browser.evaluate("document.querySelector('[data-robot-id=\"amr_02\"]').textContent");
+  assert.match(incompleteRobot, /Resource evidence incomplete/);
+  assert.doesNotMatch(incompleteRobot, /None held/);
+  assert.equal(await browser.evaluate('document.documentElement.scrollWidth <= innerWidth'), true, 'incomplete evidence phone overflow');
+  const incompletePhone = await browser.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: true, clip: { x: 0, y: 0, width: 360, height: 1800, scale: 1 } });
+  await writeFile(`${evidence}/phone-incomplete.png`, Buffer.from(incompletePhone.data, 'base64'));
+  await browser.send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 1100, deviceScaleFactor: 1, mobile: false });
+  const incompleteDesktop = await browser.send('Page.captureScreenshot', { format: 'png' });
+  await writeFile(`${evidence}/desktop-incomplete.png`, Buffer.from(incompleteDesktop.data, 'base64'));
   await browser.send('Emulation.setDeviceMetricsOverride', { width: 360, height: 800, deviceScaleFactor: 1, mobile: true });
   await command('dense');
   await waitFor(() => browser.evaluate("document.querySelectorAll('[data-resource-id]').length === 100"), 'dense waiter snapshot remains schema-valid');

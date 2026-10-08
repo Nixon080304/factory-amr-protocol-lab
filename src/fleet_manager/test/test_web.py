@@ -986,6 +986,10 @@ def test_all_advertised_maxima_and_bad_optional_data_stay_browser_acceptable(das
         )
         > 0
     )
+    assert_browser_accepts(body)
+
+
+def assert_browser_accepts(body):
     script = """
 const fs = require('node:fs');
 (async () => {
@@ -1017,3 +1021,250 @@ def test_invalid_former_claim_entries_are_omitted_whole_with_visible_count(dashb
     result = json.loads(request(dashboard)[1])
     assert result["resources"][0]["former_leases"] == []
     assert result["truncation"]["fields"] == 2
+
+
+def test_production_observer_astral_strings_match_browser_code_point_limits(tmp_path):
+    from dataclasses import replace
+    from types import SimpleNamespace
+    from fleet_manager.config import ResourceConfig
+    from fleet_manager.resources import Lease, ResourceManager
+
+    path, journal, adapter = rig(tmp_path)
+    astral = "😀" * 256
+    adapter.resources = ResourceManager([ResourceConfig(astral, "traffic_zone", 1)])
+    adapter.resources.quarantine_evidence(Lease("amr_02", astral, astral, astral, 90))
+    adapter.registry.observe(
+        replace(adapter.registry.get("amr_02", 100), health_detail=astral), 100
+    )
+    journal.register(MissionRequest(astral, astral, astral, astral), "astral", 100)
+    server = api().FleetDashboard(port=0, journal_path=path)
+    server.observe_event(
+        SimpleNamespace(
+            mission_id=astral,
+            robot_id=astral,
+            event=astral,
+            protocol=astral,
+            outcome=astral,
+            detail=astral,
+        )
+    )
+    server.capture(adapter)
+    server.start()
+    try:
+        wait_for(lambda: json.loads(request(server)[1])["robots"])
+        body = request(server)[1]
+        value = json.loads(body)
+        assert value["resources"][0]["resource_id"] == astral
+        assert value["resources"][0]["former_leases"][0]["mission_id"] == astral
+        assert value["robots"][1]["unresolved_resources"] == [astral]
+        assert len(body) <= 512000
+        assert_browser_accepts(body)
+    finally:
+        server.stop()
+        journal.close()
+
+
+@pytest.mark.parametrize("kind", ["claims", "waiters", "resources"])
+@pytest.mark.parametrize("count", [100, 101, 250])
+def test_source_caps_report_exact_omissions_and_never_claim_complete_robot_evidence(
+    tmp_path, kind, count
+):
+    from fleet_manager.config import ResourceConfig
+    from fleet_manager.resources import Lease, ResourceManager
+
+    path, journal, adapter = rig(tmp_path)
+    if kind == "resources":
+        adapter.resources = ResourceManager(
+            [
+                ResourceConfig(f"zone-{number}", "traffic_zone", 1)
+                for number in range(count)
+            ]
+        )
+    elif kind == "claims":
+        for number in range(count):
+            adapter.resources.quarantine_evidence(
+                Lease(
+                    "amr_02" if number == count - 1 else "amr_01",
+                    f"former-{number}",
+                    "central_aisle",
+                    f"old-{number}",
+                    90,
+                )
+            )
+    else:
+        adapter.resources.acquire(LeaseRequest("amr_01", "held", "central_aisle"), 100)
+        for number in range(count):
+            adapter.resources.acquire(
+                LeaseRequest("amr_02", f"waiting-{number}", "central_aisle"), 100
+            )
+    server = api().FleetDashboard(port=0, journal_path=path)
+    server.capture(adapter)
+    server.start()
+    try:
+        wait_for(lambda: json.loads(request(server)[1])["robots"])
+        value = json.loads(request(server)[1])
+        counter = "former_leases" if kind == "claims" else kind
+        assert value["truncation"].get(counter, 0) == max(0, count - 100)
+        assert all(
+            robot.get("resource_evidence_incomplete", False) == (count > 100)
+            for robot in value["robots"]
+        )
+        if kind == "claims":
+            resource = next(
+                row
+                for row in value["resources"]
+                if row["resource_id"] == "central_aisle"
+            )
+            assert len(resource["former_leases"]) == min(100, count)
+            if count == 100:
+                assert "amr_02" in resource["unresolved_claimants"]
+            else:
+                assert resource.get("omitted_claims") == count - 100
+    finally:
+        server.stop()
+        journal.close()
+
+
+def test_source_claim_omissions_clear_at_boundary_and_expiry_does_not_leave_stale_counts(
+    tmp_path,
+):
+    from fleet_manager.resources import Lease, LeaseKey
+
+    path, journal, adapter = rig(tmp_path)
+    claims = [
+        Lease(
+            "amr_02" if number == 100 else "amr_01",
+            f"former-{number}",
+            "central_aisle",
+            f"old-{number}",
+            90,
+        )
+        for number in range(101)
+    ]
+    for claim in claims:
+        adapter.resources.quarantine_evidence(claim)
+    server = api().FleetDashboard(port=0, journal_path=path)
+    server.capture(adapter)
+    server.start()
+    try:
+        wait_for(lambda: json.loads(request(server)[1])["robots"])
+        assert json.loads(request(server)[1])["truncation"].get("former_leases", 0) == 1
+        first = claims[0]
+        assert adapter.resources.clear_reconciliation(
+            LeaseKey(
+                first.robot_id, first.mission_id, first.resource_id, first.lease_id
+            ),
+            100,
+        )
+        server.capture(adapter)
+        wait_for(
+            lambda: (
+                json.loads(request(server)[1])["truncation"].get("former_leases", 0)
+                == 0
+            )
+        )
+        value = json.loads(request(server)[1])
+        assert not any(
+            robot.get("resource_evidence_incomplete", False)
+            for robot in value["robots"]
+        )
+        assert value["robots"][1]["unresolved_resources"] == ["central_aisle"]
+        for claim in claims[1:]:
+            assert adapter.resources.clear_reconciliation(
+                LeaseKey(
+                    claim.robot_id, claim.mission_id, claim.resource_id, claim.lease_id
+                ),
+                100,
+            )
+        adapter.resources.acquire(LeaseRequest("amr_02", "live", "central_aisle"), 100)
+        adapter.resources.expire(200)
+        server.capture(adapter)
+        wait_for(
+            lambda: (
+                len(
+                    next(
+                        row
+                        for row in json.loads(request(server)[1])["resources"]
+                        if row["resource_id"] == "central_aisle"
+                    )["former_leases"]
+                )
+                == 1
+            )
+        )
+        value = json.loads(request(server)[1])
+        assert value["truncation"].get("former_leases", 0) == 0
+        assert value["robots"][1]["unresolved_resources"] == ["central_aisle"]
+    finally:
+        server.stop()
+        journal.close()
+
+
+def test_source_and_serializer_omissions_merge_without_accumulating(dashboard):
+    value = snapshot()
+    value["_source_truncation"] = {"resources": 7, "waiters": 3, "former_leases": 5}
+    value["resources"] = [
+        {"resource_id": str(number), "waiters": ["amr_02"] * 102}
+        for number in range(101)
+    ]
+    dashboard.hub.publish(value)
+    first = json.loads(request(dashboard)[1])
+    assert first["truncation"]["resources"] == 8
+    assert first["truncation"].get("waiters", 0) == 203
+    assert first["truncation"].get("former_leases", 0) == 5
+    assert "_source_truncation" not in first
+    assert first["robots"][0].get("resource_evidence_incomplete") is True
+    dashboard.hub.publish(value)
+    second = json.loads(request(dashboard)[1])
+    assert second["truncation"] == first["truncation"]
+
+
+def test_observer_counts_do_not_iterate_beyond_any_source_cap(tmp_path):
+    from fleet_manager.config import ResourceConfig
+    from fleet_manager.resources import Lease, ResourceManager
+
+    path, journal, adapter = rig(tmp_path)
+    resources = ResourceManager(
+        [ResourceConfig(f"zone-{number}", "traffic_zone", 1) for number in range(250)]
+    )
+    for number in range(250):
+        resources.quarantine_evidence(
+            Lease("amr_01", f"claim-{number}", "zone-0", f"token-{number}", 90)
+        )
+        resources.acquire(LeaseRequest("amr_02", f"waiter-{number}", "zone-0"), 100)
+
+    class GuardedRows(dict):
+        def values(self):
+            for number, row in enumerate(super().values()):
+                assert number < 100, "observer reads an omitted resource"
+                yield row
+
+    class GuardedList(list):
+        def __iter__(self):
+            for number, row in enumerate(list.__iter__(self)):
+                assert number < 100, "observer reads an omitted source waiter"
+                yield row
+
+    class GuardedTuple(tuple):
+        def __iter__(self):
+            for number, row in enumerate(tuple.__iter__(self)):
+                assert number < 100, "observer reads an omitted source claim"
+                yield row
+
+    resources._resources = GuardedRows(resources._resources)
+    resources._queues["zone-0"] = GuardedList(resources._queues["zone-0"])
+    resources._former["zone-0"] = GuardedTuple(resources._former["zone-0"])
+    adapter.resources = resources
+    server = api().FleetDashboard(port=0, journal_path=path)
+    started = time.monotonic()
+    assert server.capture(adapter)
+    assert time.monotonic() - started < 0.1
+    server.start()
+    try:
+        wait_for(lambda: json.loads(request(server)[1])["robots"])
+        value = json.loads(request(server)[1])
+        assert value["truncation"]["resources"] == 150
+        assert value["truncation"].get("waiters", 0) == 150
+        assert value["truncation"].get("former_leases", 0) == 150
+    finally:
+        server.stop()
+        journal.close()

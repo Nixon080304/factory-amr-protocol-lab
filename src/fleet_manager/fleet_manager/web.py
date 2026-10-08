@@ -23,7 +23,7 @@ import threading
 import time
 
 
-def _plain(value, budget, depth=0, truncation=None):
+def _plain(value, budget, depth=0, truncation=None, field_name=None):
     """Copy only bounded plain data, including broken Unicode and nonfinite floats."""
     if budget[0] <= 0 or depth > 6:
         raise ValueError("plain row exceeds serialization bound")
@@ -43,13 +43,16 @@ def _plain(value, budget, depth=0, truncation=None):
         if truncation is not None:
             truncation["fields"] += max(0, len(value) - 32)
         return {
-            key[:64]: _plain(item, budget, depth + 1, truncation)
+            key[:64]: _plain(item, budget, depth + 1, truncation, key)
             for key, item in islice(value.items(), 32)
             if type(key) is str and key.isascii()
         }
     if type(value) in (list, tuple):
         if truncation is not None:
-            truncation["fields"] += max(0, len(value) - 100)
+            counter = {"waiters": "waiters", "former_leases": "former_leases"}.get(
+                field_name, "fields"
+            )
+            truncation[counter] += max(0, len(value) - 100)
         return [_plain(item, budget, depth + 1, truncation) for item in value[:100]]
     return None
 
@@ -103,8 +106,16 @@ class SnapshotHub:
                 "events",
                 "fields",
                 "strings",
+                "waiters",
+                "former_leases",
             )
         }
+        source = snapshot.get("_source_truncation", {})
+        if type(source) is dict:
+            for key in ("resources", "waiters", "former_leases"):
+                count = source.get(key, 0)
+                if type(count) is int and 0 <= count <= 2**53 - 1:
+                    truncation[key] = count
         for key in ("updated_at", "fleet_state"):
             raw = snapshot.get(key, value[key])
             value[key] = (
@@ -129,7 +140,7 @@ class SnapshotHub:
             if type(rows) not in (list, tuple):
                 continue
             limit = 50 if key == "events" else 100
-            truncation[key] = max(0, len(rows) - limit)
+            truncation[key] += max(0, len(rows) - limit)
             for row in rows[-limit:] if key == "events" else rows[:limit]:
                 try:
                     item = _plain(row, [4096], truncation=truncation)
@@ -193,6 +204,9 @@ class SnapshotHub:
                     ]
                     truncation["fields"] += len(claims) - len(item["former_leases"])
                 if key == "robots":
+                    item["resource_evidence_incomplete"] = (
+                        item.get("resource_evidence_incomplete", False) is not False
+                    )
                     battery = item.get("battery_percent")
                     if type(battery) not in (int, float) or not 0 <= battery <= 100:
                         item["battery_percent"] = None
@@ -219,6 +233,12 @@ class SnapshotHub:
                 wire_size += row_size
                 value[key].append(item)
         value["truncation"] = truncation
+        if any(
+            truncation[key]
+            for key in ("resources", "waiters", "former_leases", "fields")
+        ):
+            for robot in value["robots"]:
+                robot["resource_evidence_incomplete"] = True
         with self._lock:
             self._sequence += 1
             value.update(sequence=self._sequence, session_id=self._session)
@@ -246,6 +266,9 @@ class SnapshotHub:
                     break
                 value[largest].pop()
                 truncation[largest] += 1
+                if largest == "resources":
+                    for robot in value["robots"]:
+                        robot["resource_evidence_incomplete"] = True
                 body = json.dumps(
                     value, ensure_ascii=True, allow_nan=False, separators=(",", ":")
                 ).encode("utf-8")
@@ -502,7 +525,7 @@ class FleetDashboard:
 
     def capture(self, adapter):
         """Called on the executor: bounded frozen values, no SQLite or waiting."""
-        resources = adapter.resources.observer_snapshot()
+        resources = adapter.resources.observer_snapshot(with_omissions=True)
         if resources is None or not self._capture_lock.acquire(blocking=False):
             return False
         try:
@@ -605,9 +628,19 @@ class FleetDashboard:
                     robots, resources, charging, state, now, updated_at = capture
                     value = _empty()
                     value.update(fleet_state=state, updated_at=updated_at)
+                    value["_source_truncation"] = {
+                        "resources": resources.omitted_resources,
+                        "waiters": sum(resources.omitted_waiters),
+                        "former_leases": sum(resources.omitted_claims),
+                    }
+                    incomplete = any(value["_source_truncation"].values())
                     owners = {}
                     unresolved = {}
-                    for resource in resources:
+                    for resource, omitted_waiters, omitted_claims in zip(
+                        resources.snapshots,
+                        resources.omitted_waiters,
+                        resources.omitted_claims,
+                    ):
                         expired = (
                             resource.lease is not None
                             and resource.lease.expires_at <= now
@@ -633,6 +666,8 @@ class FleetDashboard:
                                 "resource_id": resource.resource_id,
                                 "kind": resource.kind,
                                 "owner": owner.robot_id if owner else None,
+                                "omitted_waiters": omitted_waiters,
+                                "omitted_claims": omitted_claims,
                                 "former_leases": [asdict(claim) for claim in claims],
                                 "unresolved_claimants": list(
                                     dict.fromkeys(claim.robot_id for claim in claims)
@@ -652,6 +687,7 @@ class FleetDashboard:
                         item["unresolved_resources"] = unresolved.get(
                             robot.robot_id, []
                         )
+                        item["resource_evidence_incomplete"] = incomplete
                         value["robots"].append(item)
                     value["dock_queue"] = [asdict(charge) for charge in charging]
                     if connection is not None:
