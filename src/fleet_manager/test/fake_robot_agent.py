@@ -73,7 +73,7 @@ def create_ros_robot(context, robot_id, namespace, cost=1.0, *, cost_available=T
         message = RobotState(
             robot_id=robot_id,
             mode="EXECUTING" if node.active else "AVAILABLE",
-            frame_id="map",
+            frame_id=namespace.strip("/") + "/map",
             battery_percent=80.0,
             payload_state="EMPTY",
         )

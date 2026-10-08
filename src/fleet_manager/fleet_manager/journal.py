@@ -2,7 +2,7 @@
 """Thread-owned SQLite journal for the fleet manager's durable mission state."""
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from enum import Enum
 import json
 import math
@@ -177,6 +177,26 @@ class MissionJournal:
                     "CREATE INDEX IF NOT EXISTS mission_events_by_mission "
                     "ON mission_events(mission_id, sequence)"
                 )
+                self._connection.execute(
+                    "CREATE TABLE IF NOT EXISTS resource_snapshots "
+                    "(resource_id TEXT PRIMARY KEY, evidence_json TEXT NOT NULL)"
+                )
+                self._connection.execute(
+                    "CREATE TABLE IF NOT EXISTS resource_events "
+                    "(sequence INTEGER PRIMARY KEY AUTOINCREMENT, resource_id TEXT NOT NULL, "
+                    "evidence_json TEXT NOT NULL, timestamp REAL NOT NULL)"
+                )
+                self._connection.execute(
+                    "CREATE TABLE IF NOT EXISTS robot_observations "
+                    "(sequence INTEGER PRIMARY KEY AUTOINCREMENT, robot_id TEXT NOT NULL, "
+                    "evidence_json TEXT NOT NULL, source_time_ns INTEGER, "
+                    "received_at REAL NOT NULL)"
+                )
+                self._connection.execute(
+                    "CREATE TABLE IF NOT EXISTS contact_observations "
+                    "(sequence INTEGER PRIMARY KEY AUTOINCREMENT, robot_id TEXT NOT NULL, "
+                    "contact INTEGER NOT NULL, source_time_ns INTEGER NOT NULL, received_at REAL NOT NULL)"
+                )
         except BaseException:
             self._connection.close()
             raise
@@ -341,6 +361,94 @@ class MissionJournal:
     def get(self, mission_id: str) -> MissionRecord:
         """Read the current snapshot, including terminal missions."""
         return self._require(mission_id)
+
+    def _save_resources(self, snapshots, now):
+        for snapshot in snapshots:
+            evidence = _json(asdict(snapshot))
+            row = self._connection.execute(
+                "SELECT evidence_json FROM resource_snapshots WHERE resource_id = ?",
+                (snapshot.resource_id,),
+            ).fetchone()
+            if row is not None and row[0] == evidence:
+                continue
+            self._connection.execute(
+                "INSERT INTO resource_snapshots VALUES (?, ?) "
+                "ON CONFLICT(resource_id) DO UPDATE SET evidence_json=excluded.evidence_json",
+                (snapshot.resource_id, evidence),
+            )
+            self._connection.execute(
+                "INSERT INTO resource_events(resource_id, evidence_json, timestamp) VALUES (?, ?, ?)",
+                (snapshot.resource_id, evidence, now),
+            )
+
+    def save_resources(self, snapshots, now):
+        """Persist authority evidence before a service can report a grant."""
+        now = _timestamp(now)
+        with self._transaction():
+            self._save_resources(snapshots, now)
+
+    def load_resources(self):
+        """Read persisted snapshots without treating tokens as authority."""
+        from fleet_manager.resources import Lease, LeaseRequest, ResourceSnapshot
+
+        values = []
+        for row in self._connection.execute(
+            "SELECT evidence_json FROM resource_snapshots ORDER BY resource_id"
+        ):
+            value = json.loads(row[0])
+            for name in ("lease", "former_lease"):
+                if value[name] is not None:
+                    value[name] = Lease(**value[name])
+            value["waiters"] = tuple(LeaseRequest(**item) for item in value["waiters"])
+            values.append(ResourceSnapshot(**value))
+        return tuple(values)
+
+    def record_observation(self, robot, received_at, source_time_ns=None):
+        evidence = _json(asdict(robot))
+        with self._transaction():
+            self._connection.execute(
+                "INSERT INTO robot_observations(robot_id, evidence_json, source_time_ns, received_at) "
+                "VALUES (?, ?, ?, ?)",
+                (robot.robot_id, evidence, source_time_ns, _timestamp(received_at)),
+            )
+
+    def record_contact(self, robot_id, contact, received_at, source_time_ns):
+        with self._transaction():
+            self._connection.execute(
+                "INSERT INTO contact_observations(robot_id, contact, source_time_ns, received_at) VALUES (?, ?, ?, ?)",
+                (robot_id, int(contact), source_time_ns, _timestamp(received_at)),
+            )
+
+    def reconcile(self, decisions, snapshots, now):
+        """Commit mission decisions and physical resource clearance atomically.
+
+        Repeated identical decisions do not append duplicate mission events.
+        The adapter exposes RUNNING only after this transaction commits.
+        """
+        now = _timestamp(now)
+        with self._transaction():
+            for decision in decisions:
+                record = self._require(decision.mission_id)
+                if (
+                    record.state == decision.state
+                    and record.assigned_robot_id == decision.robot_id
+                    and record.payload_ownership == decision.payload_ownership
+                ):
+                    continue
+                self._change(
+                    record,
+                    decision.state,
+                    _json(
+                        {
+                            "reason": decision.reason,
+                            "assigned_robot_id": decision.robot_id,
+                            "payload_ownership": decision.payload_ownership,
+                        }
+                    ),
+                    now,
+                    decision.robot_id,
+                )
+            self._save_resources(snapshots, now)
 
     def close(self) -> None:
         self._connection.close()

@@ -75,6 +75,9 @@ class FleetConfig:
     traffic_bounds: Mapping[str, tuple[float, float, float, float]] = field(
         default_factory=lambda: MappingProxyType({})
     )
+    resource_bounds: Mapping[str, tuple[float, float, float, float]] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
 
 
 class _FleetLoader(yaml.SafeLoader):
@@ -172,10 +175,11 @@ def _parse_config(data):
     data = _mapping(data, "fleet")
     geometry = data.get("route_segments", {})
     zone_geometry = data.get("traffic_bounds", {})
+    resource_geometry = data.get("resource_bounds", {})
     data = {
         key: value
         for key, value in data.items()
-        if key not in ("route_segments", "traffic_bounds")
+        if key not in ("route_segments", "traffic_bounds", "resource_bounds")
     }
     data = _mapping(data, "fleet", ("robots", "resources", "routes", "docks", "energy"))
     robots = []
@@ -301,6 +305,18 @@ def _parse_config(data):
             raise ValueError(f"{path}: must cover traffic zones in route order")
         route_segments[name] = tuple(segments)
 
+    resource_bounds = {}
+    for resource, value in _mapping(resource_geometry, "resource_bounds").items():
+        path = f"resource_bounds.{resource}"
+        if resource not in resource_ids:
+            raise ValueError(f"{path}: unknown resource")
+        if not isinstance(value, list) or len(value) != 4:
+            raise ValueError(f"{path}: expected [xmin, ymin, xmax, ymax]")
+        bounds = tuple(_number(number, path) for number in value)
+        if bounds[0] >= bounds[2] or bounds[1] >= bounds[3]:
+            raise ValueError(f"{path}: bounds must have positive area")
+        resource_bounds[resource] = bounds
+
     docks = {}
     dock_ids = {
         resource.resource_id for resource in resources if resource.kind == "dock"
@@ -380,6 +396,7 @@ def _parse_config(data):
         energy,
         MappingProxyType(route_segments),
         MappingProxyType(traffic_bounds),
+        MappingProxyType(resource_bounds),
     )
 
 

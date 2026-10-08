@@ -396,6 +396,26 @@ TEST_F(LeaseTest, CancelledMissionCannotReacquireAndRaceItsLateCleanup) {
   ASSERT_EQ(wire->calls.size(), 1u);
   EXPECT_EQ(wire->calls.front().operation, ResourceOperation::Release);
 }
+TEST_F(LeaseTest, ReleasedNoticeCannotReenterBeforeUnresolvedAcquireBarrier) {
+  ResourceState reentered = ResourceState::Waiting;
+  adapter.acquire("central_aisle", "m1", [&](const auto &notice) {
+    if (notice.state == ResourceState::Released)
+      adapter.acquire("central_aisle", "m1",
+                      [&](const auto &next) { reentered = next.state; });
+  });
+  auto old = wire->take();
+  advance(1);
+  advance(0.25);
+  wire->answer(true, "current-token");
+  adapter.release("central_aisle", "m1", [](bool) {});
+  auto releasing = wire->take();
+  old.callback({true, "late-other-token", 10, "granted"});
+  releasing.callback({true, "", 0, "released"});
+  EXPECT_EQ(reentered, ResourceState::Lost);
+  ASSERT_EQ(wire->calls.size(), 1u);
+  EXPECT_EQ(wire->calls.front().operation, ResourceOperation::CancelWait);
+  EXPECT_FALSE(adapter.authorized("central_aisle", "m1"));
+}
 TEST_F(LeaseTest, CancelledAcquireDeniedAfterCancellationRemovesItsLateWaiter) {
   // Cross-service reordering can enqueue an acquisition after cancel_wait completed.
   acquire();

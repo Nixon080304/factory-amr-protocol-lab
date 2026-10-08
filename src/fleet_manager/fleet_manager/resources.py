@@ -319,6 +319,36 @@ class ResourceManager:
             self._grant_next(key.resource_id, now)
             return True
 
+    def restore_evidence(self, snapshots: Sequence[ResourceSnapshot]) -> None:
+        """Load former authority only as quarantine; never restore a live token.
+
+        Call before serving resource operations. Queues and old process-clock
+        deadlines cannot confer authority in a new process.
+        """
+        former = {}
+        for snapshot in snapshots:
+            lease = snapshot.lease or snapshot.former_lease
+            if lease is None:
+                continue
+            self._request(lease)
+            _identity(lease.lease_id, "lease_id")
+            if snapshot.resource_id != lease.resource_id:
+                raise ValueError("persisted resource identity mismatch")
+            former[lease.resource_id] = lease
+        with self._lock:
+            if self._leases or self._former or any(self._queues.values()):
+                raise ValueError("cannot restore evidence after resource activity")
+            self._former.update(former)
+
+    def quarantine_evidence(self, lease: Lease) -> None:
+        """Fence observed occupancy that has no persisted authority identity."""
+        self._request(lease)
+        _identity(lease.lease_id, "lease_id")
+        with self._lock:
+            if lease.resource_id in self._leases or lease.resource_id in self._former:
+                raise ValueError("cannot replace existing resource ownership evidence")
+            self._former[lease.resource_id] = lease
+
     def snapshot(self, now: float) -> tuple[ResourceSnapshot, ...]:
         """Return immutable detached state, fencing leases expired at this time."""
         now = self._time(now)

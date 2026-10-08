@@ -3,6 +3,8 @@
 
 from pathlib import Path
 from dataclasses import replace
+import fcntl
+import sqlite3
 
 from ament_index_python.packages import get_package_share_directory
 from action_msgs.msg import GoalStatus
@@ -22,10 +24,11 @@ from factory_interfaces.srv import (
     RenewResource,
 )
 from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
-from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
-from rclpy.clock import Clock
+from rclpy.callback_groups import CallbackGroup, MutuallyExclusiveCallbackGroup
+from rclpy.clock import Clock, ClockType
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
+from std_msgs.msg import Bool
 
 from fleet_manager.adapter import (
     FleetAdapter,
@@ -59,6 +62,24 @@ def manager_config(fleet_file, legacy_single_robot=False):
     return config
 
 
+class _ObservationGroup(CallbackGroup):
+    """Let the steady timer take DDS samples with their original metadata.
+
+    Humble's executor discards MessageInfo before invoking subscriptions. Native
+    take_message supplies source_timestamp, which still advances while ROS time
+    is paused. Keep these subscriptions out of executor callback dispatch.
+    """
+
+    def can_execute(self, entity):
+        return False
+
+    def beginning_execution(self, entity):
+        return False
+
+    def ending_execution(self, entity):
+        pass
+
+
 class FleetManagerNode(Node):
     """Run with a SingleThreadedExecutor: SQLite belongs to its creating thread.
 
@@ -87,12 +108,35 @@ class FleetManagerNode(Node):
         config = manager_config(
             fleet_file, self.declare_parameter("legacy_single_robot", False).value
         )
+        self._journal_lock = Path(str(journal_path.resolve()) + ".manager.lock").open(
+            "a"
+        )
+        try:
+            fcntl.flock(self._journal_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            self._journal_lock.close()
+            super().destroy_node()
+            raise RuntimeError("journal already has a fleet manager writer") from error
         self.protocol_group = MutuallyExclusiveCallbackGroup()
+        self.observation_group = _ObservationGroup()
         self._waiters = {}
         self._results = {}
         self.actions, self.costs, self.states, self.docks = {}, {}, [], {}
-        self.journal = MissionJournal(journal_path)
-        self.adapter = FleetAdapter(config, self.journal, self)
+        self.contacts = []
+        try:
+            self.journal = MissionJournal(journal_path)
+        except BaseException:
+            self._journal_lock.close()
+            super().destroy_node()
+            raise
+        self.adapter = FleetAdapter(
+            config,
+            self.journal,
+            self,
+            reconciliation_timeout=self.declare_parameter(
+                "reconciliation_timeout_sec", 5.0
+            ).value,
+        )
         for robot in config.robots:
             endpoints = robot_endpoints(robot)
             self.actions[robot.robot_id] = ActionClient(
@@ -113,11 +157,18 @@ class FleetManagerNode(Node):
                 self.create_subscription(
                     RobotState,
                     endpoints["state"],
-                    lambda message, robot_id=robot.robot_id: self._observe(
-                        robot_id, message
-                    ),
+                    lambda _: None,
                     qos_profile_sensor_data,
-                    callback_group=self.protocol_group,
+                    callback_group=self.observation_group,
+                )
+            )
+            self.contacts.append(
+                self.create_subscription(
+                    Bool,
+                    robot.namespace.rstrip("/") + "/factory/dock_contact",
+                    lambda _: None,
+                    qos_profile_sensor_data,
+                    callback_group=self.observation_group,
                 )
             )
         self.resource_services = [
@@ -147,13 +198,58 @@ class FleetManagerNode(Node):
             callback_group=self.protocol_group,
         )
         self.timer = self.create_timer(
-            0.05, self.adapter.tick, callback_group=self.protocol_group, clock=Clock()
+            0.05,
+            self._tick,
+            callback_group=self.protocol_group,
+            clock=Clock(clock_type=ClockType.STEADY_TIME),
         )
 
-    def _observe(self, robot_id, message):
+    def _tick(self):
+        for robot, subscription in zip(self.adapter.config.robots, self.contacts):
+            for _ in range(20):
+                with subscription.handle:
+                    sample = subscription.handle.take_message(Bool, False)
+                if sample is None:
+                    break
+                self.adapter.observe_contact(
+                    robot.robot_id,
+                    sample[0].data,
+                    source_time_ns=sample[1].get("source_timestamp", 0),
+                )
+        for robot, subscription in zip(self.adapter.config.robots, self.states):
+            for _ in range(20):
+                with subscription.handle:
+                    sample = subscription.handle.take_message(RobotState, False)
+                if sample is None:
+                    break
+                self._observe(robot.robot_id, sample[0], sample[1])
         try:
-            self.adapter.observe(robot_snapshot(robot_id, message))
-        except ValueError as error:
+            self.adapter.tick()
+        except sqlite3.Error as error:
+            self.get_logger().error(str(error))
+
+    def _observe(self, robot_id, message, info=None):
+        try:
+            robot = next(
+                robot
+                for robot in self.adapter.config.robots
+                if robot.robot_id == robot_id
+            )
+            snapshot = robot_snapshot(robot_id, message)
+            if message.frame_id != robot.frame_prefix + "map":
+                snapshot = replace(
+                    snapshot,
+                    pose=None,
+                    health="UNHEALTHY",
+                    health_detail="pose frame mismatch",
+                )
+            self.adapter.observe(
+                snapshot,
+                source_time_ns=info.get("source_timestamp", 0)
+                if info is not None
+                else None,
+            )
+        except (ValueError, sqlite3.Error) as error:
             self.get_logger().warning(str(error))
 
     def _goal(self, goal):
@@ -172,7 +268,7 @@ class FleetManagerNode(Node):
             return GoalResponse.REJECT
         try:
             self.adapter.submit(_request(goal))
-        except ValueError as error:
+        except (ValueError, sqlite3.Error) as error:
             self.get_logger().warning(str(error))
             return GoalResponse.REJECT
         return GoalResponse.ACCEPT
@@ -427,4 +523,5 @@ class FleetManagerNode(Node):
         for client in self.docks.values():
             client.destroy()
         self.journal.close()
+        self._journal_lock.close()
         return super().destroy_node()

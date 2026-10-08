@@ -215,14 +215,15 @@ struct ResourceAdapter::State : std::enable_shared_from_this<ResourceAdapter::St
             const double current = self->clock();
             if (operation == ResourceOperation::Release) {
               auto released = std::move(entry->released);
+              const bool unresolved = self->acquiring[index] != 0 ||
+                                      self->needs_resolution.count(index) != 0;
+              // Install the barrier before a notice can reenter acquire().
+              if (reply.ok && unresolved)
+                self->cleanup(entry->key, ResourceOperation::CancelWait);
               if (reply.ok)
                 self->notify(entry, ResourceState::Released, reply.reason);
               else
                 self->invalidate(entry, reply.reason);
-              const bool unresolved = self->acquiring[index] != 0 ||
-                                      self->needs_resolution.count(index) != 0;
-              if (reply.ok && unresolved)
-                self->cleanup(entry->key, ResourceOperation::CancelWait);
               if (released)
                 released(reply.ok && !unresolved);
               return;

@@ -6,13 +6,15 @@ work in tick(), keeping the journal and FleetCore on their creating thread.
 """
 
 from dataclasses import dataclass, field, replace
+from functools import wraps
 import math
 import queue
+import secrets
+import sqlite3
 import time
 
 from fleet_manager.core import (
     FleetCore,
-    ReconciliationSnapshot,
     RobotCancellationAck,
     RobotMissionFeedback,
     RobotMissionResult,
@@ -23,9 +25,24 @@ from fleet_manager.energy import EnergyPolicy
 from fleet_manager.journal import MissionState, PayloadOwnership
 from fleet_manager.models import RobotHealth, RobotMode, RobotSnapshot, robot_is_ready
 from fleet_manager.registry import RobotRegistry
-from fleet_manager.resources import LeaseKey, LeaseRequest, ResourceManager
+from fleet_manager.recovery import RecoveryPlanner
+from fleet_manager.resources import Lease, LeaseKey, LeaseRequest, ResourceManager
 
 PATH_PENDING_GRACE_SEC = 3.0
+
+
+def _storage_boundary(method):
+    """Fence a failed journal mutation without changing its error semantics."""
+
+    @wraps(method)
+    def guarded(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except sqlite3.Error:
+            self.state = "STORAGE_FAILED"
+            raise
+
+    return guarded
 
 
 @dataclass(frozen=True)
@@ -125,7 +142,15 @@ class FleetAdapter:
     mission must not make its still-running robot available for another goal.
     """
 
-    def __init__(self, config, journal, transport, *, clock=time.monotonic):
+    def __init__(
+        self,
+        config,
+        journal,
+        transport,
+        *,
+        clock=time.monotonic,
+        reconciliation_timeout=5.0,
+    ):
         self.config, self.journal, self.transport, self.clock = (
             config,
             journal,
@@ -134,6 +159,7 @@ class FleetAdapter:
         )
         self.registry = RobotRegistry(tuple(robot.robot_id for robot in config.robots))
         self.resources = ResourceManager(config.resources)
+        self.resources.restore_evidence(journal.load_resources())
         self.core = FleetCore(
             Dispatcher(EnergyPolicy(config.energy)),
             self.registry,
@@ -149,21 +175,199 @@ class FleetAdapter:
         self._dock_seen = set()
         self._dock_restart_unsafe = set()
         self._dock_completed = set()
-        # Unknown running goals after restart are fenced before scheduling starts.
-        self.core.reconcile(ReconciliationSnapshot(()), self.clock())
+        if not math.isfinite(reconciliation_timeout) or reconciliation_timeout <= 0:
+            raise ValueError("reconciliation_timeout must be positive and finite")
+        self.state = "RECONCILING"
+        self.startup_wall_ns = time.time_ns()
+        self._reconciliation_deadline = self.clock() + reconciliation_timeout
+        self._startup_observed = set()
+        self._source_times = {}
+        self._contacts = {}
+
+    def _reconcile_startup(self, now):
+        if self.state != "RECONCILING":
+            return
+        if (
+            len(self._startup_observed) < len(self.config.robots)
+            and now < self._reconciliation_deadline
+        ):
+            return
+        policy = RecoveryPlanner(self.config)
+        robots = {
+            robot.robot_id: self.registry.get(robot.robot_id, now)
+            for robot in self.config.robots
+        }
+        self._fence_observed_resources(policy, robots, now)
+        self._clear_resources(policy, robots, now)
+        snapshots = self.resources.snapshot(now)
+        for resource in snapshots:
+            if resource.resource_id not in self.config.docks:
+                continue
+            for robot_id, robot in tuple(robots.items()):
+                dock = self.config.docks[resource.resource_id]
+                inside = (
+                    robot.pose is not None
+                    and math.hypot(
+                        robot.pose.x - dock.charging_pose.x,
+                        robot.pose.y - dock.charging_pose.y,
+                    )
+                    <= dock.arrival_tolerance
+                )
+                if inside or robot.mode in (RobotMode.DOCKING, RobotMode.CHARGING):
+                    contact, receipt, _ = self._contacts.get(
+                        robot_id, (None, -math.inf, 0)
+                    )
+                    mode = policy.dock_state(
+                        robot,
+                        resource,
+                        contact=contact if now - receipt < 1.0 else None,
+                    )
+                    robots[robot_id] = replace(robot, mode=mode)
+                    self.registry.observe(robots[robot_id], now)
+        decisions = policy.plan(self.journal.load_active(), robots, snapshots)
+        self.journal.reconcile(decisions, snapshots, now)
+        self.state = "RUNNING"
+        for decision in decisions:
+            self._emit(self.journal.get(decision.mission_id))
+
+    def _fence_observed_resources(self, policy, robots, now):
+        for resource in self.resources.snapshot(now):
+            if resource.lease is not None or resource.former_lease is not None:
+                continue
+            geometry = (
+                resource.resource_id in self.config.traffic_bounds
+                or resource.resource_id in self.config.resource_bounds
+                or resource.resource_id in self.config.docks
+            )
+            for robot in robots.values():
+                evidence = Lease(
+                    robot.robot_id,
+                    robot.mission_id or "restart-observation",
+                    resource.resource_id,
+                    secrets.token_urlsafe(32),
+                    now,
+                )
+                if (
+                    not policy.valid_pose(robot)
+                    or geometry
+                    and not policy.proves_outside(evidence, robot)
+                ):
+                    self.resources.quarantine_evidence(evidence)
+                    break
+
+    def _clear_resources(self, policy, robots, now):
+        for resource in self.resources.snapshot(now):
+            former = resource.former_lease
+            if (
+                former is not None
+                and policy.proves_outside(former, robots.get(former.robot_id))
+                and all(
+                    policy.proves_outside(
+                        replace(former, robot_id=robot.robot_id), robot
+                    )
+                    for robot in robots.values()
+                )
+            ):
+                self.resources.clear_reconciliation(
+                    LeaseKey(
+                        former.robot_id,
+                        former.mission_id,
+                        former.resource_id,
+                        former.lease_id,
+                    ),
+                    now,
+                )
+        for dock_id in tuple(self._dock_restart_unsafe):
+            dock = self.config.docks[dock_id]
+            margin = 2 * dock.robot_radius + dock.arrival_tolerance
+            if all(
+                policy.valid_pose(robot)
+                and robot.mode == RobotMode.AVAILABLE
+                and not robot.mission_id
+                and robot.payload_state == "EMPTY"
+                and all(
+                    math.hypot(robot.pose.x - pose.x, robot.pose.y - pose.y) > margin
+                    for pose in (dock.staging_pose, dock.charging_pose)
+                )
+                for robot in robots.values()
+            ):
+                self._dock_restart_unsafe.discard(dock_id)
 
     def submit(self, request):
+        if self.state == "STORAGE_FAILED":
+            raise sqlite3.OperationalError("fleet storage failed")
         if request.requested_robot_id and request.requested_robot_id not in {
             robot.robot_id for robot in self.config.robots
         }:
             raise ValueError("requested robot is not configured")
-        record = self.core.submit(request, self.clock())
+        try:
+            record = self.core.submit(request, self.clock())
+        except sqlite3.Error:
+            self.state = "STORAGE_FAILED"
+            raise
         self._emit(record)
         return record
 
-    def observe(self, snapshot):
+    def observe_contact(self, robot_id, contact, *, source_time_ns):
+        if robot_id not in {robot.robot_id for robot in self.config.robots}:
+            raise ValueError("contact owner is not configured")
+        if type(contact) is not bool:
+            raise ValueError("dock contact must be bool")
+        previous = self._contacts.get(robot_id, (None, 0, 0))[2]
+        if (
+            source_time_ns <= self.startup_wall_ns
+            or source_time_ns <= previous
+            or self.state == "STORAGE_FAILED"
+        ):
+            return
         now = self.clock()
+        try:
+            self.journal.record_contact(robot_id, contact, now, source_time_ns)
+        except sqlite3.Error:
+            self.state = "STORAGE_FAILED"
+            return
+        self._contacts[robot_id] = (contact, now, source_time_ns)
+
+    @_storage_boundary
+    def observe(self, snapshot, *, source_time_ns=None):
+        now = self.clock()
+        if source_time_ns is not None:
+            if (
+                source_time_ns <= self.startup_wall_ns
+                or source_time_ns <= self._source_times.get(snapshot.robot_id, 0)
+            ):
+                return
+            self._source_times[snapshot.robot_id] = source_time_ns
+        if self.state == "STORAGE_FAILED":
+            return
+        try:
+            self.journal.record_observation(snapshot, now, source_time_ns)
+        except sqlite3.Error:
+            self.state = "STORAGE_FAILED"
+            return
+        if (
+            snapshot.robot_id in self._dock_flights
+            and snapshot.mode == RobotMode.CHARGING
+        ):
+            for charge in self.core.charging_snapshot():
+                if charge.robot_id != snapshot.robot_id:
+                    continue
+                resource = next(
+                    value
+                    for value in self.resources.snapshot(now)
+                    if value.resource_id == charge.dock_id
+                )
+                contact, receipt, _ = self._contacts.get(
+                    snapshot.robot_id, (None, -math.inf, 0)
+                )
+                mode = RecoveryPlanner(self.config).dock_state(
+                    snapshot,
+                    resource,
+                    contact=contact if now - receipt < 1.0 else None,
+                )
+                snapshot = replace(snapshot, mode=mode)
         self.registry.observe(snapshot, now)
+        self._startup_observed.add(snapshot.robot_id)
         if snapshot.pose is not None:
             self._dock_seen.add(snapshot.robot_id)
         if snapshot.robot_id not in self._dock_flights:
@@ -208,6 +412,10 @@ class FleetAdapter:
                         now,
                     )
                     self._emit(record)
+        try:
+            self._reconcile_startup(now)
+        except sqlite3.Error:
+            self.state = "STORAGE_FAILED"
 
     def _enqueue(self, callback, *args):
         self._callbacks.put((callback, args))
@@ -224,6 +432,21 @@ class FleetAdapter:
             callback(*args)
 
     def tick(self):
+        if self.state == "STORAGE_FAILED":
+            return
+        try:
+            self._reconcile_startup(self.clock())
+            if self.state != "RUNNING":
+                return
+            self._tick()
+            self.journal.save_resources(
+                self.resources.snapshot(self.clock()), self.clock()
+            )
+        except sqlite3.Error:
+            self.state = "STORAGE_FAILED"
+            raise
+
+    def _tick(self):
         self._drain_callbacks(200)
         now = self.clock()
         self.resources.expire(now)
@@ -241,6 +464,15 @@ class FleetAdapter:
                         robot.robot_id, charge.assignment_id, False
                     )
                     charge.retired = True
+        self._clear_resources(
+            RecoveryPlanner(self.config),
+            {
+                robot.robot_id: self.registry.get(robot.robot_id, now)
+                for robot in self.config.robots
+            },
+            now,
+        )
+        self.journal.save_resources(self.resources.snapshot(now), now)
         reserved = {flight.robot_id for flight in self._flights.values()}
         self.core.queue_charging(self.config.energy, now, reserved)
         previous = {}
@@ -516,7 +748,10 @@ class FleetAdapter:
         self._remove_waiters(mission_id)
         self._emit(record)
 
+    @_storage_boundary
     def cancel(self, mission_id):
+        if self.state == "STORAGE_FAILED":
+            raise sqlite3.OperationalError("fleet storage failed")
         # Consume already-received pickup evidence before deciding whether a
         # cancellation is safe or requires physical payload recovery.
         self._drain_callbacks(self._callbacks.qsize())
@@ -562,6 +797,51 @@ class FleetAdapter:
             )
 
     def resource(self, operation, request):
+        if self.state == "RECONCILING":
+            try:
+                self._reconcile_startup(self.clock())
+            except sqlite3.Error:
+                self.state = "STORAGE_FAILED"
+        if self.state != "RUNNING":
+            return self._resource_denial(
+                operation,
+                "fleet reconciling"
+                if self.state == "RECONCILING"
+                else "fleet storage failed",
+            )
+        try:
+            response = self._resource(operation, request)
+            self.journal.save_resources(
+                self.resources.snapshot(self.clock()), self.clock()
+            )
+            return response
+        except sqlite3.Error:
+            self.state = "STORAGE_FAILED"
+            return self._resource_denial(operation, "fleet storage failed")
+
+    @staticmethod
+    def _resource_denial(operation, reason):
+        if operation == "acquire":
+            return {
+                "granted": False,
+                "lease_id": "",
+                "lease_ttl_sec": 0.0,
+                "current_owner": "",
+                "reason": reason,
+            }
+        if operation == "renew":
+            return {"renewed": False, "lease_ttl_sec": 0.0, "reason": reason}
+        if operation == "release":
+            return {"released": False, "reason": reason}
+        return {
+            "cancelled": False,
+            "lease_id": "",
+            "lease_ttl_sec": 0.0,
+            "reconciliation_required": True,
+            "reason": reason,
+        }
+
+    def _resource(self, operation, request):
         if operation not in ("acquire", "renew", "release", "cancel_wait"):
             raise ValueError("unsupported resource operation")
         if request.robot_id not in {robot.robot_id for robot in self.config.robots}:
