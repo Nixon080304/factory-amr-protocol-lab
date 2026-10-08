@@ -51,6 +51,8 @@ class ResourceSnapshot:
     waiters: tuple[LeaseRequest, ...]
     reconciliation_required: bool
     former_lease: Lease | None
+    # All unresolved identities; former_lease remains the first for old callers.
+    former_leases: tuple[Lease, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -111,7 +113,7 @@ class ResourceManager:
                 raise ValueError("resource kind must be station, traffic_zone, or dock")
             self._resources[resource.resource_id] = resource
         self._leases: dict[str, Lease] = {}
-        self._former: dict[str, Lease] = {}
+        self._former: dict[str, tuple[Lease, ...]] = {}
         self._queues: dict[str, list[_Waiter]] = {
             resource_id: [] for resource_id in self._resources
         }
@@ -159,7 +161,7 @@ class ResourceManager:
 
     def _grant_next(self, resource_id: str, now: float) -> None:
         queue = self._queues[resource_id]
-        if queue:
+        if queue and resource_id not in self._former:
             self._grant(queue.pop(0).request, now)
 
     def _expire(self, now: float) -> tuple[Lease, ...]:
@@ -168,12 +170,13 @@ class ResourceManager:
         )
         for lease in expired:
             del self._leases[lease.resource_id]
-            self._former[lease.resource_id] = lease
+            self._former[lease.resource_id] = (lease,)
         return expired
 
     def _decision(self, resource_id: str, granted: bool, reason: str) -> LeaseDecision:
         lease = self._leases.get(resource_id)
-        owner = lease or self._former.get(resource_id)
+        former = self._former.get(resource_id, ())
+        owner = lease or (former[0] if former else None)
         return LeaseDecision(
             granted,
             lease if granted else None,
@@ -262,8 +265,10 @@ class ResourceManager:
                 if lease is not None and self._same_request(lease, request)
                 else None
             )
-            former = self._former.get(request.resource_id)
-            reconciliation = former is not None and self._same_request(former, request)
+            reconciliation = any(
+                self._same_request(former, request)
+                for former in self._former.get(request.resource_id, ())
+            )
             reason = (
                 "reconciliation required"
                 if reconciliation
@@ -292,7 +297,7 @@ class ResourceManager:
             )
             for lease in removed:
                 del self._leases[lease.resource_id]
-                self._former[lease.resource_id] = lease
+                self._former[lease.resource_id] = (lease,)
             for resource_id, queue in self._queues.items():
                 self._queues[resource_id] = [
                     waiter for waiter in queue if waiter.request.robot_id != robot_id
@@ -313,10 +318,17 @@ class ResourceManager:
         now = self._time(now)
         with self._lock:
             self._expire(now)
-            if not self._same_key(self._former.get(key.resource_id), key):
+            claims = self._former.get(key.resource_id, ())
+            if not any(self._same_key(lease, key) for lease in claims):
                 return False
-            del self._former[key.resource_id]
-            self._grant_next(key.resource_id, now)
+            remaining = tuple(
+                lease for lease in claims if not self._same_key(lease, key)
+            )
+            if remaining:
+                self._former[key.resource_id] = remaining
+            else:
+                del self._former[key.resource_id]
+                self._grant_next(key.resource_id, now)
             return True
 
     def restore_evidence(self, snapshots: Sequence[ResourceSnapshot]) -> None:
@@ -327,14 +339,19 @@ class ResourceManager:
         """
         former = {}
         for snapshot in snapshots:
-            lease = snapshot.lease or snapshot.former_lease
-            if lease is None:
-                continue
-            self._request(lease)
-            _identity(lease.lease_id, "lease_id")
-            if snapshot.resource_id != lease.resource_id:
-                raise ValueError("persisted resource identity mismatch")
-            former[lease.resource_id] = lease
+            claims = snapshot.former_leases or (
+                (snapshot.former_lease,) if snapshot.former_lease is not None else ()
+            )
+            if snapshot.lease is not None:
+                claims = (snapshot.lease,) + claims
+            for lease in claims:
+                self._request(lease)
+                _identity(lease.lease_id, "lease_id")
+                if snapshot.resource_id != lease.resource_id:
+                    raise ValueError("persisted resource identity mismatch")
+                existing = former.get(lease.resource_id, ())
+                if lease not in existing:
+                    former[lease.resource_id] = existing + (lease,)
         with self._lock:
             if self._leases or self._former or any(self._queues.values()):
                 raise ValueError("cannot restore evidence after resource activity")
@@ -345,9 +362,11 @@ class ResourceManager:
         self._request(lease)
         _identity(lease.lease_id, "lease_id")
         with self._lock:
-            if lease.resource_id in self._leases or lease.resource_id in self._former:
+            if lease.resource_id in self._leases:
                 raise ValueError("cannot replace existing resource ownership evidence")
-            self._former[lease.resource_id] = lease
+            existing = self._former.get(lease.resource_id, ())
+            if lease not in existing:
+                self._former[lease.resource_id] = existing + (lease,)
 
     def snapshot(self, now: float) -> tuple[ResourceSnapshot, ...]:
         """Return immutable detached state, fencing leases expired at this time."""
@@ -364,7 +383,8 @@ class ResourceManager:
                         waiter.request for waiter in self._queues[resource.resource_id]
                     ),
                     resource.resource_id in self._former,
-                    self._former.get(resource.resource_id),
+                    next(iter(self._former.get(resource.resource_id, ())), None),
+                    self._former.get(resource.resource_id, ()),
                 )
                 for resource in self._resources.values()
             )

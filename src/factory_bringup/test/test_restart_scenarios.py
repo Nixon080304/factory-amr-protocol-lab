@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src/fleet_manager"
 
 from fleet_manager.config import load_fleet_config
 from fleet_manager.journal import MissionJournal, MissionState
-from fleet_manager.models import MissionRequest
+from fleet_manager.models import MissionRequest, RobotSnapshot
 from fleet_manager.resources import LeaseRequest, ResourceManager
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -70,6 +70,15 @@ MATRIX = [
         (-3, 1),
         "RECOVERY_REQUIRED",
     ),
+    ("EXECUTING", "UNKNOWN", None, "LEGACY_MULTI", (-3, -3), "RECOVERY_REQUIRED"),
+    (
+        "EXECUTING",
+        "NOT_PICKED_UP",
+        None,
+        "HISTORICAL_MULTI",
+        (-3, -3),
+        "RECOVERY_REQUIRED",
+    ),
 ]
 
 
@@ -119,6 +128,30 @@ def test_actual_kill_restart_failure_matrix(
         },
         2,
     )
+    if mode == "LEGACY_MULTI":
+        journal.register(
+            MissionRequest("removed", "assembly", "inspection", "motor"),
+            "removed-hash",
+            3,
+        )
+        journal.transition(
+            "removed",
+            MissionState.QUEUED,
+            MissionState.EXECUTING,
+            {"assigned_robot_id": "amr_03", "payload_ownership": "UNKNOWN"},
+            4,
+        )
+    if mode == "HISTORICAL_MULTI":
+        for timestamp, robot_id, payload in (
+            (3, "amr_01", "LOADED"),
+            (4, "amr_03", "UNKNOWN"),
+        ):
+            journal.record_observation(
+                RobotSnapshot(
+                    robot_id, "EXECUTING", None, 80, payload, mission_id="old"
+                ),
+                timestamp,
+            )
     old_lease = None
     if held:
         resources = ResourceManager(config.resources)
@@ -249,6 +282,8 @@ def test_actual_kill_restart_failure_matrix(
     def heartbeat(robot_id):
         first = robot_id == "amr_01"
         observed_mode = mode
+        if mode in ("LEGACY_MULTI", "HISTORICAL_MULTI"):
+            observed_mode = "AVAILABLE"
         if live:
             observed_mode = (
                 "EXECUTING"
@@ -263,6 +298,7 @@ def test_actual_kill_restart_failure_matrix(
             and ownership in ("PICKED_UP", "UNKNOWN")
             and (not live or phase[0] > 0)
             and not (mode == "LIVE_WRITE_FAIL" and phase[0] == 2)
+            and mode != "LEGACY_MULTI"
         )
         message = RobotState(
             robot_id=robot_id,
@@ -410,6 +446,22 @@ def test_actual_kill_restart_failure_matrix(
                     "SELECT evidence_json FROM resource_snapshots WHERE resource_id='assembly'"
                 ).fetchone()[0]
                 assert '"robot_id":"amr_01"' in evidence
+                assert '"lease":null' in evidence
+        if mode in ("LEGACY_MULTI", "HISTORICAL_MULTI"):
+            overlap = call(
+                acquire,
+                AcquireResource.Request(
+                    robot_id="amr_02", mission_id="probe", resource_id="assembly"
+                ),
+            )
+            assert not overlap.granted, (
+                "removed former owner must survive configured owners' clearance"
+            )
+            with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as connection:
+                evidence = connection.execute(
+                    "SELECT evidence_json FROM resource_snapshots WHERE resource_id='assembly'"
+                ).fetchone()[0]
+                assert '"robot_id":"amr_03"' in evidence
                 assert '"lease":null' in evidence
         assert len(goals) == goals_before
         if mode == "OFFLINE":

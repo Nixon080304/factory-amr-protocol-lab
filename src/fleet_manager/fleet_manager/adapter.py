@@ -242,8 +242,11 @@ class FleetAdapter:
                 for robot in robots.values()
                 if robot.mission_id == record.request.mission_id
             ]
-            robot_id = record.assigned_robot_id or (claims[0] if claims else None)
-            if robot_id is None or (
+            owners = set(claims)
+            owners.update(self.journal.recovery_carriers(record.request.mission_id))
+            if record.assigned_robot_id is not None:
+                owners.add(record.assigned_robot_id)
+            if not owners or (
                 record.state
                 not in (
                     MissionState.ASSIGNED,
@@ -260,22 +263,25 @@ class FleetAdapter:
                 if stations.intersection(route):
                     related.update(route)
             for resource in self.resources.snapshot(now):
-                if (
-                    resource.resource_id in related
-                    and resource.lease is None
-                    and resource.former_lease is None
-                ):
+                if resource.resource_id in related and resource.lease is None:
                     # This identity names quarantine evidence, not an issued
                     # authority token. No live lease is created or restored.
-                    self.resources.quarantine_evidence(
-                        Lease(
-                            robot_id,
-                            record.request.mission_id,
-                            resource.resource_id,
-                            "restart-evidence-" + secrets.token_urlsafe(32),
-                            now,
+                    for robot_id in sorted(owners):
+                        if any(
+                            lease.robot_id == robot_id
+                            and lease.mission_id == record.request.mission_id
+                            for lease in resource.former_leases
+                        ):
+                            continue
+                        self.resources.quarantine_evidence(
+                            Lease(
+                                robot_id,
+                                record.request.mission_id,
+                                resource.resource_id,
+                                "restart-evidence-" + secrets.token_urlsafe(32),
+                                now,
+                            )
                         )
-                    )
 
     def _fence_observed_resources(self, policy, robots, now):
         for resource in self.resources.snapshot(now):
@@ -300,30 +306,25 @@ class FleetAdapter:
                     and not policy.proves_outside(evidence, robot)
                 ):
                     self.resources.quarantine_evidence(evidence)
-                    break
 
     def _clear_resources(self, policy, robots, now):
         for resource in self.resources.snapshot(now):
-            former = resource.former_lease
-            if (
-                former is not None
-                and policy.proves_outside(former, robots.get(former.robot_id))
-                and all(
+            for former in resource.former_leases:
+                if policy.proves_outside(former, robots.get(former.robot_id)) and all(
                     policy.proves_outside(
                         replace(former, robot_id=robot.robot_id), robot
                     )
                     for robot in robots.values()
-                )
-            ):
-                self.resources.clear_reconciliation(
-                    LeaseKey(
-                        former.robot_id,
-                        former.mission_id,
-                        former.resource_id,
-                        former.lease_id,
-                    ),
-                    now,
-                )
+                ):
+                    self.resources.clear_reconciliation(
+                        LeaseKey(
+                            former.robot_id,
+                            former.mission_id,
+                            former.resource_id,
+                            former.lease_id,
+                        ),
+                        now,
+                    )
         for dock_id in tuple(self._dock_restart_unsafe):
             dock = self.config.docks[dock_id]
             margin = 2 * dock.robot_radius + dock.arrival_tolerance

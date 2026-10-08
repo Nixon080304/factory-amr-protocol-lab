@@ -143,6 +143,7 @@ class RecoveryPlanner:
                             lease.mission_id == mission_id or lease.robot_id == robot_id
                         )
                         for lease in (resource.lease, resource.former_lease)
+                        + resource.former_leases
                     )
                 )
                 schedulable = state in (

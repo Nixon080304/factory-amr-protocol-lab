@@ -1024,3 +1024,274 @@ def test_conflicting_observation_preserves_durable_former_payload_owner(
         assert record.payload_ownership == "UNKNOWN"
     finally:
         journal.close()
+
+
+def test_every_legacy_owner_remains_fenced_after_known_owner_clears(config, tmp_path):
+    path = tmp_path / "multiple-legacy-owners.sqlite3"
+    journal = MissionJournal(path)
+    try:
+        seed(journal, ownership="UNKNOWN", mission_id="first")
+        seed(journal, ownership="UNKNOWN", mission_id="removed")
+        journal.transition(
+            "removed",
+            MissionState.EXECUTING,
+            MissionState.EXECUTING,
+            {"assigned_robot_id": "amr_03"},
+            3,
+        )
+        adapter = FleetAdapter(config, journal, FakeRobots(journal), clock=lambda: 100)
+        adapter.observe(safe())
+        adapter.observe(safe("amr_02"))
+        response = adapter.resource(
+            "acquire",
+            SimpleNamespace(
+                robot_id="amr_02", mission_id="probe", resource_id="assembly"
+            ),
+        )
+        assert not response["granted"], "removed second owner must remain quarantined"
+        snapshot = next(
+            s for s in adapter.resources.snapshot(100) if s.resource_id == "assembly"
+        )
+        assert snapshot.lease is None
+        assert {lease.robot_id for lease in snapshot.former_leases} == {"amr_03"}
+        journal.close()
+        journal = MissionJournal(path)
+        restored = ResourceManager(config.resources)
+        restored.restore_evidence(journal.load_resources())
+        assert not restored.acquire(
+            LeaseRequest("amr_02", "probe", "assembly"), 200
+        ).granted
+    finally:
+        journal.close()
+
+
+def test_operator_clearance_removes_only_exact_claim_and_preserves_fairness(config):
+    manager = ResourceManager(config.resources)
+    first = Lease("amr_01", "first", "assembly", "claim-one", 0)
+    second = Lease("amr_03", "second", "assembly", "claim-two", 0)
+    manager.quarantine_evidence(first)
+    manager.quarantine_evidence(second)
+    assert not manager.acquire(LeaseRequest("amr_02", "queued", "assembly"), 1).granted
+    assert not manager.clear_reconciliation(
+        LeaseKey("amr_03", "second", "assembly", "claim-one"), 2
+    )
+    assert manager.clear_reconciliation(
+        LeaseKey("amr_01", "first", "assembly", "claim-one"), 2
+    )
+    assert not manager.acquire(LeaseRequest("amr_04", "late", "assembly"), 3).granted
+    snapshot = next(s for s in manager.snapshot(3) if s.resource_id == "assembly")
+    assert snapshot.lease is None and snapshot.former_lease == second
+    assert manager.clear_reconciliation(
+        LeaseKey("amr_03", "second", "assembly", "claim-two"), 4
+    )
+    granted = manager.acquire(LeaseRequest("amr_02", "queued", "assembly"), 4)
+    assert granted.granted and granted.lease.lease_id not in ("claim-one", "claim-two")
+
+
+@pytest.mark.parametrize("active", [False, True])
+def test_recovery_query_never_reads_telemetry_history(tmp_path, active):
+    import sqlite3
+
+    journal = MissionJournal(tmp_path / "bounded.sqlite3")
+    try:
+        if active:
+            seed(journal)
+            journal.record_observation(safe(mission_id="m1", payload_state="LOADED"), 3)
+        # Thousands of unrelated positive observations must not affect recovery work.
+        evidence = '{"mission_id":"old","payload_state":"LOADED"}'
+        journal._connection.executemany(
+            "INSERT INTO robot_observations(robot_id,evidence_json,received_at) VALUES ('old',?,0)",
+            [(evidence,)] * 10000,
+        )
+
+        def authorize(action, table, column, database, trigger):
+            if action == sqlite3.SQLITE_READ and table == "robot_observations":
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        journal._connection.set_authorizer(authorize)
+        records = journal.load_recovery()
+        assert len(records) == int(active)
+        if active:
+            assert records[0].payload_ownership == "PICKED_UP"
+    finally:
+        journal.close()
+
+
+def test_payload_summary_backfills_legacy_once_and_uses_indexes(tmp_path):
+    import json
+    import sqlite3
+
+    path = tmp_path / "legacy-payload.sqlite3"
+    journal = MissionJournal(path)
+    seed(journal)
+    # Simulate the old journal writer: carrying INSERT committed independently
+    # of a mission transition, and no compact summary schema existed yet.
+    for robot_id, payload in (
+        ("amr_01", "LOADED"),
+        ("amr_02", "UNKNOWN"),
+        ("amr_01", "LOADED"),
+    ):
+        journal._connection.execute(
+            "INSERT INTO robot_observations(robot_id,evidence_json,received_at) VALUES (?,?,0)",
+            (robot_id, json.dumps({"mission_id": "m1", "payload_state": payload})),
+        )
+    journal._connection.execute("DROP TABLE IF EXISTS payload_evidence")
+    journal._connection.execute("DROP TABLE IF EXISTS journal_schema")
+    journal.close()
+    journal = MissionJournal(path)
+    try:
+        record = journal.load_recovery()[0]
+        assert (
+            record.assigned_robot_id == "amr_01"
+            and record.payload_ownership == "UNKNOWN"
+        )
+        assert journal.recovery_carriers("m1") == ("amr_01", "amr_02")
+        plan = journal._connection.execute(
+            "EXPLAIN QUERY PLAN SELECT * FROM payload_evidence WHERE mission_id='m1'"
+        ).fetchall()
+        assert any("SEARCH" in row[3] and "INDEX" in row[3] for row in plan)
+        carrier_plan = journal._connection.execute(
+            "EXPLAIN QUERY PLAN SELECT robot_id FROM payload_carrier_claims WHERE mission_id='m1' ORDER BY robot_id"
+        ).fetchall()
+        assert any("SEARCH" in row[3] and "INDEX" in row[3] for row in carrier_plan)
+        active_plan = journal._connection.execute(
+            "EXPLAIN QUERY PLAN SELECT * FROM missions WHERE state NOT IN ('COMPLETED','FAILED','CANCELLED') ORDER BY created_at,mission_id"
+        ).fetchall()
+        assert any("missions_active" in row[3] for row in active_plan)
+        history_plan = journal._connection.execute(
+            "EXPLAIN QUERY PLAN SELECT robot_id,evidence_json FROM robot_observations WHERE json_extract(evidence_json,'$.payload_state') IN ('LOADED','UNKNOWN') ORDER BY sequence"
+        ).fetchall()
+        assert any("robot_payload_history" in row[3] for row in history_plan)
+    finally:
+        journal.close()
+    # A later open must not scan even one raw telemetry row again.
+    real_connect = sqlite3.connect
+
+    class NoHistoryRead(sqlite3.Connection):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.set_authorizer(
+                lambda action, table, column, db, trigger: (
+                    sqlite3.SQLITE_DENY
+                    if action == sqlite3.SQLITE_READ and table == "robot_observations"
+                    else sqlite3.SQLITE_OK
+                )
+            )
+
+    from unittest.mock import patch
+
+    with patch(
+        "fleet_manager.journal.sqlite3.connect",
+        lambda *args, **kwargs: real_connect(*args, **kwargs, factory=NoHistoryRead),
+    ):
+        journal = MissionJournal(path)
+        try:
+            assert journal.load_recovery()[0] == record
+        finally:
+            journal.close()
+
+
+def test_payload_summary_write_failure_rolls_back_raw_observation(tmp_path):
+    import sqlite3
+
+    journal = MissionJournal(tmp_path / "summary-atomic.sqlite3")
+    try:
+        seed(journal)
+        journal._connection.execute(
+            "CREATE TRIGGER reject_summary BEFORE INSERT ON payload_evidence "
+            "BEGIN SELECT RAISE(ABORT,'summary failed'); END"
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="summary failed"):
+            journal.record_observation(safe(mission_id="m1", payload_state="LOADED"), 3)
+        assert (
+            journal._connection.execute(
+                "SELECT COUNT(*) FROM robot_observations"
+            ).fetchone()[0]
+            == 0
+        )
+        assert journal.load_recovery()[0].payload_ownership == "NOT_PICKED_UP"
+    finally:
+        journal.close()
+
+
+def test_unknown_payload_summary_is_monotonic_until_correlated_delivery(tmp_path):
+    journal = MissionJournal(tmp_path / "unknown-monotonic.sqlite3")
+    try:
+        seed(journal)
+        for timestamp, payload in enumerate(("UNKNOWN", "LOADED", "EMPTY"), 3):
+            journal.record_observation(
+                safe(mission_id="m1", payload_state=payload), timestamp
+            )
+        assert journal.load_recovery()[0].payload_ownership == "UNKNOWN"
+        journal.transition(
+            "m1",
+            MissionState.EXECUTING,
+            MissionState.COMPLETED,
+            {"payload_ownership": "DELIVERED"},
+            7,
+        )
+        assert journal.load_recovery() == ()
+        assert journal.recovery_carriers("m1") == ()
+        assert journal.get("m1").payload_ownership == "DELIVERED"
+    finally:
+        journal.close()
+
+
+def test_later_durable_uncertainty_cannot_be_weakened_by_earlier_loaded_summary(
+    tmp_path,
+):
+    journal = MissionJournal(tmp_path / "durable-unknown.sqlite3")
+    try:
+        seed(journal)
+        journal.record_observation(safe(mission_id="m1", payload_state="LOADED"), 3)
+        journal.transition(
+            "m1",
+            MissionState.EXECUTING,
+            MissionState.EXECUTING,
+            {"payload_ownership": "UNKNOWN"},
+            4,
+        )
+        assert journal.load_recovery()[0].payload_ownership == "UNKNOWN"
+    finally:
+        journal.close()
+
+
+def test_removed_conflicting_durable_carrier_keeps_related_resources_fenced(
+    config, tmp_path
+):
+    path = tmp_path / "removed-carrier.sqlite3"
+    journal = MissionJournal(path)
+    try:
+        seed(journal)
+        journal.record_observation(safe(mission_id="m1", payload_state="LOADED"), 3)
+        journal.record_observation(
+            safe("amr_03", mission_id="m1", payload_state="UNKNOWN"), 4
+        )
+        journal.close()
+        journal = MissionJournal(path)
+        adapter = FleetAdapter(config, journal, FakeRobots(journal), clock=lambda: 100)
+        adapter.observe(safe())
+        adapter.observe(safe("amr_02"))
+        record = journal.get("m1")
+        assert (
+            record.assigned_robot_id == "amr_01"
+            and record.payload_ownership == "UNKNOWN"
+        )
+        response = adapter.resource(
+            "acquire",
+            SimpleNamespace(
+                robot_id="amr_02", mission_id="probe", resource_id="assembly"
+            ),
+        )
+        assert not response["granted"], (
+            "durable removed carrier cannot be cleared by another owner's pose"
+        )
+        claims = next(
+            s.former_leases
+            for s in adapter.resources.snapshot(100)
+            if s.resource_id == "assembly"
+        )
+        assert {claim.robot_id for claim in claims} == {"amr_03"}
+    finally:
+        journal.close()

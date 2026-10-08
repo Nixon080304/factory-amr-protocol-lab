@@ -197,6 +197,47 @@ class MissionJournal:
                     "(sequence INTEGER PRIMARY KEY AUTOINCREMENT, robot_id TEXT NOT NULL, "
                     "contact INTEGER NOT NULL, source_time_ns INTEGER NOT NULL, received_at REAL NOT NULL)"
                 )
+                self._connection.execute(
+                    "CREATE INDEX IF NOT EXISTS missions_active ON missions(created_at, mission_id) "
+                    "WHERE state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED')"
+                )
+                self._connection.execute(
+                    "CREATE INDEX IF NOT EXISTS robot_payload_history ON robot_observations(sequence) "
+                    "WHERE json_extract(evidence_json, '$.payload_state') IN ('LOADED', 'UNKNOWN')"
+                )
+                self._connection.execute(
+                    "CREATE TABLE IF NOT EXISTS payload_evidence ("
+                    "mission_id TEXT PRIMARY KEY REFERENCES missions(mission_id), "
+                    "carrier_robot_id TEXT NOT NULL, ownership TEXT NOT NULL, "
+                    "conflicted INTEGER NOT NULL CHECK (conflicted IN (0,1)))"
+                )
+                self._connection.execute(
+                    "CREATE TABLE IF NOT EXISTS journal_schema (name TEXT PRIMARY KEY, version INTEGER NOT NULL)"
+                )
+                self._connection.execute(
+                    "CREATE TABLE IF NOT EXISTS payload_carrier_claims ("
+                    "mission_id TEXT NOT NULL REFERENCES missions(mission_id), "
+                    "robot_id TEXT NOT NULL, PRIMARY KEY(mission_id, robot_id))"
+                )
+                version = self._connection.execute(
+                    "SELECT version FROM journal_schema WHERE name='payload_evidence'"
+                ).fetchone()
+                if version is None or version[0] < 2:
+                    # Task 13/early Task 14 journals need one ordered backfill.
+                    # The marker and summaries commit together, so failed migration
+                    # retries safely. Later restarts never revisit telemetry.
+                    for row in self._connection.execute(
+                        "SELECT robot_id, evidence_json FROM robot_observations "
+                        "WHERE json_extract(evidence_json, '$.payload_state') IN ('LOADED', 'UNKNOWN') "
+                        "ORDER BY sequence"
+                    ):
+                        self._merge_payload_evidence(
+                            row["robot_id"], json.loads(row["evidence_json"])
+                        )
+                    self._connection.execute(
+                        "INSERT INTO journal_schema VALUES ('payload_evidence', 2) "
+                        "ON CONFLICT(name) DO UPDATE SET version=excluded.version"
+                    )
         except BaseException:
             self._connection.close()
             raise
@@ -333,9 +374,8 @@ class MissionJournal:
 
     def load_active(self) -> tuple[MissionRecord, ...]:
         rows = self._connection.execute(
-            "SELECT * FROM missions WHERE state NOT IN (?, ?, ?) "
-            "ORDER BY created_at, mission_id",
-            (MissionState.COMPLETED, MissionState.FAILED, MissionState.CANCELLED),
+            "SELECT * FROM missions WHERE state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED') "
+            "ORDER BY created_at, mission_id"
         ).fetchall()
         return tuple(_record(row) for row in rows)
 
@@ -346,47 +386,97 @@ class MissionJournal:
         fails. EMPTY is not an ordered delivery proof and cannot erase carrying
         evidence. Completed delivery rows are excluded by load_active().
         """
-        active = {record.request.mission_id: record for record in self.load_active()}
-        carriers = {
-            mission_id: record.assigned_robot_id
-            for mission_id, record in active.items()
+        recovered = []
+        for record in self.load_active():
+            evidence = self._connection.execute(
+                "SELECT * FROM payload_evidence WHERE mission_id = ?",
+                (record.request.mission_id,),
+            ).fetchone()
+            if evidence is not None:
+                carrier = evidence["carrier_robot_id"]
+                strong_owner = (
+                    record.assigned_robot_id is not None
+                    and record.payload_ownership
+                    in (PayloadOwnership.PICKED_UP, PayloadOwnership.UNKNOWN)
+                )
+                conflict = evidence["conflicted"] or (
+                    strong_owner and record.assigned_robot_id != carrier
+                )
+                ownership = (
+                    PayloadOwnership.UNKNOWN
+                    if conflict or record.payload_ownership == PayloadOwnership.UNKNOWN
+                    else PayloadOwnership(evidence["ownership"])
+                )
+                record = replace(
+                    record,
+                    assigned_robot_id=record.assigned_robot_id
+                    if strong_owner
+                    else carrier,
+                    payload_ownership=ownership,
+                )
+            recovered.append(record)
+        return tuple(recovered)
+
+    def recovery_carriers(self, mission_id):
+        """Return compact unresolved carrier identities, never physical authority."""
+        return tuple(
+            row[0]
+            for row in self._connection.execute(
+                "SELECT c.robot_id FROM payload_carrier_claims c JOIN missions m USING(mission_id) "
+                "WHERE c.mission_id = ? AND m.state NOT IN ('COMPLETED','FAILED','CANCELLED') "
+                "ORDER BY c.robot_id",
+                (mission_id,),
+            )
+        )
+
+    def _merge_payload_evidence(self, robot_id, evidence):
+        """Fold ordered carrying claims into one durable summary per mission.
+
+        EMPTY cannot prove delivery. The first carrier is retained and any
+        conflicting carrier makes uncertainty sticky, including later LOADED
+        claims from the first carrier. Only mission delivery transitions close
+        work; telemetry never manufactures a delivery or terminal transition.
+        """
+        payload = evidence.get("payload_state")
+        mission_id = evidence.get("mission_id")
+        if payload not in ("LOADED", "UNKNOWN") or not mission_id:
+            return
+        record = self._find(mission_id)
+        if record is None:
+            return
+        row = self._connection.execute(
+            "SELECT * FROM payload_evidence WHERE mission_id = ?", (mission_id,)
+        ).fetchone()
+        carrier = (
+            row["carrier_robot_id"]
+            if row is not None
+            else record.assigned_robot_id
             if record.assigned_robot_id is not None
             and record.payload_ownership
             in (PayloadOwnership.PICKED_UP, PayloadOwnership.UNKNOWN)
-        }
-        conflicts = set()
-        for row in self._connection.execute(
-            "SELECT robot_id, evidence_json FROM robot_observations "
-            "WHERE json_extract(evidence_json, '$.payload_state') IN ('LOADED', 'UNKNOWN') "
-            "ORDER BY sequence"
-        ):
-            evidence = json.loads(row["evidence_json"])
-            record = active.get(evidence.get("mission_id"))
-            if record is None:
-                continue
-            carrier = carriers.setdefault(record.request.mission_id, row["robot_id"])
-            ownership = record.payload_ownership
-            if ownership == PayloadOwnership.NOT_PICKED_UP:
-                ownership = (
-                    PayloadOwnership.PICKED_UP
-                    if evidence["payload_state"] == "LOADED"
-                    else PayloadOwnership.UNKNOWN
-                )
-            elif (
-                ownership == PayloadOwnership.UNKNOWN
-                and evidence["payload_state"] == "LOADED"
-            ):
-                ownership = PayloadOwnership.PICKED_UP
-            if carrier != row["robot_id"]:
-                conflicts.add(record.request.mission_id)
-            if record.request.mission_id in conflicts:
-                ownership = PayloadOwnership.UNKNOWN
-            active[record.request.mission_id] = replace(
-                record,
-                assigned_robot_id=carrier,
-                payload_ownership=ownership,
+            else robot_id
+        )
+        conflict = carrier != robot_id or (row is not None and row["conflicted"])
+        uncertain = (
+            conflict
+            or payload == "UNKNOWN"
+            or record.payload_ownership == PayloadOwnership.UNKNOWN
+            or row is not None
+            and row["ownership"] == "UNKNOWN"
+        )
+        ownership = (
+            PayloadOwnership.UNKNOWN if uncertain else PayloadOwnership.PICKED_UP
+        )
+        self._connection.execute(
+            "INSERT INTO payload_evidence VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(mission_id) DO UPDATE SET ownership=excluded.ownership, conflicted=excluded.conflicted",
+            (mission_id, carrier, ownership, int(bool(conflict))),
+        )
+        for owner in sorted({robot_id, carrier}):
+            self._connection.execute(
+                "INSERT INTO payload_carrier_claims VALUES (?, ?) ON CONFLICT DO NOTHING",
+                (mission_id, owner),
             )
-        return tuple(active.values())
 
     def events(self, mission_id: str) -> tuple[MissionEvent, ...]:
         rows = self._connection.execute(
@@ -449,6 +539,9 @@ class MissionJournal:
                 if value[name] is not None:
                     value[name] = Lease(**value[name])
             value["waiters"] = tuple(LeaseRequest(**item) for item in value["waiters"])
+            value["former_leases"] = tuple(
+                Lease(**item) for item in value.get("former_leases", ())
+            )
             values.append(ResourceSnapshot(**value))
         return tuple(values)
 
@@ -460,6 +553,7 @@ class MissionJournal:
                 "VALUES (?, ?, ?, ?)",
                 (robot.robot_id, evidence, source_time_ns, _timestamp(received_at)),
             )
+            self._merge_payload_evidence(robot.robot_id, json.loads(evidence))
 
     def record_contact(self, robot_id, contact, received_at, source_time_ns):
         with self._transaction():
