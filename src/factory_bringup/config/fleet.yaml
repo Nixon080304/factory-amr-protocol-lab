@@ -5,12 +5,12 @@ robots:
   - robot_id: amr_01
     namespace: /amr_01
     frame_prefix: amr_01/
-    spawn: [0.0, -3.0, 0.0]
+    spawn: [-1.1, -3.4, 0.0]
     battery_start_percent: 100.0
   - robot_id: amr_02
     namespace: /amr_02
     frame_prefix: amr_02/
-    spawn: [1.0, -3.0, 0.0]
+    spawn: [5.2, -3.4, 3.141592653589793]
     battery_start_percent: 60.0
 
 resources:
@@ -40,8 +40,28 @@ traffic_bounds:
 # Regions include stations.yaml approach poses and the factory_floor.world
 # station bodies. Clearance adds the configured conservative robot footprint.
 resource_bounds:
-  assembly: [-3.5, 0.3, -2.5, 2.5]
-  inspection: [2.5, 0.3, 3.5, 2.5]
+  assembly: [-3.5, -0.8, -1.7, 2.5]
+  inspection: [1.7, -0.8, 3.5, 2.5]
+
+# Waiters remain separate from the owner's route clearance/traffic exit.
+station_staging:
+  assembly: [-2.3, -2.2, 1.5707963267948966]
+  inspection: [2.3, -2.2, 1.5707963267948966]
+
+# Authoritative fleet approach poses; startup rejects disagreement with stations.yaml.
+station_approach:
+  assembly: [-3.0, 0.8, 1.5707963267948966]
+  inspection: [3.0, 0.8, 1.5707963267948966]
+
+# Every robot has its own terminal bay. A completed owner cannot block the next
+# robot's final station exit. All approaches remain on the outward station side.
+station_exit_poses:
+  assembly:
+    amr_01: [-4.2, 1.0, 3.141592653589793]
+    amr_02: [-4.2, 0.0, 3.141592653589793]
+  inspection:
+    amr_01: [4.2, 0.0, 0.0]
+    amr_02: [5.0, 2.4, 0.0]
 
 route_segments:
   to_assembly:
@@ -61,12 +81,17 @@ docks:
   # Staging is outside dock ownership. Agents require fresh, independently
   # confirmed Bool contact on /<namespace>/factory/dock_contact to charge.
   dock_01:
-    # Conservative fleet-wide radius and arrival bound match supplied Nav2
-    # robot_radius/xy_goal_tolerance. Increase for larger robot footprints.
+    # Conservative fleet-wide radius and localization-arrival bound. Nav2 aims
+    # within 0.05 m; this 0.15 m bound and 0.60 m planned clearance stay unchanged.
     robot_radius: 0.15
     arrival_tolerance: 0.15
-    staging_pose: [3.5, -2.0, 0.0]
-    charging_pose: [4.0, -2.0, 0.0]
+    staging_pose: [5.4, -1.4, 3.141592653589793]
+    charging_pose: [4.0, -2.0, 3.141592653589793]
+    # Only these terminal origins have a validated direct dock approach.
+    departure_stations: [inspection]
+    exit_poses:
+      amr_01: [4.2, 0.0, 0.0]
+      amr_02: [5.2, -3.4, 3.141592653589793]
 
 energy:
   reserve_percent: 20.0

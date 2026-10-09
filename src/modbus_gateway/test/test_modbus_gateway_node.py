@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import time
 from types import SimpleNamespace
 
@@ -606,7 +607,7 @@ def test_fault_side_channel_failure_preserves_transfer_outcome(
     Socket.fault = Socket.unexpected_error = False
     Socket.connect_failures = 0
     context = Context()
-    rclpy.init(context=context, domain_id=78)
+    rclpy.init(context=context, domain_id=int(os.environ.get("ROS_DOMAIN_ID", "78")))
     node = ModbusGatewayNode(context=context)
     node.faults.enable(FaultRequest("modbus_delay", "cleanup_test"))
 
@@ -616,7 +617,7 @@ def test_fault_side_channel_failure_preserves_transfer_outcome(
 
     monkeypatch.setattr(node, "_plc_control", control)
     events = []
-    monkeypatch.setattr(node, "_event", lambda *args: events.append(args))
+    monkeypatch.setattr(node.events, "publish", events.append)
     try:
         response = node._transfer(
             TransferPart.Request(
@@ -630,8 +631,11 @@ def test_fault_side_channel_failure_preserves_transfer_outcome(
         assert not response.accepted
         assert response.error_code == expected
         if failure == "cleanup":
-            name, outcome, detail = events[-1]
+            finish = events[-1]
+            name, outcome, detail = finish.event, finish.outcome, finish.detail
+            assert (finish.mission_id, finish.robot_id) == ("cleanup_test", "amr_01")
             fields = json.loads(detail)
+            assert fields["part"] == "motor"
             assert fields["station_id"] == "assembly"
             assert fields["transfer_kind"] == "LOADING"
             assert fields["cycle_counter"] == 11
@@ -705,7 +709,7 @@ def test_service_mapping_cycle_detail_failure_and_live_clock(monkeypatch):
     Socket.connect_failures = 1
     Socket.unexpected_error = False
     context = Context()
-    rclpy.init(context=context, domain_id=78)
+    rclpy.init(context=context, domain_id=int(os.environ.get("ROS_DOMAIN_ID", "78")))
     node = ModbusGatewayNode(context=context)
     peer = rclpy.create_node("modbus_service_peer", context=context)
     executor = MultiThreadedExecutor(num_threads=3, context=context)

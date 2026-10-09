@@ -34,6 +34,11 @@ try {
   assert.equal(order.accept({ ...value, robots: {} }), 'invalid');
   assert.equal(order.accept({ ...value, resources: [{ resource_id: 'dock_01', kind: 2, waiters: 'bad' }] }), 'invalid');
   assert.equal(order.accept({ ...value, resources: [{ resource_id: 'dock_01', former_leases: [null] }] }), 'invalid');
+  const claim = { robot_id: 'cart', mission_id: 'charge', resource_id: 'dock_01', lease_id: 'secret-token-a' };
+  assert.equal(new client.SnapshotOrder().accept({ ...value, resources: [{ resource_id: 'dock_01', former_leases: [claim] }] }, true), 'invalid', 'client must reject leaked authority credentials');
+  const fingerprintClaim = { robot_id: 'cart', mission_id: 'charge', resource_id: 'dock_01', lease_fingerprint: '0b0433472146' };
+  assert.equal(new client.SnapshotOrder().accept({ ...value, resources: [{ resource_id: 'dock_01', former_leases: [fingerprintClaim] }] }, true), 'new');
+  assert.equal(new client.SnapshotOrder().accept({ ...value, resources: [{ resource_id: 'dock_01', former_leases: [{ ...fingerprintClaim, lease_fingerprint: 123456789012 }] }] }, true), 'invalid', 'lease fingerprint must remain a typed string');
   assert.equal(order.accept({ ...value, dock_queue: [null] }), 'invalid');
   assert.equal(order.accept({ ...value, sequence: 11, robots: [{ robot_id: '<script>', battery_percent: 'broken' }] }), 'invalid');
   assert.equal(order.accept({ ...value, session_id: 'session-two', sequence: 1 }), 'refresh');
@@ -45,7 +50,7 @@ try {
   const astral = '😀'.repeat(256);
   const boundedCases = [
     { robots: [{ robot_id: astral, health_detail: astral, unresolved_resources: [astral] }] },
-    { resources: [{ resource_id: astral, kind: astral, owner: astral, waiters: [astral], unresolved_claimants: [astral], former_leases: [{ robot_id: astral, mission_id: astral, resource_id: astral, lease_id: astral }] }] },
+    { resources: [{ resource_id: astral, kind: astral, owner: astral, waiters: [astral], unresolved_claimants: [astral], former_leases: [{ robot_id: astral, mission_id: astral, resource_id: astral, lease_fingerprint: 'a'.repeat(12) }] }] },
     { missions: [{ mission_id: astral, part: astral, pickup_station: astral, dropoff_station: astral }] },
     { dock_queue: [{ robot_id: astral, dock_id: astral, state: astral }] },
     { events: [{ event_id: astral, mission_id: astral, robot_id: astral, protocol: astral, event: astral, outcome: astral, detail: astral }] },
@@ -103,6 +108,8 @@ try {
   await writeFile(`${evidence}/phone.png`, Buffer.from(phone.data, 'base64'));
   await command('quarantine');
   await waitFor(() => browser.evaluate("document.querySelector('[data-resource-id=\"central_aisle\"]').textContent.includes('Reconciliation required')"), 'quarantined resource evidence');
+  assert.equal(await browser.evaluate("document.body.innerText.includes('old-aisle')"), false, 'raw lease credential must not enter rendered public media');
+  assert.equal(await browser.evaluate("fetch('/api/snapshot').then(response => response.text()).then(body => body.includes('\\\"lease_id\\\"'))"), false, 'HTTP must not expose raw lease IDs');
   assert.equal(await browser.evaluate("document.querySelector('[data-resource-id=\"central_aisle\"]').textContent.includes('Waiters: amr_01')"), true, 'quarantine must retain visible waiters');
   assert.equal(await browser.evaluate("document.querySelector('[data-resource-id=\"central_aisle\"]').textContent.includes('Unresolved claims: amr_02, amr_01')"), true, 'all claimants must remain visible');
   assert.equal(await browser.evaluate("document.querySelector('[data-robot-id=\"amr_02\"]').textContent.includes('Unresolved: central_aisle')"), true, 'quarantine is not None held');

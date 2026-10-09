@@ -1,5 +1,41 @@
 # Protocol contracts
 
+## Fleet boundary
+
+The fleet gateway sends `ExecuteFleetMission` to
+`/factory/execute_fleet_mission`. Omit `robot_id` for automatic assignment;
+include a configured ID to pin a mission. The original `M-001`, `amr_01`,
+assembly-to-inspection motor request remains valid. An unassigned automatic
+status omits `robot_id`; assigned status includes the selected robot.
+Fleet states add `QUEUED`, `ASSIGNING`, `ASSIGNED`, `EXECUTING`, `REASSIGNING`
+and `RECOVERY_REQUIRED`. The durable mission journal suppresses completed
+re-execution and detects conflicting IDs across manager restart.
+
+Robot-local DDS endpoints are `/<namespace>/factory/execute_mission`,
+`factory/estimate_mission_cost`, `factory/robot_state`, `factory/dock_robot`,
+`factory/dock_contact` and `battery_state`. Navigation, localization, sensors
+and TF use robot namespaces and prefixed frames. Resource services are shared
+under `/factory/resources/`: acquire, renew, release and cancel_wait. Renew and
+release require the exact robot, mission, resource and random lease ID. A stale
+or foreign token cannot authorize entry or release. Heartbeat receipt and lease
+expiry use monotonic time; simulation stamps remain telemetry.
+
+`TransferPart.robot_id` and `ProtocolEvent.robot_id` identify each robot and
+mission. The ownership-enabled PLC binds each claim to its actual live Modbus
+TCP peer; the loopback listener authorizes ownership and fault control, never
+executes station transfers. Raw Modbus remains the station execution transport.
+The fleet driver starts the listener and supplies matching gateway parameters.
+Loading attaches a robot's configured part only after a confirmed cycle;
+unloading detaches only after confirmation. `transfer_complete` plus a changed
+`cycle_counter` remains the completion rule.
+
+The dashboard serves only local GET `/`, `/api/snapshot` and `/api/events`.
+SSE clients receive bounded snapshots and refresh after reconnect. No dashboard
+route commands ROS, PLC, resources or fault controls. Full failure and cleanup
+runbooks are in [fleet operations](fleet-operations.md).
+
+## Retained transport and Version 1 contracts
+
 The protocol core provides transport-independent mission, MQTT, Modbus, and
 trace logic. Implemented ROS node adapters connect Nav2, perception, and Gazebo
 to those contracts. MQTT handles external mission ingress, DDS handles typed
@@ -16,12 +52,18 @@ The local broker listens on host `127.0.0.1:1883`.
 | `factory/missions/request` | Dispatcher to robot | 1 | No |
 | `factory/missions/<mission_id>/status` | Robot to dispatcher | 1 | No |
 | `factory/robots/amr_01/telemetry` | Robot to dispatcher | 0 | No |
-| `factory/robots/amr_01/availability` | Robot to dispatcher | 1 | Yes |
+| `factory/fleet/availability` | Fleet gateway to dispatcher | 1 | Yes |
 
 The gateway adapter configures a retained last-will message of `offline`
 and publishes retained `online` on connection. Mission status events queue in
 order during a disconnect, up to 100 entries. When full, the queue drops the
 oldest event. Telemetry keeps only the latest sample and does not replay history.
+
+The former Version 1 robot-specific availability topic is historical. The
+current fleet gateway and compatible Version 1 launch publish fleet availability;
+the pinned `amr_01` mission JSON remains unchanged. Availability alone does not
+prove robot dispatch readiness: startup also checks the fleet manager's exact
+cost-service and mission-action readiness evidence before demonstration ingress.
 
 Mission request:
 
@@ -38,12 +80,12 @@ Mission request:
 | JSON field | Type | Accepted value |
 | --- | --- | --- |
 | `mission_id` | String | 1–64 ASCII letters, digits, underscores, or hyphens |
-| `robot_id` | String | `amr_01` |
-| `pickup` | String | `assembly` |
-| `dropoff` | String | `inspection` |
-| `part` | String | `motor` |
+| `robot_id` | Optional string | Configured topic-safe ID; omitted means automatic |
+| `pickup` | String | Configured station, assembly or inspection |
+| `dropoff` | String | Configured station, assembly or inspection |
+| `part` | String | Configured gateway part; the visible demo uses motor |
 
-All five fields are required. String fields are limited to 64 characters.
+Four fields are required; `robot_id` is optional. String fields are limited to 64 characters.
 Unknown properties are rejected (`additionalProperties: false`). Requests must
 be UTF-8 JSON objects of at most 4096 bytes. The installed schema is
 `mqtt_gateway/schemas/mission.schema.json` within the Python package.
@@ -250,7 +292,8 @@ Operational adapters must log mission ID, robot ID, station, and current state.
 Run `mission_coordinator/mission_coordinator`, `mqtt_gateway/mqtt_gateway`,
 `modbus_gateway/modbus_gateway`, and `protocol_observer/protocol_observer` with
 `ros2 run <package> <executable>`. All four adapters enforce simulation time.
-The coordinator serves `/factory/execute_mission` and consumes
+In explicit Version 1 compatibility mode, the root coordinator serves
+`/factory/execute_mission` and consumes
 `/factory/transfer_part`, `/navigate_to_pose`, `/amcl_pose`, and
 `/factory/station_detection`. Station parameters are
 `stations.assembly.pose` and `stations.inspection.pose`, each `[x, y, yaw]`
@@ -278,8 +321,10 @@ requires restarting the full simulation. Another valid idle goal is accepted
 only to return an immediate aborted action result: `success=false`,
 `final_state=FAILED`, `error_code=RESTART_REQUIRED`. Its `mission_rejected`
 protocol event carries that code; no `mission_started`, navigation, or PLC
-transfer occurs. The MQTT gateway publishes `RECEIVED` followed by
-`FAILED/RESTART_REQUIRED`. Action acceptance acknowledges transport, not physical
+transfer occurs. Through the current fleet gateway, MQTT progress is
+`RECEIVED`, `QUEUED`, `ASSIGNED`, then `FAILED/RESTART_REQUIRED`; bounded cost
+backoff may repeat consecutive `QUEUED` progress. The historical direct Version
+1 path published only `RECEIVED` then `FAILED`. Action acceptance acknowledges transport, not physical
 execution. Cleanup failure and pending cancellation preserve this guard.
 Only proven pre-request failures permit new requests. Identical-ID
 MQTT replay remains unchanged. Invalid and busy goals retain their existing

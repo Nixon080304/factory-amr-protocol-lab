@@ -1,0 +1,7 @@
+name: charging
+proof: gazebo_nav2
+timeout_sec: 300
+initial_battery: {amr_01: 31.0, amr_02: 25.0}
+missions:
+  - {mission_id: fleet-charge-work, pickup: assembly, dropoff: inspection, part: motor}
+assertions: [below_30_to_80, independent_simulated_contact, other_robot_completes, verified_dock_clearance, both_contact_to_80, post_mission_below_30, exact_dock_handoff]

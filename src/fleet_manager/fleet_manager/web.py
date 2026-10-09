@@ -10,6 +10,7 @@ always starts from a snapshot, so no event replay buffer is needed.
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import hashlib
 import json
 from itertools import islice
 import math
@@ -42,11 +43,20 @@ def _plain(value, budget, depth=0, truncation=None, field_name=None):
     if type(value) is dict:
         if truncation is not None:
             truncation["fields"] += max(0, len(value) - 32)
-        return {
-            key[:64]: _plain(item, budget, depth + 1, truncation, key)
-            for key, item in islice(value.items(), 32)
-            if type(key) is str and key.isascii()
-        }
+        result = {}
+        for key, item in islice(value.items(), 32):
+            if type(key) is not str or not key.isascii():
+                continue
+            if key == "lease_id":
+                # Exact lease IDs are authority credentials. Hash the original
+                # value before Unicode/length normalization; never send the key.
+                if isinstance(item, str):
+                    result["lease_fingerprint"] = hashlib.sha256(
+                        item.encode("utf-8", "replace")
+                    ).hexdigest()[:12]
+                continue
+            result[key[:64]] = _plain(item, budget, depth + 1, truncation, key)
+        return result
     if type(value) in (list, tuple):
         if truncation is not None:
             counter = {"waiters": "waiters", "former_leases": "former_leases"}.get(
@@ -198,8 +208,12 @@ class SnapshotHub:
                                 "robot_id",
                                 "mission_id",
                                 "resource_id",
-                                "lease_id",
+                                "lease_fingerprint",
                             )
+                        )
+                        and len(claim["lease_fingerprint"]) == 12
+                        and all(
+                            c in "0123456789abcdef" for c in claim["lease_fingerprint"]
                         )
                     ]
                     truncation["fields"] += len(claims) - len(item["former_leases"])
@@ -523,7 +537,7 @@ class FleetDashboard:
         with server.socket_lock:
             return len(server.sockets)
 
-    def capture(self, adapter):
+    def capture(self, adapter, dispatch_readiness=None):
         """Called on the executor: bounded frozen values, no SQLite or waiting."""
         resources = adapter.resources.observer_snapshot(with_omissions=True)
         if resources is None or not self._capture_lock.acquire(blocking=False):
@@ -540,6 +554,18 @@ class FleetDashboard:
                 adapter.state,
                 now,
                 time.time(),
+                {
+                    robot.robot_id: {
+                        field: value if type(value) is bool else None
+                        for field in ("cost_service_ready", "mission_action_ready")
+                        for value in [
+                            (dispatch_readiness or {})
+                            .get(robot.robot_id, {})
+                            .get(field)
+                        ]
+                    }
+                    for robot in adapter.config.robots
+                },
             )
             return True
         finally:
@@ -625,7 +651,9 @@ class FleetDashboard:
                 with self._capture_lock:
                     capture, protocol_events = self._capture, tuple(self._events)
                 if capture is not None:
-                    robots, resources, charging, state, now, updated_at = capture
+                    robots, resources, charging, state, now, updated_at, readiness = (
+                        capture
+                    )
                     value = _empty()
                     value.update(fleet_state=state, updated_at=updated_at)
                     value["_source_truncation"] = {
@@ -681,6 +709,7 @@ class FleetDashboard:
                         )
                     for robot in robots:
                         item = asdict(robot)
+                        item.update(readiness[robot.robot_id])
                         item["current_resource"] = (
                             ", ".join(owners.get(robot.robot_id, ())) or None
                         )

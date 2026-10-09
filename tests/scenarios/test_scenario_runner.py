@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import socket
 import subprocess
 import sys
@@ -136,6 +137,111 @@ def test_unknown_name_fails_before_command_starts(tmp_path, command):
     result = run(tmp_path, command, scenario="unknown")
     assert result.returncode == 2
     assert not list(tmp_path.rglob("started"))
+
+
+@pytest.mark.parametrize(
+    "setup", ["relative.bash", "/missing/install/setup.bash", "directory", "unreadable"]
+)
+def test_invalid_install_setup_fails_before_command_or_domain_reservation(
+    tmp_path, command, setup
+):
+    if setup == "directory":
+        setup = str(tmp_path)
+    elif setup == "unreadable":
+        unreadable = tmp_path / "setup.bash"
+        unreadable.write_text("")
+        unreadable.chmod(0)
+        setup = str(unreadable)
+    env = environment(tmp_path, command)
+    env["FACTORY_INSTALL_SETUP"] = setup
+    result = subprocess.run(
+        [str(RUNNER), "success"],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert not list(tmp_path.rglob("started"))
+    assert not list(tmp_path.rglob("ownership.json"))
+
+
+def test_case_sources_only_explicit_fresh_install_not_checkout_install(
+    tmp_path, command
+):
+    project = tmp_path / "project"
+    (project / "scripts").mkdir(parents=True)
+    (project / "tests/scenarios").mkdir(parents=True)
+    (project / "tests/system").mkdir(parents=True)
+    (project / ".venv/bin").mkdir(parents=True)
+    (project / "install").mkdir()
+    shutil.copy2(RUNNER, project / "scripts/run_scenario.sh")
+    shutil.copy2(
+        ROOT / "tests/scenarios/expected_outcomes.yaml", project / "tests/scenarios"
+    )
+    shutil.copy2(ROOT / "tests/system/fleet_isolation.py", project / "tests/system")
+    shutil.copytree(ROOT / "src/protocol_observer", project / "src/protocol_observer")
+    (project / ".venv/bin/activate").write_text("")
+    (project / "install/setup.bash").write_text("export STALE_OVERLAY=1\n")
+    fresh = tmp_path / "fresh install/setup.bash"
+    fresh.parent.mkdir()
+    fresh.write_text("export FRESH_OVERLAY=1\n")
+    case = project / "tests/scenarios/run_case.py"
+    case.write_text(
+        command.read_text()
+        + '\n(output / "overlay.json").write_text(json.dumps(dict(fresh=os.environ.get("FRESH_OVERLAY"), stale=os.environ.get("STALE_OVERLAY"))))\n'
+    )
+    env = environment(tmp_path, command)
+    env.pop("FACTORY_SCENARIO_COMMAND")
+    env.update(FACTORY_INSTALL_SETUP=str(fresh), FACTORY_SCENARIO_TIMEOUT="20")
+    env.pop("FRESH_OVERLAY", None)
+    env.pop("STALE_OVERLAY", None)
+    result = subprocess.run(
+        [str(project / "scripts/run_scenario.sh"), "success"],
+        cwd=project,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    evidence = json.loads(next(tmp_path.rglob("overlay.json")).read_text())
+    assert evidence == {"fresh": "1", "stale": None}
+
+
+def test_v1_runner_cannot_take_live_fleet_domain(
+    tmp_path, command, private_lease_namespace, monkeypatch
+):
+    sys.path.insert(0, str(ROOT / "tests/system"))
+    import fleet_isolation
+
+    monkeypatch.setenv("ROS_DOMAIN_ID", "99")
+    monkeypatch.setattr(
+        fleet_isolation.random.SystemRandom, "shuffle", lambda self, values: None
+    )
+    original_open = Path.open
+
+    def private_open(path, *args, **kwargs):
+        if str(path).startswith("/tmp/factory-fleet-domain-"):
+            path = private_lease_namespace / path.name
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", private_open)
+    for domain in range(21, 70):
+        (private_lease_namespace / f"factory-fleet-domain-{domain}.lock").write_text(
+            json.dumps(dict(domain_id=domain, quarantined=True))
+        )
+    reservation = fleet_isolation.Domain()
+    try:
+        assert reservation.id == 20
+        result = run(tmp_path, command)
+        assert result.returncode == 1, result.stdout + result.stderr
+        assert not list(tmp_path.rglob("started"))
+        assert not list(tmp_path.rglob("ownership.json"))
+        assert "No isolated scenario DDS domain available" in str(outcomes(tmp_path))
+    finally:
+        reservation.close()
 
 
 def test_success_compares_actual_state_and_trace_in_isolated_directories(
@@ -391,7 +497,7 @@ namespace = runpy.run_path(str(adapter))
 original_open = builtins.open
 def private_open(name, *args, **kwargs):
     # Keep the original driver's lease mechanism real without touching shared locks.
-    if str(name).startswith("/tmp/factory-amr-scenario-domain-"):
+    if str(name).startswith("/tmp/factory-fleet-domain-"):
         name = pathlib.Path(os.environ["TMPDIR"]) / pathlib.Path(name).name
     return original_open(name, *args, **kwargs)
 builtins.open = private_open
@@ -443,7 +549,7 @@ def test_domain_lease_remains_unavailable_until_owned_cleanup_finishes(
             Path(f"/proc/{child}/stat").read_text().rsplit(")", 1)[1].split()[19]
         )
         ownership = json.loads(next(tmp_path.rglob("ownership.json")).read_text())
-        lock = lease_root / f"factory-amr-scenario-domain-{ownership['domain_id']}.lock"
+        lock = lease_root / f"factory-fleet-domain-{ownership['domain_id']}.lock"
         acquired_while_live = False
         while process.poll() is None:
             with lock.open("a+") as candidate:
@@ -514,7 +620,7 @@ def test_failed_cleanup_quarantines_domain_and_exhaustion_records_failure(
         domain = json.loads(next(tmp_path.rglob("ownership.json")).read_text())[
             "domain_id"
         ]
-        lock = lease_root / f"factory-amr-scenario-domain-{domain}.lock"
+        lock = lease_root / f"factory-fleet-domain-{domain}.lock"
         quarantine = json.loads(lock.read_text())
         assert quarantine["quarantined"] and quarantine["domain_id"] == domain
         assert quarantine["resources"]["ports"] == [port]
@@ -534,10 +640,8 @@ def test_failed_cleanup_quarantines_domain_and_exhaustion_records_failure(
         ]
         assert len(domains) == 2 and len(set(domains)) == 2
         # Exhaust only this private lock directory, never shared DDS leases.
-        for candidate_domain in range(100, 221):
-            candidate = (
-                lease_root / f"factory-amr-scenario-domain-{candidate_domain}.lock"
-            )
+        for candidate_domain in range(20, 70):
+            candidate = lease_root / f"factory-fleet-domain-{candidate_domain}.lock"
             with candidate.open("a+") as handle:
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 if not candidate.read_text():
@@ -565,12 +669,12 @@ def test_failed_cleanup_quarantines_domain_and_exhaustion_records_failure(
 
 
 def cross_tmpdir_environments(tmp_path, command, lease_root):
-    """Only domain 100 is eligible, in every private RED/GREEN namespace."""
+    """Only domain 20 is eligible, in every private RED/GREEN namespace."""
     directories = [lease_root, tmp_path / "ambient-one", tmp_path / "ambient-two"]
     for directory in directories:
         directory.mkdir(exist_ok=True)
-        for domain in range(101, 221):
-            with (directory / f"factory-amr-scenario-domain-{domain}.lock").open(
+        for domain in range(21, 70):
+            with (directory / f"factory-fleet-domain-{domain}.lock").open(
                 "a+"
             ) as handle:
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -612,7 +716,7 @@ def test_different_tmpdir_cannot_reserve_a_live_domain(
             json.loads(
                 next((tmp_path / "reports-1").rglob("ownership.json")).read_text()
             )["domain_id"]
-            == 100
+            == 20
         )
         second = subprocess.run(
             [str(RUNNER), "success"],
@@ -680,7 +784,7 @@ def test_different_tmpdir_cannot_bypass_domain_quarantine(
             json.loads(
                 next((tmp_path / "reports-1").rglob("ownership.json")).read_text()
             )["domain_id"]
-            == 100
+            == 20
         )
         second = subprocess.run(
             [str(RUNNER), "success"],
@@ -702,9 +806,7 @@ def test_different_tmpdir_cannot_bypass_domain_quarantine(
             for failure in row["failures"]
         )
         metadata = json.loads(
-            (
-                private_lease_namespace / "factory-amr-scenario-domain-100.lock"
-            ).read_text()
+            (private_lease_namespace / "factory-fleet-domain-20.lock").read_text()
         )
         assert metadata["quarantined"] and metadata["resources"]["ports"] == [port]
         assert f"Owned port {port} remains open" in metadata["cleanup_failures"]

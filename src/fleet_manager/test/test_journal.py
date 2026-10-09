@@ -84,6 +84,23 @@ def test_first_registration_persists_canonical_request_and_initial_event(journal
     assert events[0].detail == {}
 
 
+def test_active_order_uses_first_durable_event_across_reopen_and_clock_changes(journal):
+    handle = journal()
+    api = journal_api()
+    handle.register(request("z_first"), "hash_first", 10.0)
+    handle.register(request("a_second"), "hash_second", 10.0)
+    handle.register(request("clock_reset"), "hash_reset", 1.0)
+    handle.transition(
+        "z_first", api.MissionState.QUEUED, api.MissionState.ASSIGNING, {}, 20.0
+    )
+    reopened = journal()
+    assert [record.request.mission_id for record in reopened.load_active()] == [
+        "z_first",
+        "a_second",
+        "clock_reset",
+    ]
+
+
 def test_identical_duplicate_returns_current_state_without_new_event(journal):
     journal = journal()
     api = journal_api()

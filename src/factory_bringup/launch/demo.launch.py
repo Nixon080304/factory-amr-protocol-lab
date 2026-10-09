@@ -32,17 +32,18 @@ def generate_launch_description():
     agent_config = agent_parameters(fleet_config, robot, stations)
     agent_config["frame_prefix"] = ""
     agent_config["legacy_unprefixed_frames"] = True
+    initial_pose = {name: str(getattr(robot.spawn, name)) for name in ("x", "y", "yaw")}
     launches = []
     for package, filename, arguments in [
         (
             "factory_simulation",
             "simulation.launch.py",
-            {"gui": LaunchConfiguration("gui")},
+            {"gui": LaunchConfiguration("gui"), **initial_pose},
         ),
         (
             "factory_bringup",
             "navigation.launch.py",
-            {"rviz": LaunchConfiguration("rviz")},
+            {"rviz": LaunchConfiguration("rviz"), **initial_pose},
         ),
     ]:
         share = Path(get_package_share_directory(package))
@@ -58,6 +59,7 @@ def generate_launch_description():
             DeclareLaunchArgument("rviz", default_value="true"),
             DeclareLaunchArgument("broker_port", default_value="1883"),
             DeclareLaunchArgument("plc_port", default_value="1502"),
+            DeclareLaunchArgument("fault_control_port", default_value="0"),
             DeclareLaunchArgument("output_dir", default_value="artifacts/traces"),
             DeclareLaunchArgument("dashboard_enabled", default_value="true"),
             DeclareLaunchArgument("dashboard_port", default_value="8080"),
@@ -78,8 +80,6 @@ def generate_launch_description():
                         "odom",
                         "amcl_pose",
                         "factory/mission_state",
-                        "compute_path_to_pose",
-                        "navigate_to_pose",
                     )
                 ],
             ),
@@ -88,15 +88,9 @@ def generate_launch_description():
                     package=package,
                     executable=executable,
                     name=name,
+                    namespace="/" if package == "mission_coordinator" else None,
                     output="screen",
-                    remappings=[
-                        (
-                            "/factory/execute_mission",
-                            robot_namespace + "/factory/execute_mission",
-                        )
-                    ]
-                    if package == "mission_coordinator"
-                    else [],
+                    remappings=[],
                     parameters=[
                         system["/**"]["ros__parameters"],
                         system.get(name, {}).get("ros__parameters", {}),
@@ -150,7 +144,11 @@ def generate_launch_description():
                         {
                             "plc_port": ParameterValue(
                                 LaunchConfiguration("plc_port"), value_type=int
-                            )
+                            ),
+                            "fault_control_port": ParameterValue(
+                                LaunchConfiguration("fault_control_port", default="0"),
+                                value_type=int,
+                            ),
                         },
                     ),
                     (

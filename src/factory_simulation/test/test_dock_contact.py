@@ -16,6 +16,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 class Host:
     def __init__(self):
         self.messages, self.timers = [], []
+        self.logs = []
+
+    def get_logger(self):
+        return SimpleNamespace(info=self.logs.append)
 
     def create_publisher(self, kind, name, qos):
         assert name == "factory/dock_contact"
@@ -58,6 +62,102 @@ def reply(pose=(4, -2, 0), success=True):
     response.header.frame_id = "world"
     response.state.pose = value
     return response
+
+
+@pytest.mark.parametrize(
+    "reason", ["xy", "yaw", "z", "identity", "quaternion", "service", "stale"]
+)
+def test_contact_transition_diagnostics_classify_exact_loss_reason(reason):
+    import json
+    import math
+
+    runtime, host, wall, _, futures, _ = sensor()
+    runtime.tick()
+    futures[-1].set_result(reply())
+    runtime.tick()
+    value = reply()
+    if reason == "xy":
+        value.state.pose.position.x = 4.151
+    elif reason == "yaw":
+        value.state.pose.orientation.z = math.sin(0.201 / 2)
+        value.state.pose.orientation.w = math.cos(0.201 / 2)
+    elif reason == "z":
+        value.state.pose.position.z = 0.151
+    elif reason == "identity":
+        value.header.frame_id = "wrong"
+    elif reason == "quaternion":
+        value.state.pose.orientation.w = 0.9
+    if reason == "stale":
+        wall[0] += 0.5
+        runtime.tick()
+    elif reason == "service":
+        futures[-1].set_exception(RuntimeError("simulator response lost"))
+    else:
+        wall[0] += 0.02
+        futures[-1].set_result(value)
+    assert host.messages[-1] is False
+    assert host.logs, "contact transitions need structured diagnostics"
+    diagnostic = json.loads(host.logs[-1])
+    assert diagnostic["event"] == "dock_contact_transition"
+    assert diagnostic["confirmed"] is False and diagnostic["reason"] == reason
+    assert diagnostic["entity_name"] == "configured_cart"
+    assert diagnostic["thresholds"] == {
+        "xy_m": 0.15,
+        "yaw_rad": 0.2,
+        "z_m": 0.15,
+        "quaternion_norm_error": 0.01,
+        "stale_sec": 0.5,
+    }
+    assert diagnostic["request_age_sec"] == pytest.approx(
+        0.5 if reason == "stale" else 0.0 if reason == "service" else 0.02
+    )
+    if reason == "yaw":
+        assert diagnostic["measurements"]["yaw_rad"] == pytest.approx(0.201)
+        assert diagnostic["receipt_age_sec"] == 0.0
+    elif reason == "xy":
+        assert diagnostic["measurements"]["xy_m"] == pytest.approx(0.151)
+    elif reason == "z":
+        assert diagnostic["measurements"]["z_m"] == pytest.approx(0.151)
+    elif reason == "quaternion":
+        assert diagnostic["measurements"]["quaternion_norm_squared"] == pytest.approx(
+            0.81
+        )
+
+
+def test_contact_diagnostics_emit_only_boolean_transitions_not_periodic_samples():
+    import json
+
+    runtime, host, _, _, futures, _ = sensor()
+    assert len(host.logs) == 1
+    for _ in range(20):
+        runtime.tick()
+        futures[-1].set_result(reply())
+    assert [json.loads(value)["confirmed"] for value in host.logs] == [False, True]
+    for _ in range(20):
+        runtime.tick()
+        futures[-1].set_result(reply((4.2, -2, 0)))
+    assert [json.loads(value)["confirmed"] for value in host.logs] == [
+        False,
+        True,
+        False,
+    ]
+
+
+def test_nonfinite_contact_diagnostics_remain_valid_json_and_fail_closed():
+    import json
+
+    runtime, host, _, _, futures, _ = sensor()
+    runtime.tick()
+    futures[-1].set_result(reply())
+    runtime.tick()
+    value = reply()
+    value.state.pose.position.x = float("nan")
+    futures[-1].set_result(value)
+    assert host.messages[-1] is False
+    assert host.logs
+    diagnostic = json.loads(host.logs[-1])
+    assert diagnostic["reason"] == "xy"
+    assert diagnostic["measurements"]["xy_m"] is None
 
 
 @pytest.mark.parametrize(
@@ -156,6 +256,18 @@ def test_shutdown_clears_contact_and_fences_late_simulator_callback():
     assert host.messages[-1] is False
 
 
+def test_shutdown_after_ros_context_invalidation_never_publishes():
+    runtime, host, _, _, futures, _ = sensor()
+    host.context = SimpleNamespace(ok=lambda: False)
+    runtime.tick()
+    before = list(host.messages)
+    runtime.shutdown()
+    assert host.messages == before
+    assert runtime._pending is None
+    futures[-1].set_result(reply())
+    assert host.messages == before
+
+
 def test_timed_out_world_queries_remove_client_pending_requests_before_retry():
     runtime, host, wall, client, futures, _ = sensor()
     removed = []
@@ -200,3 +312,93 @@ def test_missing_invalid_or_stale_simulator_evidence_publishes_false(failure):
             value.state.pose.orientation.z, value.state.pose.orientation.w = 1.0, 0.0
         pending.set_result(value)
     assert host.messages[-1] is False
+
+
+@pytest.mark.parametrize(
+    "shutdown, interrupted, handled",
+    [(True, True, True), (False, True, False), (True, False, False)],
+)
+def test_main_handles_only_shutdown_interrupted_response_conversion(
+    monkeypatch, shutdown, interrupted, handled
+):
+    """A SIGINT during generated response conversion must not make exit fail."""
+    from types import SimpleNamespace
+    import factory_simulation.dock_contact as contact
+
+    live = [True]
+    destroyed = []
+    node = SimpleNamespace(
+        context=SimpleNamespace(ok=lambda: live[0]),
+        destroy_node=lambda: destroyed.append(True),
+    )
+    monkeypatch.setattr(contact, "DockContactNode", lambda: node)
+    monkeypatch.setattr(contact.rclpy, "init", lambda: None)
+    monkeypatch.setattr(contact.rclpy, "try_shutdown", lambda: None)
+
+    def spin(_):
+        live[0] = not shutdown
+        error = SystemError("response conversion interrupted")
+        if interrupted:
+            raise error from KeyboardInterrupt()
+        raise error
+
+    monkeypatch.setattr(contact.rclpy, "spin", spin)
+    if handled:
+        contact.main()
+    else:
+        with pytest.raises(SystemError, match="response conversion interrupted"):
+            contact.main()
+    assert destroyed == [True]
+
+
+@pytest.mark.parametrize(
+    "shutdown,message,handled",
+    [
+        (
+            True,
+            "failed to initialize wait set: the given context is not valid, either "
+            "rcl_init() was not called or rcl_shutdown() was called., "
+            "at ./src/rcl/wait.c:130",
+            True,
+        ),
+        (
+            False,
+            "failed to initialize wait set: the given context is not valid, either "
+            "rcl_init() was not called or rcl_shutdown() was called., "
+            "at ./src/rcl/wait.c:130",
+            False,
+        ),
+        (True, "failed to initialize wait set: allocation failure", False),
+    ],
+)
+def test_main_handles_only_exact_inactive_context_wait_set_error(
+    monkeypatch, shutdown, message, handled
+):
+    """An active or unrelated native error must remain a failed process."""
+    import factory_simulation.dock_contact as contact
+    from rclpy.impl.implementation_singleton import rclpy_implementation
+
+    live = [True]
+    destroyed, shutdown_calls = [], []
+    node = SimpleNamespace(
+        context=SimpleNamespace(ok=lambda: live[0]),
+        destroy_node=lambda: destroyed.append(True),
+    )
+    monkeypatch.setattr(contact, "DockContactNode", lambda: node)
+    monkeypatch.setattr(contact.rclpy, "init", lambda: None)
+    monkeypatch.setattr(
+        contact.rclpy, "try_shutdown", lambda: shutdown_calls.append(True)
+    )
+
+    def spin(_):
+        live[0] = not shutdown
+        raise rclpy_implementation.RCLError(message)
+
+    monkeypatch.setattr(contact.rclpy, "spin", spin)
+    if handled:
+        contact.main()
+    else:
+        with pytest.raises(rclpy_implementation.RCLError) as caught:
+            contact.main()
+        assert str(caught.value) == message
+    assert destroyed == [True] and shutdown_calls == [True]

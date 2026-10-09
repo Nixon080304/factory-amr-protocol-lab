@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <gtest/gtest.h>
+#include <std_srvs/srv/empty.hpp>
 #include <chrono>
 #include <thread>
 #include <algorithm>
 #include <limits>
+#include <iomanip>
+#include <sstream>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
 #include <rosgraph_msgs/msg/clock.hpp>
@@ -30,8 +33,9 @@ using namespace std::chrono_literals;
 class DispatchBoundaryNode : public mission_coordinator::MissionCoordinatorNode {
 public:
   using MissionCoordinatorNode::MissionCoordinatorNode;
-  enum class Failure { None, Dispatch, Future };
+  enum class Failure { None, Dispatch, Future, Deferred };
   Failure failure{Failure::None};
+  TransferCallback pending_callback;
 
 protected:
   void dispatch_transfer(std::shared_ptr<Transfer::Request> request,
@@ -46,15 +50,31 @@ protected:
       callback(promise.get_future().share());
       return;
     }
+    if (failure == Failure::Deferred) {
+      pending_callback = std::move(callback);
+      return;
+    }
     MissionCoordinatorNode::dispatch_transfer(std::move(request), std::move(callback));
   }
 };
 
 class CoordinatorTest : public testing::Test {
 protected:
+  CoordinatorTest() : CoordinatorTest(rclcpp::contexts::get_global_default_context()) {}
+  explicit CoordinatorTest(rclcpp::Context::SharedPtr context)
+      : context_(std::move(context)), executor(executor_options(context_)) {}
+  static rclcpp::ExecutorOptions
+  executor_options(const rclcpp::Context::SharedPtr &context) {
+    rclcpp::ExecutorOptions options;
+    options.context = context;
+    return options;
+  }
   virtual std::string robot_id() const { return "amr_01"; }
   virtual bool leases_enabled() const { return false; }
   virtual std::vector<std::string> pickup_resources() const { return {}; }
+  virtual std::vector<std::string> dropoff_resources() const { return {}; }
+  virtual double resource_wait_timeout() const { return 120.0; }
+  virtual double refresh_timeout() const { return 0.3; }
   static void SetUpTestSuite() { rclcpp::init(0, nullptr); }
   static void TearDownTestSuite() { rclcpp::shutdown(); }
   void SetUp() override {
@@ -63,23 +83,61 @@ protected:
     }
     coordinator = std::make_shared<DispatchBoundaryNode>(
         rclcpp::NodeOptions()
+            .context(context_)
             .arguments({"--ros-args", "-r", "__ns:=/" + robot_id()})
-            .parameter_overrides({{"use_sim_time", true},
-                                  {"robot_id", robot_id()},
-                                  {"frame_prefix", robot_id() + "/"},
-                                  {"resource_leases_enabled", leases_enabled()},
-                                  {"routes.to_assembly.resources", pickup_resources()},
-                                  {"routes.to_assembly.central_aisle.staging_pose",
-                                   std::vector<double>{-1.5, -2.2, 0}},
-                                  {"routes.to_assembly.central_aisle.exit_pose",
-                                   std::vector<double>{1.5, -2.2, 0}},
-                                  {"routes.to_assembly.central_aisle.bounds",
-                                   std::vector<double>{-0.8, -2.65, 0.8, -1.75}},
-                                  {"perception_timeout_sec", 2.0}}));
-    peer = std::make_shared<rclcpp::Node>("mission_test_peers", "/" + robot_id());
+            .parameter_overrides(
+                {{"use_sim_time", true},
+                 {"robot_id", robot_id()},
+                 {"frame_prefix", robot_id() + "/"},
+                 {"resource_leases_enabled", leases_enabled()},
+                 {"localization_refresh_timeout_sec", refresh_timeout()},
+                 {"resource_wait_timeout_sec", resource_wait_timeout()},
+                 {"stations.assembly.bounds",
+                  std::vector<double>{-3.5, 0.3, -2.5, 2.5}},
+                 {"stations.inspection.bounds",
+                  std::vector<double>{2.5, 0.3, 3.5, 2.5}},
+                 {"stations.assembly.staging_pose", std::vector<double>{-3.8, -1.0, 0}},
+                 {"stations.inspection.staging_pose",
+                  std::vector<double>{3.8, -1.0, 0}},
+                 {"stations.assembly.exit_pose", std::vector<double>{-3.8, -2.5, 0}},
+                 {"stations.inspection.exit_pose", std::vector<double>{3.8, -2.5, 0}},
+                 {"routes.to_assembly.resources", pickup_resources()},
+                 {"routes.assembly_to_inspection.resources", dropoff_resources()},
+                 {"routes.assembly_to_inspection.central_aisle.staging_pose",
+                  std::vector<double>{-1.5, -2.2, 0}},
+                 {"routes.assembly_to_inspection.central_aisle.exit_pose",
+                  std::vector<double>{1.5, -2.2, 0}},
+                 {"routes.assembly_to_inspection.central_aisle.bounds",
+                  std::vector<double>{-0.8, -2.65, 0.8, -1.75}},
+                 {"routes.to_assembly.central_aisle.staging_pose",
+                  std::vector<double>{-1.5, -2.2, 0}},
+                 {"routes.to_assembly.central_aisle.exit_pose",
+                  std::vector<double>{1.5, -2.2, 0}},
+                 {"routes.to_assembly.central_aisle.bounds",
+                  std::vector<double>{-0.8, -2.65, 0.8, -1.75}},
+                 {"perception_timeout_sec", 2.0}}));
+    peer = std::make_shared<rclcpp::Node>("mission_test_peers", "/" + robot_id(),
+                                          rclcpp::NodeOptions().context(context_));
     clock_pub = peer->create_publisher<rosgraph_msgs::msg::Clock>("/clock", 10);
     pose_pub = peer->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
         "amcl_pose", rclcpp::SensorDataQoS());
+    refresh_service = peer->create_service<std_srvs::srv::Empty>(
+        "request_nomotion_update",
+        [this](std::shared_ptr<rmw_request_id_t> header,
+               std::shared_ptr<std_srvs::srv::Empty::Request>) {
+          refresh_requests.push_back(header);
+          if (hold_refresh)
+            return;
+          std_srvs::srv::Empty::Response response;
+          refresh_service->send_response(*header, response);
+          if (emit_refresh_pose) {
+            geometry_msgs::msg::PoseWithCovarianceStamped pose;
+            pose.header.frame_id = robot_id() + "/map";
+            pose.header.stamp = rclcpp::Time(static_cast<int64_t>(sim_time * 1e9));
+            pose.pose.pose = target.pose;
+            pose_pub->publish(pose);
+          }
+        });
     detection_pub = peer->create_publisher<factory_interfaces::msg::StationDetection>(
         "factory/station_detection", rclcpp::SensorDataQoS());
     fault_pub = peer->create_publisher<factory_interfaces::msg::FaultCommand>(
@@ -145,6 +203,8 @@ protected:
     executor.add_node(coordinator);
     executor.add_node(peer);
     ASSERT_TRUE(client->wait_for_action_server(2s));
+    target.pose.position.y = -3.5;
+    target.pose.orientation.w = 1.0;
     pump(20);
   }
   void TearDown() override {
@@ -175,7 +235,8 @@ protected:
       if (invalid_pose) {
         pose.pose.pose.position.z = std::numeric_limits<double>::quiet_NaN();
       }
-      pose_pub->publish(pose);
+      if (publish_pose)
+        pose_pub->publish(pose);
       if (detect && !feedback.empty() && feedback.back().find("VERIFYING") == 0) {
         factory_interfaces::msg::StationDetection detection;
         detection.header.frame_id =
@@ -197,6 +258,18 @@ protected:
       executor.spin_some();
       std::this_thread::sleep_for(5ms);
     }
+  }
+  double buffered_scan_stamp() {
+    const double stamp = sim_time + 0.025;
+    // Keep the cached source fixed while advancing the coordinator's actual
+    // clock. Goal admission may otherwise run before a queued clock callback.
+    EXPECT_FALSE(publish_pose);
+    pump(2, false);
+    for (int i = 0; i < 20 && coordinator->now().seconds() <= stamp; ++i) {
+      executor.spin_some();
+      std::this_thread::sleep_for(5ms);
+    }
+    return stamp;
   }
   std::shared_ptr<rclcpp_action::ClientGoalHandle<Mission>>
   send(std::string id = "test", std::string robot = "amr_01",
@@ -265,6 +338,7 @@ protected:
     }
     ASSERT_TRUE(acknowledged());
   }
+  rclcpp::Context::SharedPtr context_;
   rclcpp::executors::SingleThreadedExecutor executor;
   std::shared_ptr<DispatchBoundaryNode> coordinator;
   rclcpp::Node::SharedPtr peer;
@@ -289,6 +363,10 @@ protected:
   std::vector<float> progress;
   std::vector<std::string> states;
   geometry_msgs::msg::PoseStamped target;
+  bool publish_pose{true};
+  bool emit_refresh_pose{false}, hold_refresh{false};
+  std::vector<std::shared_ptr<rmw_request_id_t>> refresh_requests;
+  rclcpp::Service<std_srvs::srv::Empty>::SharedPtr refresh_service;
   double sim_time = 10.0;
   int fail_navigation = 0, clear_count = 0;
   bool hold_navigation = false;
@@ -306,19 +384,25 @@ protected:
   void create_resources() {
     acquire_service = peer->create_service<factory_interfaces::srv::AcquireResource>(
         "/factory/resources/acquire",
-        [this](
-            std::shared_ptr<factory_interfaces::srv::AcquireResource::Request> request,
-            std::shared_ptr<factory_interfaces::srv::AcquireResource::Response>
-                response) {
+        [this](std::shared_ptr<rmw_request_id_t> header,
+               std::shared_ptr<factory_interfaces::srv::AcquireResource::Request>
+                   request) {
+          auto response =
+              std::make_shared<factory_interfaces::srv::AcquireResource::Response>();
           acquired.push_back(request->resource_id);
           auto owner = owners.find(request->resource_id);
           response->granted = allow_station && (owner == owners.end() ||
                                                 owner->second == request->robot_id);
           response->lease_id = response->granted ? "central-random-token" : "";
           response->lease_ttl_sec = response->granted ? 10 : 0;
-          response->reason = response->granted ? "granted" : "owned by other robot";
+          response->reason = response->granted ? "granted" : "queued";
           if (response->granted)
             owners[request->resource_id] = request->robot_id;
+          if (request->resource_id == hold_acquire_resource) {
+            pending_acquire = header;
+            pending_acquire_response = response;
+          } else
+            acquire_service->send_response(*header, *response);
         });
     renew_service = peer->create_service<factory_interfaces::srv::RenewResource>(
         "/factory/resources/renew",
@@ -355,6 +439,10 @@ protected:
   }
   bool allow_station{false};
   bool quarantined_cancel{false};
+  std::string hold_acquire_resource;
+  std::shared_ptr<rmw_request_id_t> pending_acquire;
+  std::shared_ptr<factory_interfaces::srv::AcquireResource::Response>
+      pending_acquire_response;
   std::map<std::string, std::string> owners;
   std::vector<std::string> acquired;
   std::vector<factory_interfaces::srv::ReleaseResource::Request> released;
@@ -370,6 +458,526 @@ protected:
     return {"central_aisle"};
   }
 };
+class QueuedCoordinatorTest : public LeasedCoordinatorTest {
+protected:
+  double resource_wait_timeout() const override { return 0.4; }
+};
+class RefreshDeadlineCoordinatorTest : public TrafficCoordinatorTest {
+protected:
+  double refresh_timeout() const override { return 1.0; }
+};
+class RefreshReceiptCoordinatorTest : public TrafficCoordinatorTest {
+protected:
+  std::shared_ptr<rclcpp_action::ClientGoalHandle<Mission>>
+  delayed_tick(bool late, bool late_ack = false) {
+    create_resources();
+    allow_station = true;
+    publish_pose = false;
+    hold_refresh = true;
+    hold_navigation = true;
+    // Delay only the production timer. Real DDS acknowledgement and pose
+    // callbacks still execute, reproducing receipt before a delayed tick.
+    auto timer = coordinator->get_node_base_interface()
+                     ->get_default_callback_group()
+                     ->find_timer_ptrs_if([](const auto &candidate) {
+                       int64_t period = 0;
+                       return rcl_timer_get_period(candidate->get_timer_handle().get(),
+                                                   &period) == RCL_RET_OK &&
+                              period == 20000000;
+                     });
+    EXPECT_NE(timer, nullptr);
+    if (!timer)
+      throw std::runtime_error("production coordinator timer unavailable");
+    timer->cancel();
+    auto handle = send(late ? "late-receipt" : "timely-receipt");
+    for (int i = 0; i < 30 && refresh_requests.empty(); ++i)
+      pump(1, false);
+    EXPECT_EQ(refresh_requests.size(), 1u);
+    if (refresh_requests.empty())
+      throw std::runtime_error("refresh dispatch missing");
+    std_srvs::srv::Empty::Response response;
+    if (!late_ack)
+      refresh_service->send_response(*refresh_requests.front(), response);
+    pump(5, false);
+    if (late)
+      std::this_thread::sleep_for(350ms);
+    geometry_msgs::msg::PoseWithCovarianceStamped pose;
+    pose.header.frame_id = robot_id() + "/map";
+    pose.header.stamp = rclcpp::Time(static_cast<int64_t>(sim_time * 1e9));
+    pose.pose.pose = target.pose;
+    pose_pub->publish(pose);
+    const auto expected_pose_received = [&] {
+      return std::any_of(
+          events.begin(), events.end(), [late, late_ack](const auto &entry) {
+            return entry.event == "localization_refresh_pose" &&
+                   entry.detail.find(late_ack ? "\"acknowledged\":false"
+                                     : late   ? "\"pose_current\":false"
+                                              : "\"pose_current\":true") !=
+                       std::string::npos &&
+                   entry.detail.find("\"source_valid\":true") != std::string::npos;
+          });
+    };
+    for (int i = 0; i < 30 && !expected_pose_received(); ++i)
+      pump(1, false);
+    EXPECT_TRUE(expected_pose_received());
+    EXPECT_TRUE(nav_handles.empty());
+    if (!late)
+      std::this_thread::sleep_for(350ms);
+    if (late_ack) {
+      refresh_service->send_response(*refresh_requests.front(), response);
+      for (int i = 0; i < 30; ++i) {
+        pump(1, false);
+        if (std::any_of(events.begin(), events.end(), [](const auto &entry) {
+              return entry.event == "localization_refresh_finished" &&
+                     entry.outcome == "SUCCEEDED";
+            }))
+          break;
+      }
+      EXPECT_TRUE(std::any_of(events.begin(), events.end(), [](const auto &entry) {
+        return entry.event == "localization_refresh_finished" &&
+               entry.outcome == "SUCCEEDED";
+      }));
+    }
+    timer->execute_callback();
+    timer->reset();
+    return handle;
+  }
+};
+TEST_F(RefreshReceiptCoordinatorTest, TimelyFreshReceiptSurvivesDelayedTimerTick) {
+  auto handle = delayed_tick(false);
+  for (int i = 0; i < 30 && nav_handles.empty(); ++i)
+    pump(1, false);
+  EXPECT_EQ(nav_handles.size(), 1u);
+  EXPECT_EQ(owners["central_aisle"], "amr_01");
+  client->async_cancel_goal(handle);
+  EXPECT_EQ(finish(handle, false).result->error_code, "MISSION_CANCELED");
+}
+TEST_F(RefreshReceiptCoordinatorTest, ReceiptAfterDeadlineNeverAuthorizesMotion) {
+  auto handle = delayed_tick(true);
+  auto result = finish(handle, false);
+  EXPECT_EQ(result.result->error_code, "LOCALIZATION_REFRESH_TIMEOUT");
+  EXPECT_TRUE(nav_handles.empty());
+  EXPECT_TRUE(acquired.empty());
+}
+TEST_F(RefreshReceiptCoordinatorTest, LateAcknowledgementCannotCombineWithTimelyPose) {
+  auto handle = delayed_tick(false, true);
+  auto result = client->async_get_result(handle);
+  pump(20, false);
+  EXPECT_EQ(result.wait_for(0s), std::future_status::ready);
+  EXPECT_TRUE(nav_handles.empty());
+  EXPECT_TRUE(acquired.empty());
+  if (result.wait_for(0s) != std::future_status::ready) {
+    // The RED implementation wrongly starts motion. Cancel that external
+    // goal after recording the failed assertions so teardown remains bounded.
+    client->async_cancel_goal(handle);
+    finish(handle, false);
+    return;
+  }
+  EXPECT_EQ(result.get().result->error_code, "LOCALIZATION_REFRESH_TIMEOUT");
+}
+TEST_F(LeasedCoordinatorTest, FreshOffTargetPoseUsesStationTimeoutNotRefreshTimeout) {
+  create_resources();
+  allow_station = true;
+  hold_navigation = true;
+  auto handle = send("off-target");
+  for (int i = 0; i < 30 && nav_handles.empty(); ++i)
+    pump(1, false);
+  ASSERT_EQ(nav_handles.size(), 1u);
+  pump(5, false, false);
+  // Let the last pose and its clock both settle, then keep that genuinely
+  // current observation fixed. Publishing a new future candidate on every
+  // timer turn would legitimately request a refresh before clock catches up.
+  for (int i = 0; i < 10; ++i) {
+    executor.spin_some();
+    std::this_thread::sleep_for(5ms);
+  }
+  publish_pose = false;
+  const auto before = refresh_requests.size();
+  nav_handles.front()->succeed(std::make_shared<Nav::Result>());
+  auto pending = client->async_get_result(handle);
+  for (int i = 0; i < 80; ++i) {
+    executor.spin_some();
+    std::this_thread::sleep_for(5ms);
+  }
+  EXPECT_NE(pending.wait_for(0s), std::future_status::ready);
+  EXPECT_EQ(refresh_requests.size(), before);
+  EXPECT_TRUE(transfers.empty());
+  publish_pose = true;
+  EXPECT_EQ(finish(handle, false, false).result->error_code, "STATION_NOT_CONFIRMED");
+}
+TEST_F(QueuedCoordinatorTest, QueueTimeoutReportsExactErrorAfterConfirmedCleanup) {
+  create_resources();
+  auto result = finish(send("queue-timeout"));
+  EXPECT_FALSE(result.result->success);
+  EXPECT_EQ(result.result->error_code, "RESOURCE_WAIT_TIMEOUT");
+  EXPECT_EQ(result.result->final_state, "FAILED");
+  EXPECT_EQ(nav_handles.size(), 1u);
+  EXPECT_TRUE(transfers.empty());
+  EXPECT_TRUE(released.empty());
+  allow_station = true;
+  EXPECT_TRUE(finish(send("after-queue-timeout")).result->success);
+}
+TEST_F(TrafficCoordinatorTest, IdleMissionRequestsRobotLocalPoseBeforeTraffic) {
+  create_resources();
+  allow_station = true;
+  hold_navigation = true;
+  publish_pose = false;
+  emit_refresh_pose = true;
+  auto handle = send();
+  for (int i = 0; i < 100 && nav_handles.empty(); ++i)
+    pump(1, false);
+  EXPECT_EQ(std::string(refresh_service->get_service_name()),
+            "/amr_01/request_nomotion_update");
+  ASSERT_EQ(refresh_requests.size(), 1u);
+  ASSERT_EQ(nav_handles.size(), 1u);
+  EXPECT_EQ(owners["central_aisle"], "amr_01");
+  client->async_cancel_goal(handle);
+  EXPECT_EQ(finish(handle, false).result->final_state, "RECOVERY_REQUIRED");
+}
+TEST_F(TrafficCoordinatorTest, MissingRefreshTerminatesWithoutMotionOrOwnership) {
+  create_resources();
+  allow_station = true;
+  publish_pose = false;
+  refresh_service.reset();
+  auto handle = send();
+  auto result = client->async_get_result(handle);
+  for (int i = 0; i < 100 && result.wait_for(0s) != std::future_status::ready; ++i)
+    pump(1, false);
+  ASSERT_EQ(result.wait_for(0s), std::future_status::ready);
+  EXPECT_EQ(result.get().result->error_code, "LOCALIZATION_REFRESH_FAILED");
+  EXPECT_TRUE(nav_handles.empty());
+  EXPECT_TRUE(acquired.empty());
+}
+TEST_F(TrafficCoordinatorTest, RefreshAcknowledgementWithoutPoseTimesOutBounded) {
+  create_resources();
+  allow_station = true;
+  publish_pose = false;
+  auto handle = send();
+  auto result = client->async_get_result(handle);
+  for (int i = 0; i < 100 && result.wait_for(0s) != std::future_status::ready; ++i)
+    pump(1, false);
+  ASSERT_EQ(result.wait_for(0s), std::future_status::ready);
+  EXPECT_EQ(result.get().result->error_code, "LOCALIZATION_REFRESH_TIMEOUT");
+  EXPECT_EQ(refresh_requests.size(), 1u);
+  EXPECT_TRUE(nav_handles.empty());
+  EXPECT_TRUE(acquired.empty());
+}
+TEST_F(TrafficCoordinatorTest, BufferedScanRefreshReissuesWithinOriginalDeadline) {
+  create_resources();
+  allow_station = true;
+  publish_pose = false;
+  hold_refresh = true;
+  hold_navigation = true;
+  const auto cached_stamp = buffered_scan_stamp();
+  ASSERT_LT(cached_stamp, coordinator->now().seconds());
+  auto handle = send("buffered-scan");
+  for (int i = 0; i < 100 && refresh_requests.empty(); ++i)
+    pump(1, false);
+  ASSERT_EQ(refresh_requests.size(), 1u);
+  geometry_msgs::msg::PoseWithCovarianceStamped pose;
+  pose.header.frame_id = robot_id() + "/map";
+  // A buffered scan is newer than the cached source, but predates the request.
+  pose.header.stamp = rclcpp::Time(static_cast<int64_t>(cached_stamp * 1e9));
+  pose.pose.pose = target.pose;
+  pose_pub->publish(pose);
+  std_srvs::srv::Empty::Response response;
+  refresh_service->send_response(*refresh_requests.front(), response);
+  for (int i = 0; i < 30 && refresh_requests.size() < 2; ++i)
+    pump(1, false);
+  EXPECT_TRUE(nav_handles.empty());
+  EXPECT_TRUE(acquired.empty());
+  ASSERT_EQ(refresh_requests.size(), 2u);
+  pose.header.stamp = rclcpp::Time(static_cast<int64_t>(sim_time * 1e9));
+  pose_pub->publish(pose);
+  refresh_service->send_response(*refresh_requests.back(), response);
+  for (int i = 0; i < 30 && nav_handles.empty(); ++i)
+    pump(1, false);
+  ASSERT_EQ(nav_handles.size(), 1u);
+  client->async_cancel_goal(handle);
+  EXPECT_EQ(finish(handle, false).result->final_state, "RECOVERY_REQUIRED");
+}
+TEST_F(RefreshDeadlineCoordinatorTest, BufferedScansCannotExtendOriginalDeadline) {
+  create_resources();
+  allow_station = true;
+  publish_pose = false;
+  hold_refresh = true;
+  const auto cached_stamp = buffered_scan_stamp();
+  ASSERT_LT(cached_stamp, coordinator->now().seconds());
+  auto handle = send("buffered-deadline");
+  auto result = client->async_get_result(handle);
+  geometry_msgs::msg::PoseWithCovarianceStamped pose;
+  pose.header.frame_id = robot_id() + "/map";
+  pose.header.stamp = rclcpp::Time(static_cast<int64_t>(cached_stamp * 1e9));
+  pose.pose.pose = target.pose;
+  size_t acknowledged = 0;
+  auto started = std::chrono::steady_clock::now();
+  while (result.wait_for(0s) != std::future_status::ready &&
+         std::chrono::steady_clock::now() - started < 1400ms) {
+    if (acknowledged < refresh_requests.size()) {
+      pose_pub->publish(pose);
+      std_srvs::srv::Empty::Response response;
+      refresh_service->send_response(*refresh_requests[acknowledged++], response);
+    }
+    pump(1, false);
+  }
+  std::ostringstream refresh_trace;
+  for (const auto &entry : events)
+    if (entry.event.rfind("localization_refresh_", 0) == 0)
+      refresh_trace << entry.event << " " << entry.detail << "\n";
+  SCOPED_TRACE(refresh_trace.str());
+  ASSERT_EQ(result.wait_for(0s), std::future_status::ready);
+  EXPECT_EQ(result.get().result->error_code, "LOCALIZATION_REFRESH_TIMEOUT");
+  EXPECT_GE(refresh_requests.size(), 2u);
+  EXPECT_LE(refresh_requests.size(), 10u);
+  // DDS delivery jitter can compress server receipt intervals. Check the
+  // actual client dispatch cadence, not the transport's arrival spacing.
+  std::vector<double> attempts;
+  for (const auto &entry : events) {
+    if (entry.event != "localization_refresh_requested")
+      continue;
+    const auto field = entry.detail.find("\"elapsed_sec\":");
+    ASSERT_NE(field, std::string::npos);
+    attempts.push_back(std::stod(entry.detail.substr(field + 14)));
+  }
+  ASSERT_EQ(attempts.size(), refresh_requests.size());
+  for (size_t i = 1; i < attempts.size(); ++i)
+    EXPECT_GE(attempts[i] - attempts[i - 1], 0.1);
+  EXPECT_LT(std::chrono::steady_clock::now() - started, 1250ms);
+  EXPECT_TRUE(nav_handles.empty());
+  EXPECT_TRUE(acquired.empty());
+}
+TEST_F(TrafficCoordinatorTest, CanceledBufferedRetryCannotAuthorizeNextMission) {
+  create_resources();
+  allow_station = true;
+  publish_pose = false;
+  hold_refresh = true;
+  hold_navigation = true;
+  const auto cached_stamp = buffered_scan_stamp();
+  ASSERT_LT(cached_stamp, coordinator->now().seconds());
+  auto first = send("buffered-canceled");
+  for (int i = 0; i < 30 && refresh_requests.empty(); ++i)
+    pump(1, false);
+  ASSERT_EQ(refresh_requests.size(), 1u);
+  geometry_msgs::msg::PoseWithCovarianceStamped pose;
+  pose.header.frame_id = robot_id() + "/map";
+  pose.header.stamp = rclcpp::Time(static_cast<int64_t>(cached_stamp * 1e9));
+  pose.pose.pose = target.pose;
+  pose_pub->publish(pose);
+  std_srvs::srv::Empty::Response response;
+  refresh_service->send_response(*refresh_requests.front(), response);
+  for (int i = 0; i < 30 && refresh_requests.size() < 2; ++i)
+    pump(1, false);
+  ASSERT_EQ(refresh_requests.size(), 2u);
+  client->async_cancel_goal(first);
+  EXPECT_EQ(finish(first, false).result->error_code, "MISSION_CANCELED");
+  auto second = send("after-buffered-cancel");
+  for (int i = 0; i < 30 && refresh_requests.size() < 3; ++i)
+    pump(1, false);
+  ASSERT_EQ(refresh_requests.size(), 3u);
+  pose.header.stamp = rclcpp::Time(static_cast<int64_t>(sim_time * 1e9));
+  pose_pub->publish(pose);
+  refresh_service->send_response(*refresh_requests[1], response);
+  pump(10, false);
+  EXPECT_TRUE(nav_handles.empty());
+  EXPECT_TRUE(acquired.empty());
+  refresh_service->send_response(*refresh_requests[2], response);
+  for (int i = 0; i < 30 && nav_handles.empty(); ++i)
+    pump(1, false);
+  ASSERT_EQ(nav_handles.size(), 1u);
+  client->async_cancel_goal(second);
+  EXPECT_EQ(finish(second, false).result->final_state, "RECOVERY_REQUIRED");
+}
+TEST_F(TrafficCoordinatorTest, PendingRefreshTimeoutFencesLateResponse) {
+  create_resources();
+  allow_station = true;
+  publish_pose = false;
+  hold_refresh = true;
+  auto handle = send();
+  auto result = client->async_get_result(handle);
+  for (int i = 0; i < 100 && result.wait_for(0s) != std::future_status::ready; ++i)
+    pump(1, false);
+  ASSERT_EQ(result.wait_for(0s), std::future_status::ready);
+  EXPECT_EQ(result.get().result->error_code, "LOCALIZATION_REFRESH_TIMEOUT");
+  ASSERT_EQ(refresh_requests.size(), 1u);
+  std_srvs::srv::Empty::Response response;
+  refresh_service->send_response(*refresh_requests.back(), response);
+  publish_pose = true;
+  pump(10, false);
+  EXPECT_TRUE(nav_handles.empty());
+  EXPECT_TRUE(acquired.empty());
+}
+TEST_F(TrafficCoordinatorTest, LateRefreshReplyCannotAuthorizeNextMission) {
+  create_resources();
+  allow_station = true;
+  publish_pose = false;
+  hold_refresh = true;
+  hold_navigation = true;
+  auto first = send("first-refresh");
+  for (int i = 0; i < 100 && refresh_requests.empty(); ++i)
+    pump(1, false);
+  ASSERT_EQ(refresh_requests.size(), 1u);
+  client->async_cancel_goal(first);
+  EXPECT_EQ(finish(first, false).result->error_code, "MISSION_CANCELED");
+  auto second = send("second-refresh");
+  for (int i = 0; i < 100 && refresh_requests.size() < 2; ++i)
+    pump(1, false);
+  ASSERT_EQ(refresh_requests.size(), 2u);
+  geometry_msgs::msg::PoseWithCovarianceStamped pose;
+  pose.header.frame_id = robot_id() + "/map";
+  pose.header.stamp = rclcpp::Time(static_cast<int64_t>(sim_time * 1e9));
+  pose.pose.pose = target.pose;
+  pose_pub->publish(pose);
+  std_srvs::srv::Empty::Response response;
+  refresh_service->send_response(*refresh_requests.front(), response);
+  pump(10, false);
+  EXPECT_TRUE(acquired.empty());
+  EXPECT_TRUE(nav_handles.empty());
+  refresh_service->send_response(*refresh_requests.back(), response);
+  for (int i = 0; i < 100 && nav_handles.empty(); ++i)
+    pump(1, false);
+  ASSERT_EQ(nav_handles.size(), 1u);
+  client->async_cancel_goal(second);
+  EXPECT_EQ(finish(second, false).result->final_state, "RECOVERY_REQUIRED");
+}
+TEST_F(TrafficCoordinatorTest, RefreshRejectsReplayedFutureAndForeignPoseEvidence) {
+  create_resources();
+  allow_station = true;
+  publish_pose = false;
+  hold_navigation = true;
+  const auto cached_stamp = sim_time;
+  auto handle = send();
+  for (int i = 0; i < 100 && refresh_requests.empty(); ++i)
+    pump(1, false);
+  ASSERT_EQ(refresh_requests.size(), 1u);
+  geometry_msgs::msg::PoseWithCovarianceStamped pose;
+  pose.header.frame_id = robot_id() + "/map";
+  pose.header.stamp = rclcpp::Time(static_cast<int64_t>(cached_stamp * 1e9));
+  pose.pose.pose = target.pose;
+  pose_pub->publish(pose);
+  pump(3, false);
+  EXPECT_TRUE(acquired.empty());
+  EXPECT_TRUE(nav_handles.empty());
+  pose.header.stamp = rclcpp::Time(static_cast<int64_t>((sim_time + 1.0) * 1e9));
+  pose_pub->publish(pose);
+  pump(3, false);
+  EXPECT_TRUE(acquired.empty());
+  EXPECT_TRUE(nav_handles.empty());
+  pose.header.stamp = rclcpp::Time(static_cast<int64_t>(sim_time * 1e9));
+  pose.header.frame_id = "amr_02/map";
+  pose_pub->publish(pose);
+  pump(3, false);
+  EXPECT_TRUE(acquired.empty());
+  EXPECT_TRUE(nav_handles.empty());
+  pose.header.frame_id = robot_id() + "/map";
+  pose.header.stamp = rclcpp::Time(static_cast<int64_t>(sim_time * 1e9));
+  pose_pub->publish(pose);
+  for (int i = 0; i < 100 && nav_handles.empty(); ++i)
+    pump(1, false);
+  ASSERT_EQ(nav_handles.size(), 1u);
+  EXPECT_EQ(refresh_requests.size(), 1u);
+  client->async_cancel_goal(handle);
+  EXPECT_EQ(finish(handle, false).result->final_state, "RECOVERY_REQUIRED");
+}
+TEST_F(LeasedCoordinatorTest, IdleNav2ResultsRefreshEveryPhysicalHandoff) {
+  create_resources();
+  allow_station = true;
+  publish_pose = false;
+  emit_refresh_pose = true;
+  auto result = finish(send());
+  EXPECT_TRUE(result.result->success);
+  EXPECT_EQ(nav_handles.size(), 6u);
+  EXPECT_EQ(refresh_requests.size(), 7u); // Startup plus six terminal Nav2 results.
+  ASSERT_EQ(released.size(), 2u);
+  EXPECT_EQ(released.front().resource_id, "assembly");
+  EXPECT_EQ(released.back().resource_id, "inspection");
+}
+TEST_F(LeasedCoordinatorTest, CancelingDepartureRefreshKeepsStationQuarantined) {
+  create_resources();
+  allow_station = true;
+  publish_pose = false;
+  emit_refresh_pose = true;
+  hold_transfer_station = "assembly";
+  auto handle = send();
+  for (int i = 0; i < 100 && !pending_transfer; ++i)
+    pump();
+  ASSERT_NE(pending_transfer, nullptr);
+  const auto previous_refreshes = refresh_requests.size();
+  hold_refresh = true;
+  emit_refresh_pose = false;
+  factory_interfaces::srv::TransferPart::Response response;
+  response.accepted = true;
+  transfer->send_response(*pending_transfer, response);
+  for (int i = 0; i < 100 && refresh_requests.size() == previous_refreshes; ++i)
+    pump(1, false);
+  ASSERT_EQ(refresh_requests.size(), previous_refreshes + 1);
+  client->async_cancel_goal(handle);
+  auto result = finish(handle, false);
+  EXPECT_EQ(result.result->error_code, "MISSION_CANCELED");
+  EXPECT_EQ(result.result->final_state, "RECOVERY_REQUIRED");
+  std_srvs::srv::Empty::Response ack;
+  refresh_service->send_response(*refresh_requests.back(), ack);
+  publish_pose = true;
+  pump(10, false);
+  EXPECT_TRUE(released.empty());
+  EXPECT_EQ(owners["assembly"], "amr_01");
+  EXPECT_EQ(finish(send("after-canceled-refresh"), false).result->error_code,
+            "RESTART_REQUIRED");
+}
+TEST_F(TrafficCoordinatorTest, MissingOrOccupiedPoseCannotRequestSharedStaging) {
+  create_resources();
+  allow_station = true;
+  hold_navigation = true;
+  invalid_pose = true;
+  auto handle = send();
+  pump(10, false);
+  EXPECT_TRUE(acquired.empty());
+  EXPECT_TRUE(nav_handles.empty());
+  invalid_pose = false;
+  target.pose.position.x = 0;
+  target.pose.position.y = -2.2;
+  pump(10, false);
+  EXPECT_TRUE(acquired.empty());
+  EXPECT_TRUE(nav_handles.empty());
+  target.pose.position.x = -3.8;
+  target.pose.position.y = -1.0;
+  for (int i = 0; i < 100 && nav_handles.empty(); ++i)
+    pump(1, false);
+  ASSERT_EQ(nav_handles.size(), 1u);
+  EXPECT_EQ(owners["central_aisle"], "amr_01");
+  client->async_cancel_goal(handle);
+  EXPECT_EQ(finish(handle, false).result->final_state, "RECOVERY_REQUIRED");
+}
+TEST_F(TrafficCoordinatorTest, FuturePoseAtGrantWaitsForCurrentClearance) {
+  create_resources();
+  allow_station = true;
+  hold_acquire_resource = "central_aisle";
+  hold_navigation = true;
+  auto handle = send();
+  auto result = client->async_get_result(handle);
+  for (int i = 0; i < 100 && !pending_acquire; ++i)
+    pump(1, false);
+  ASSERT_NE(pending_acquire, nullptr);
+  ASSERT_TRUE(nav_handles.empty());
+  publish_pose = false;
+  geometry_msgs::msg::PoseWithCovarianceStamped future;
+  future.header.frame_id = robot_id() + "/map";
+  future.header.stamp = rclcpp::Time(static_cast<int64_t>((sim_time + 1.0) * 1e9));
+  future.pose.pose = target.pose;
+  pose_pub->publish(future);
+  pump(3, false);
+  acquire_service->send_response(*pending_acquire, *pending_acquire_response);
+  pump(3, false);
+  EXPECT_TRUE(nav_handles.empty());
+  EXPECT_TRUE(released.empty());
+  EXPECT_EQ(result.wait_for(0s), std::future_status::timeout);
+  publish_pose = true;
+  for (int i = 0; i < 100 && nav_handles.empty(); ++i)
+    pump(1, false);
+  ASSERT_EQ(nav_handles.size(), 1u);
+  EXPECT_EQ(owners["central_aisle"], "amr_01");
+  client->async_cancel_goal(handle);
+  EXPECT_EQ(finish(handle, false).result->final_state, "RECOVERY_REQUIRED");
+}
 TEST_F(TrafficCoordinatorTest, TwoRobotContextsWaitUntilOwnerVerifiesExitAndRelease) {
   create_resources();
   allow_station = true;
@@ -378,6 +986,7 @@ TEST_F(TrafficCoordinatorTest, TwoRobotContextsWaitUntilOwnerVerifiesExitAndRele
   for (int i = 0; i < 100 && nav_handles.empty(); ++i)
     pump(1, false);
   ASSERT_EQ(nav_handles.size(), 1u); // Safe staging goal.
+  EXPECT_EQ(owners["central_aisle"], "amr_01");
   nav_handles[0]->succeed(std::make_shared<Nav::Result>());
   for (int i = 0; i < 100 && nav_handles.size() < 2; ++i)
     pump(1, false);
@@ -386,22 +995,289 @@ TEST_F(TrafficCoordinatorTest, TwoRobotContextsWaitUntilOwnerVerifiesExitAndRele
   auto second_node = std::make_shared<mission_coordinator::MissionCoordinatorNode>(
       rclcpp::NodeOptions()
           .arguments({"--ros-args", "-r", "__ns:=/amr_02"})
-          .parameter_overrides({{"robot_id", "amr_02"},
-                                {"frame_prefix", "amr_02/"},
-                                {"resource_leases_enabled", true},
-                                {"routes.to_assembly.resources",
-                                 std::vector<std::string>{"central_aisle"}},
-                                {"routes.to_assembly.central_aisle.staging_pose",
-                                 std::vector<double>{-1.5, -2.2, 0}},
-                                {"routes.to_assembly.central_aisle.exit_pose",
-                                 std::vector<double>{1.5, -2.2, 0}},
-                                {"routes.to_assembly.central_aisle.bounds",
-                                 std::vector<double>{-0.8, -2.65, 0.8, -1.75}}}));
+          // Select simulation time before constructing the ROS time source.
+          // Switching clocks after dispatch invalidates current-leg evidence.
+          .parameter_overrides(
+              {{"use_sim_time", true},
+               {"robot_id", "amr_02"},
+               {"frame_prefix", "amr_02/"},
+               {"resource_leases_enabled", true},
+               {"stations.assembly.bounds", std::vector<double>{-3.5, 0.3, -2.5, 2.5}},
+               {"stations.inspection.bounds", std::vector<double>{2.5, 0.3, 3.5, 2.5}},
+               {"stations.assembly.staging_pose", std::vector<double>{-3.8, -1.0, 0}},
+               {"stations.inspection.staging_pose", std::vector<double>{3.8, -1.0, 0}},
+               {"stations.assembly.exit_pose", std::vector<double>{-3.8, -2.5, 0}},
+               {"stations.inspection.exit_pose", std::vector<double>{3.8, -2.5, 0}},
+               {"routes.to_assembly.resources",
+                std::vector<std::string>{"central_aisle"}},
+               {"routes.to_assembly.central_aisle.staging_pose",
+                std::vector<double>{-1.5, -2.2, 0}},
+               {"routes.to_assembly.central_aisle.exit_pose",
+                std::vector<double>{1.5, -2.2, 0}},
+               {"routes.to_assembly.central_aisle.bounds",
+                std::vector<double>{-0.8, -2.65, 0.8, -1.75}}}));
   auto second_pose =
       peer->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
           "/amr_02/amcl_pose", rclcpp::SensorDataQoS());
+  auto second_refresh = peer->create_service<std_srvs::srv::Empty>(
+      "/amr_02/request_nomotion_update",
+      [](std::shared_ptr<std_srvs::srv::Empty::Request>,
+         std::shared_ptr<std_srvs::srv::Empty::Response>) {});
   std::vector<std::shared_ptr<rclcpp_action::ServerGoalHandle<Nav>>> second_goals;
   geometry_msgs::msg::PoseStamped second_target;
+  second_target.pose.position.x = -3.8;
+  second_target.pose.position.y = -1.0;
+  second_target.pose.orientation.w = 1.0;
+  double second_staging_finished_at = -1;
+  auto second_nav = rclcpp_action::create_server<Nav>(
+      peer, "/amr_02/navigate_to_pose",
+      [](auto, auto) { return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE; },
+      [](auto) { return rclcpp_action::CancelResponse::ACCEPT; },
+      [&](auto handle) {
+        second_goals.push_back(handle);
+        second_target = handle->get_goal()->pose;
+        if (second_goals.size() == 1) {
+          second_staging_finished_at = second_node->now().seconds();
+          handle->succeed(std::make_shared<Nav::Result>());
+        }
+      });
+  auto second_client =
+      rclcpp_action::create_client<Mission>(peer, "/amr_02/factory/execute_mission");
+  executor.add_node(second_node);
+  ASSERT_TRUE(second_client->wait_for_action_server(2s));
+  Mission::Goal request;
+  request.mission_id = "second";
+  request.robot_id = "amr_02";
+  request.pickup_station = "assembly";
+  request.dropoff_station = "inspection";
+  request.part = "motor";
+  auto second = second_client->async_send_goal(request);
+  auto pump_both = [&](int count, bool first_localized) {
+    for (int i = 0; i < count; ++i) {
+      geometry_msgs::msg::PoseWithCovarianceStamped pose;
+      pose.header.stamp = rclcpp::Time(static_cast<int64_t>((sim_time + 0.05) * 1e9));
+      pose.header.frame_id = "amr_02/map";
+      pose.pose.pose = second_target.pose;
+      second_pose->publish(pose);
+      pump(1, false, first_localized);
+    }
+  };
+  pump_both(100, false);
+  ASSERT_EQ(second.wait_for(0s), std::future_status::ready);
+  ASSERT_NE(second.get(), nullptr);
+  EXPECT_TRUE(second_goals.empty());
+  EXPECT_EQ(owners["central_aisle"], "amr_01");
+  nav_handles[1]->succeed(std::make_shared<Nav::Result>());
+  for (int i = 0; i < 100 && nav_handles.size() < 3; ++i)
+    pump_both(1, true);
+  ASSERT_EQ(nav_handles.size(), 3u); // Distinct destination wait pose.
+  EXPECT_EQ(owners["central_aisle"], "amr_01");
+  EXPECT_TRUE(second_goals.empty());
+  nav_handles[2]->succeed(std::make_shared<Nav::Result>());
+  pump_both(10, false);
+  EXPECT_EQ(owners["central_aisle"], "amr_01");
+  EXPECT_TRUE(second_goals.empty());
+  for (int i = 0; i < 200 && second_goals.size() < 2; ++i)
+    pump_both(1, true);
+  EXPECT_EQ(second_goals.size(), 2u)
+      << "staging finished at " << second_staging_finished_at
+      << ", current simulation time " << second_node->now().seconds();
+  EXPECT_EQ(owners["central_aisle"], "amr_02");
+  ASSERT_FALSE(released.empty());
+  EXPECT_EQ(released[0].resource_id, "central_aisle");
+  EXPECT_EQ(released[0].mission_id, "first");
+  client->async_cancel_goal(first);
+  pump_both(10, true);
+  executor.remove_node(second_node);
+}
+TEST_F(LeasedCoordinatorTest, StationWaitNeverDispatchesTransferUntilGrant) {
+  create_resources();
+  auto handle = send();
+  pump(100);
+  EXPECT_TRUE(transfers.empty());
+  // A denied station lease must keep navigation at safe staging.
+  ASSERT_EQ(nav_handles.size(), 1u);
+  EXPECT_DOUBLE_EQ(nav_handles.front()->get_goal()->pose.pose.position.x, -3.8);
+  EXPECT_DOUBLE_EQ(nav_handles.front()->get_goal()->pose.pose.position.y, -1.0);
+  ASSERT_FALSE(acquired.empty());
+  EXPECT_EQ(acquired.front(), "assembly");
+  EXPECT_NE(std::find(feedback.begin(), feedback.end(), "WAITING_FOR_RESOURCE"),
+            feedback.end());
+  allow_station = true;
+  EXPECT_TRUE(finish(handle).result->success);
+  ASSERT_EQ(released.size(), 2u);
+  EXPECT_EQ(released[0].robot_id, "amr_01");
+  EXPECT_EQ(released[0].mission_id, "test");
+  EXPECT_EQ(released[0].lease_id, "central-random-token");
+}
+
+class DepartingCoordinatorTest : public LeasedCoordinatorTest {
+protected:
+  std::vector<std::string> dropoff_resources() const override {
+    return {"central_aisle"};
+  }
+};
+class QueuedDepartureCoordinatorTest : public DepartingCoordinatorTest {
+protected:
+  double resource_wait_timeout() const override { return 0.4; }
+};
+TEST_F(QueuedDepartureCoordinatorTest,
+       QueueTimeoutPreservesSourceStationAndOtherOwner) {
+  create_resources();
+  allow_station = true;
+  hold_transfer_station = "assembly";
+  auto handle = send();
+  for (int i = 0; i < 100 && !pending_transfer; ++i)
+    pump();
+  ASSERT_NE(pending_transfer, nullptr);
+  owners["central_aisle"] = "amr_02";
+  factory_interfaces::srv::TransferPart::Response response;
+  response.accepted = true;
+  transfer->send_response(*pending_transfer, response);
+  auto result = finish(handle);
+  EXPECT_EQ(result.result->error_code, "RESOURCE_WAIT_TIMEOUT");
+  EXPECT_EQ(result.result->final_state, "RECOVERY_REQUIRED");
+  EXPECT_EQ(owners["assembly"], "amr_01");
+  EXPECT_EQ(owners["central_aisle"], "amr_02");
+  EXPECT_EQ(nav_handles.size(), 2u);
+  EXPECT_TRUE(released.empty());
+}
+
+TEST_F(DepartingCoordinatorTest, TrafficGrantPrecedesStationDepartureAndClearsLast) {
+  create_resources();
+  allow_station = true;
+  hold_transfer_station = "assembly";
+  auto handle = send();
+  for (int i = 0; i < 100 && !pending_transfer; ++i)
+    pump();
+  ASSERT_NE(pending_transfer, nullptr);
+  ASSERT_EQ(nav_handles.size(), 2u);
+  owners["central_aisle"] = "amr_02";
+  hold_navigation = true;
+  factory_interfaces::srv::TransferPart::Response response;
+  response.accepted = true;
+  transfer->send_response(*pending_transfer, response);
+  pump(20, false);
+  EXPECT_EQ(nav_handles.size(), 2u);
+  EXPECT_EQ(owners["assembly"], "amr_01");
+  EXPECT_EQ(acquired.back(), "central_aisle");
+  owners.erase("central_aisle");
+  for (int i = 0; i < 200 && nav_handles.size() < 3; ++i)
+    pump(1, false);
+  ASSERT_EQ(nav_handles.size(), 3u);
+  EXPECT_EQ(owners["central_aisle"], "amr_01");
+  EXPECT_EQ(owners["assembly"], "amr_01");
+  nav_handles[2]->succeed(std::make_shared<Nav::Result>());
+  pump(10, false, false);
+  EXPECT_TRUE(released.empty());
+  for (int i = 0; i < 100 && nav_handles.size() < 4; ++i)
+    pump(1, false);
+  ASSERT_EQ(nav_handles.size(), 4u);
+  ASSERT_EQ(released.size(), 1u);
+  EXPECT_EQ(released[0].resource_id, "assembly");
+  EXPECT_EQ(released[0].mission_id, "test");
+  EXPECT_EQ(released[0].lease_id, "central-random-token");
+  EXPECT_EQ(owners["central_aisle"], "amr_01");
+  nav_handles[3]->succeed(std::make_shared<Nav::Result>());
+  for (int i = 0; i < 100 && nav_handles.size() < 5; ++i)
+    pump(1, false);
+  ASSERT_EQ(nav_handles.size(), 5u);
+  EXPECT_EQ(owners["central_aisle"], "amr_01");
+  EXPECT_DOUBLE_EQ(target.pose.position.x, 3.8);
+  EXPECT_DOUBLE_EQ(target.pose.position.y, -1.0);
+  nav_handles[4]->succeed(std::make_shared<Nav::Result>());
+  pump(10, false, false);
+  EXPECT_EQ(released.size(), 1u);
+  EXPECT_EQ(owners["central_aisle"], "amr_01");
+  for (int i = 0; i < 100 && nav_handles.size() < 6; ++i)
+    pump(1, false);
+  ASSERT_EQ(nav_handles.size(), 6u);
+  ASSERT_EQ(released.size(), 2u);
+  EXPECT_EQ(released[1].resource_id, "central_aisle");
+  EXPECT_EQ(released[1].mission_id, "test");
+  EXPECT_EQ(released[1].lease_id, "central-random-token");
+  EXPECT_EQ(owners["inspection"], "amr_01");
+  client->async_cancel_goal(handle);
+  finish(handle);
+}
+TEST_F(LeasedCoordinatorTest, CanceledUnconfirmedTransferRetainsStationLease) {
+  create_resources();
+  allow_station = true;
+  hold_transfer_station = "assembly";
+  auto handle = send();
+  for (int i = 0; i < 100 && !pending_transfer; ++i)
+    pump();
+  ASSERT_NE(pending_transfer, nullptr);
+  client->async_cancel_goal(handle);
+  pump(20);
+  EXPECT_TRUE(released.empty());
+  factory_interfaces::srv::TransferPart::Response response;
+  response.accepted = true;
+  transfer->send_response(*pending_transfer, response);
+  EXPECT_EQ(finish(handle).result->error_code, "MISSION_CANCELED");
+  // Completing the PLC transaction does not prove physical station exit.
+  EXPECT_TRUE(released.empty());
+  EXPECT_EQ(owners["assembly"], "amr_01");
+}
+
+TEST_F(LeasedCoordinatorTest, TransferRetainsStationUntilLocalizedExit) {
+  create_resources();
+  allow_station = true;
+  auto handle = send();
+  for (int i = 0; i < 100 && transfers.empty(); ++i)
+    pump();
+  ASSERT_EQ(transfers.size(), 1u);
+  hold_navigation = true;
+  for (int i = 0; i < 100 && nav_handles.size() < 3; ++i)
+    pump();
+  ASSERT_EQ(nav_handles.size(), 3u);
+  EXPECT_TRUE(released.empty());
+  EXPECT_EQ(owners["assembly"], "amr_01");
+  nav_handles.back()->succeed(std::make_shared<Nav::Result>());
+  pump(10, false, false);
+  EXPECT_TRUE(released.empty());
+  EXPECT_EQ(owners["assembly"], "amr_01");
+  pump(10, false, true);
+  ASSERT_FALSE(released.empty());
+  EXPECT_EQ(released.front().resource_id, "assembly");
+  EXPECT_EQ(released.front().mission_id, "test");
+  EXPECT_EQ(released.front().lease_id, "central-random-token");
+  client->async_cancel_goal(handle);
+  finish(handle);
+}
+
+TEST_F(LeasedCoordinatorTest, TwoRobotsWaitForVerifiedStationExitBeforeApproach) {
+  create_resources();
+  allow_station = true;
+  hold_transfer_station = "assembly";
+  auto first = send("first");
+  for (int i = 0; i < 100 && !pending_transfer; ++i)
+    pump();
+  ASSERT_NE(pending_transfer, nullptr);
+  hold_navigation = true;
+  auto second_node = std::make_shared<mission_coordinator::MissionCoordinatorNode>(
+      rclcpp::NodeOptions()
+          .arguments({"--ros-args", "-r", "__ns:=/amr_02"})
+          .parameter_overrides(
+              {{"use_sim_time", true},
+               {"robot_id", "amr_02"},
+               {"frame_prefix", "amr_02/"},
+               {"resource_leases_enabled", true},
+               {"stations.assembly.bounds", std::vector<double>{-3.5, 0.3, -2.5, 2.5}},
+               {"stations.inspection.bounds", std::vector<double>{2.5, 0.3, 3.5, 2.5}},
+               {"stations.assembly.staging_pose", std::vector<double>{-3.8, -1.0, 0}},
+               {"stations.inspection.staging_pose", std::vector<double>{3.8, -1.0, 0}},
+               {"stations.assembly.exit_pose", std::vector<double>{-3.8, -2.5, 0}},
+               {"stations.inspection.exit_pose", std::vector<double>{3.8, -2.5, 0}}}));
+  auto second_pose =
+      peer->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
+          "/amr_02/amcl_pose", rclcpp::SensorDataQoS());
+  auto second_refresh = peer->create_service<std_srvs::srv::Empty>(
+      "/amr_02/request_nomotion_update",
+      [](std::shared_ptr<std_srvs::srv::Empty::Request>,
+         std::shared_ptr<std_srvs::srv::Empty::Response>) {});
+  geometry_msgs::msg::PoseStamped second_target;
+  std::vector<std::shared_ptr<rclcpp_action::ServerGoalHandle<Nav>>> second_goals;
   auto second_nav = rclcpp_action::create_server<Nav>(
       peer, "/amr_02/navigate_to_pose",
       [](auto, auto) { return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE; },
@@ -433,56 +1309,119 @@ TEST_F(TrafficCoordinatorTest, TwoRobotContextsWaitUntilOwnerVerifiesExitAndRele
       pump(1, false, first_localized);
     }
   };
-  pump_both(100, false);
+  pump_both(100, true);
   ASSERT_EQ(second.wait_for(0s), std::future_status::ready);
-  ASSERT_NE(second.get(), nullptr);
-  EXPECT_EQ(second_goals.size(), 1u);
-  EXPECT_EQ(owners["central_aisle"], "amr_01");
-  nav_handles[1]->succeed(std::make_shared<Nav::Result>());
-  for (int i = 0; i < 200 && second_goals.size() < 2; ++i)
-    pump_both(1, true);
-  EXPECT_EQ(second_goals.size(), 2u);
-  EXPECT_EQ(owners["central_aisle"], "amr_02");
-  ASSERT_FALSE(released.empty());
-  EXPECT_EQ(released[0].resource_id, "central_aisle");
-  EXPECT_EQ(released[0].mission_id, "first");
-  client->async_cancel_goal(first);
-  pump_both(10, true);
-  executor.remove_node(second_node);
-}
-TEST_F(LeasedCoordinatorTest, StationWaitNeverDispatchesTransferUntilGrant) {
-  create_resources();
-  auto handle = send();
-  pump(100);
-  EXPECT_TRUE(transfers.empty());
-  ASSERT_FALSE(acquired.empty());
-  EXPECT_EQ(acquired.front(), "assembly");
-  EXPECT_NE(std::find(feedback.begin(), feedback.end(), "WAITING_FOR_RESOURCE"),
-            feedback.end());
-  allow_station = true;
-  EXPECT_TRUE(finish(handle).result->success);
-  ASSERT_EQ(released.size(), 2u);
-  EXPECT_EQ(released[0].robot_id, "amr_01");
-  EXPECT_EQ(released[0].mission_id, "test");
-  EXPECT_EQ(released[0].lease_id, "central-random-token");
-}
-TEST_F(LeasedCoordinatorTest, CanceledUnconfirmedTransferRetainsStationLease) {
-  create_resources();
-  allow_station = true;
-  hold_transfer_station = "assembly";
-  auto handle = send();
-  for (int i = 0; i < 100 && !pending_transfer; ++i)
-    pump();
-  ASSERT_NE(pending_transfer, nullptr);
-  client->async_cancel_goal(handle);
-  pump(20);
-  EXPECT_TRUE(released.empty());
+  auto second_handle = second.get();
+  ASSERT_NE(second_handle, nullptr);
+  ASSERT_EQ(second_goals.size(), 1u);
+  EXPECT_DOUBLE_EQ(second_target.pose.position.x, -3.8);
+  EXPECT_DOUBLE_EQ(second_target.pose.position.y, -1.0);
+  EXPECT_EQ(owners["assembly"], "amr_01");
+  EXPECT_EQ(transfers.size(), 1u);
   factory_interfaces::srv::TransferPart::Response response;
   response.accepted = true;
   transfer->send_response(*pending_transfer, response);
-  EXPECT_EQ(finish(handle).result->error_code, "MISSION_CANCELED");
+  for (int i = 0; i < 100 && nav_handles.size() < 3; ++i)
+    pump_both(1, true);
+  ASSERT_EQ(nav_handles.size(), 3u);
+  EXPECT_TRUE(released.empty());
+  nav_handles.back()->succeed(std::make_shared<Nav::Result>());
+  pump_both(10, false);
+  EXPECT_TRUE(released.empty());
+  EXPECT_EQ(owners["assembly"], "amr_01");
+  EXPECT_EQ(second_goals.size(), 1u);
+  for (int i = 0; i < 200 && second_goals.size() < 2; ++i)
+    pump_both(1, true);
+  ASSERT_EQ(second_goals.size(), 2u);
+  EXPECT_DOUBLE_EQ(second_target.pose.position.x, -3.0);
+  EXPECT_DOUBLE_EQ(second_target.pose.position.y, 0.8);
+  EXPECT_EQ(owners["assembly"], "amr_02");
   ASSERT_EQ(released.size(), 1u);
-  EXPECT_EQ(released[0].resource_id, "assembly");
+  EXPECT_EQ(released.front().resource_id, "assembly");
+  EXPECT_EQ(released.front().robot_id, "amr_01");
+  EXPECT_EQ(released.front().mission_id, "first");
+  EXPECT_EQ(released.front().lease_id, "central-random-token");
+  client->async_cancel_goal(first);
+  second_client->async_cancel_goal(second_handle);
+  pump_both(10, true);
+  executor.remove_node(second_node);
+}
+
+TEST_F(LeasedCoordinatorTest, FinalStationExitNeedsPoseBeforeCompletion) {
+  create_resources();
+  allow_station = true;
+  auto handle = send();
+  auto result = client->async_get_result(handle);
+  for (int i = 0; i < 200 && transfers.size() < 2; ++i)
+    pump();
+  ASSERT_EQ(transfers.size(), 2u);
+  hold_navigation = true;
+  for (int i = 0; i < 100 && nav_handles.size() < 6; ++i)
+    pump();
+  EXPECT_EQ(result.wait_for(0s), std::future_status::timeout);
+  EXPECT_EQ(owners["inspection"], "amr_01");
+  ASSERT_EQ(released.size(), 1u);
+  EXPECT_EQ(released.front().resource_id, "assembly");
+  ASSERT_EQ(nav_handles.size(), 6u);
+  nav_handles.back()->succeed(std::make_shared<Nav::Result>());
+  pump(10, false, false);
+  EXPECT_EQ(result.wait_for(0s), std::future_status::timeout);
+  EXPECT_EQ(owners["inspection"], "amr_01");
+  EXPECT_EQ(released.size(), 1u);
+  for (int i = 0; i < 100 && result.wait_for(0s) != std::future_status::ready; ++i)
+    pump(1, false, true);
+  ASSERT_EQ(result.wait_for(0s), std::future_status::ready);
+  EXPECT_TRUE(result.get().result->success);
+  ASSERT_EQ(released.size(), 2u);
+  EXPECT_EQ(released.back().resource_id, "inspection");
+  EXPECT_EQ(released.back().lease_id, "central-random-token");
+}
+TEST_F(LeasedCoordinatorTest, StaleFinalParkingPoseCannotReleaseStation) {
+  create_resources();
+  allow_station = true;
+  auto handle = send();
+  auto result = client->async_get_result(handle);
+  for (int i = 0; i < 200 && transfers.size() < 2; ++i)
+    pump();
+  ASSERT_EQ(transfers.size(), 2u);
+  hold_navigation = true;
+  for (int i = 0; i < 100 && nav_handles.size() < 6; ++i)
+    pump();
+  ASSERT_EQ(nav_handles.size(), 6u);
+  pump(3, false);
+  publish_pose = false;
+  pump(32, false);
+  nav_handles.back()->succeed(std::make_shared<Nav::Result>());
+  pump(3, false);
+  EXPECT_EQ(owners["inspection"], "amr_01");
+  EXPECT_EQ(released.size(), 1u);
+  EXPECT_EQ(result.wait_for(0s), std::future_status::timeout);
+  publish_pose = true;
+  for (int i = 0; i < 100 && result.wait_for(0s) != std::future_status::ready; ++i)
+    pump(1, false);
+  ASSERT_EQ(result.wait_for(0s), std::future_status::ready);
+  EXPECT_TRUE(result.get().result->success);
+}
+
+TEST_F(LeasedCoordinatorTest, CanceledFinalStationExitRetainsQuarantine) {
+  create_resources();
+  allow_station = true;
+  auto handle = send();
+  for (int i = 0; i < 200 && transfers.size() < 2; ++i)
+    pump();
+  ASSERT_EQ(transfers.size(), 2u);
+  hold_navigation = true;
+  for (int i = 0; i < 100 && nav_handles.size() < 6; ++i)
+    pump();
+  ASSERT_EQ(nav_handles.size(), 6u);
+  client->async_cancel_goal(handle);
+  auto result = finish(handle);
+  EXPECT_EQ(result.code, rclcpp_action::ResultCode::CANCELED);
+  EXPECT_EQ(result.result->final_state, "RECOVERY_REQUIRED");
+  EXPECT_EQ(owners["inspection"], "amr_01");
+  EXPECT_EQ(std::count(states.begin(), states.end(), "COMPLETED"), 0);
+  ASSERT_EQ(released.size(), 1u);
+  EXPECT_EQ(released.front().resource_id, "assembly");
 }
 TEST_F(LeasedCoordinatorTest, ConfirmedWaiterCancellationFinishesWithoutRecovery) {
   create_resources();
@@ -508,6 +1447,119 @@ TEST_F(LeasedCoordinatorTest, QuarantinedWaiterCancellationReportsRecovery) {
   EXPECT_EQ(finish(handle).result->final_state, "RECOVERY_REQUIRED");
   EXPECT_TRUE(transfers.empty());
   EXPECT_TRUE(released.empty());
+}
+
+TEST_F(LeasedCoordinatorTest, RejectsWaitPoseOnTrafficWaypoint) {
+  auto options =
+      rclcpp::NodeOptions()
+          .arguments({"--ros-args", "-r", "__ns:=/amr_03"})
+          .parameter_overrides(
+              {{"robot_id", "amr_03"},
+               {"resource_leases_enabled", true},
+               {"stations.assembly.bounds", std::vector<double>{-3.5, 0.3, -2.5, 2.5}},
+               {"stations.inspection.bounds", std::vector<double>{2.5, 0.3, 3.5, 2.5}},
+               {"stations.assembly.staging_pose", std::vector<double>{-1.5, -2.2, 0}},
+               {"stations.inspection.staging_pose", std::vector<double>{3.8, -1.0, 0}},
+               {"stations.assembly.exit_pose", std::vector<double>{-3.8, -2.5, 0}},
+               {"stations.inspection.exit_pose", std::vector<double>{3.8, -2.5, 0}},
+               {"routes.to_assembly.resources",
+                std::vector<std::string>{"central_aisle"}},
+               {"routes.to_assembly.central_aisle.staging_pose",
+                std::vector<double>{-1.5, -2.2, 0}},
+               {"routes.to_assembly.central_aisle.exit_pose",
+                std::vector<double>{1.5, -2.2, 0}},
+               {"routes.to_assembly.central_aisle.bounds",
+                std::vector<double>{-0.8, -2.65, 0.8, -1.75}}});
+  EXPECT_THROW(std::make_shared<mission_coordinator::MissionCoordinatorNode>(options),
+               std::invalid_argument);
+  const auto base_parameters = options.parameter_overrides();
+  for (const auto &invalid : std::vector<std::pair<std::vector<double>, double>>{
+           {{-2.0, -2.2, 0}, 0.5}, // Equality: exactly 0.5 m from the waypoint.
+           {{}, 0.6},              // An explicit waiting pose is mandatory.
+           {{-3.8, -1.0, 0}, 0.0}}) {
+    auto parameters = base_parameters;
+    for (auto &parameter : parameters)
+      if (parameter.get_name() == "stations.assembly.staging_pose")
+        parameter = rclcpp::Parameter(parameter.get_name(), invalid.first);
+    parameters.emplace_back("stations.clearance_distance", invalid.second);
+    options.parameter_overrides(parameters);
+    EXPECT_THROW(std::make_shared<mission_coordinator::MissionCoordinatorNode>(options),
+                 std::invalid_argument);
+  }
+  auto parameters = base_parameters;
+  for (auto &parameter : parameters)
+    if (parameter.get_name() == "stations.assembly.staging_pose")
+      parameter =
+          rclcpp::Parameter(parameter.get_name(), std::vector<double>{-2.3, -2.2, 0});
+  parameters.emplace_back("stations.clearance_distance", 0.60);
+  options.parameter_overrides(parameters);
+  EXPECT_NO_THROW(
+      std::make_shared<mission_coordinator::MissionCoordinatorNode>(options));
+}
+TEST_F(LeasedCoordinatorTest, RequiresIndependentParkingOutsideTrafficPath) {
+  const std::vector<rclcpp::Parameter> base{
+      {"robot_id", "amr_03"},
+      {"resource_leases_enabled", true},
+      {"stations.clearance_distance", 0.5},
+      {"stations.assembly.bounds", std::vector<double>{-3.5, 0.3, -2.5, 2.5}},
+      {"stations.inspection.bounds", std::vector<double>{2.5, 0.3, 3.5, 2.5}},
+      {"stations.assembly.staging_pose", std::vector<double>{-3.8, -1.0, 0}},
+      {"stations.inspection.staging_pose", std::vector<double>{3.8, -1.0, 0}},
+      {"stations.assembly.exit_pose", std::vector<double>{-3.2, -2.2, 0}},
+      {"stations.inspection.exit_pose", std::vector<double>{3.2, -2.2, 0}},
+      {"routes.to_assembly.resources", std::vector<std::string>{"central_aisle"}},
+      {"routes.to_assembly.central_aisle.staging_pose",
+       std::vector<double>{-1.5, -2.2, 0}},
+      {"routes.to_assembly.central_aisle.exit_pose", std::vector<double>{1.5, -2.2, 0}},
+      {"routes.to_assembly.central_aisle.bounds",
+       std::vector<double>{-0.8, -2.65, 0.8, -1.75}}};
+  auto options = rclcpp::NodeOptions().arguments({"--ros-args", "-r", "__ns:=/amr_03"});
+  options.parameter_overrides(base);
+  EXPECT_NO_THROW(
+      std::make_shared<mission_coordinator::MissionCoordinatorNode>(options));
+  for (const auto &invalid : std::vector<std::vector<double>>{{},
+                                                              {-1.5, -2.2, 0},
+                                                              {-2.0, -2.2, 0},
+                                                              {-3.8, -1.0, 0},
+                                                              {-3.0, 0.8, 0},
+                                                              {3.2, -3.5, 0}}) {
+    auto parameters = base;
+    for (auto &parameter : parameters)
+      if (parameter.get_name() == "stations.assembly.exit_pose")
+        parameter = rclcpp::Parameter(parameter.get_name(), invalid);
+    options.parameter_overrides(parameters);
+    EXPECT_THROW(std::make_shared<mission_coordinator::MissionCoordinatorNode>(options),
+                 std::invalid_argument);
+  }
+  auto parameters = base;
+  for (auto &parameter : parameters)
+    if (parameter.get_name() == "stations.assembly.staging_pose")
+      parameter =
+          rclcpp::Parameter(parameter.get_name(), std::vector<double>{0, -2.2, 0});
+  options.parameter_overrides(parameters);
+  EXPECT_THROW(std::make_shared<mission_coordinator::MissionCoordinatorNode>(options),
+               std::invalid_argument);
+  for (auto &parameter : parameters)
+    if (parameter.get_name() == "stations.assembly.staging_pose")
+      parameter =
+          rclcpp::Parameter(parameter.get_name(), std::vector<double>{3.8, -3.5, 0});
+  options.parameter_overrides(parameters);
+  EXPECT_THROW(std::make_shared<mission_coordinator::MissionCoordinatorNode>(options),
+               std::invalid_argument);
+  parameters = base;
+  for (auto &parameter : parameters)
+    if (parameter.get_name() == "routes.to_assembly.resources")
+      parameter = rclcpp::Parameter(parameter.get_name(),
+                                    std::vector<std::string>{"central_aisle", "other"});
+  parameters.emplace_back("routes.to_assembly.other.staging_pose",
+                          std::vector<double>{4.3, -2.2, 0});
+  parameters.emplace_back("routes.to_assembly.other.exit_pose",
+                          std::vector<double>{6.7, -2.2, 0});
+  parameters.emplace_back("routes.to_assembly.other.bounds",
+                          std::vector<double>{5.0, -2.65, 6.0, -1.75});
+  options.parameter_overrides(parameters);
+  EXPECT_THROW(std::make_shared<mission_coordinator::MissionCoordinatorNode>(options),
+               std::invalid_argument);
 }
 
 TEST_F(CoordinatorTest, ValidMissionCompletesWithOrderedFeedbackAndPhases) {
@@ -553,6 +1605,52 @@ TEST_F(CoordinatorTest, ValidMissionCompletesWithOrderedFeedbackAndPhases) {
                           [](auto e) { return e.event == "mission_finished"; }),
             1);
 }
+
+class ShutdownCoordinatorTest : public CoordinatorTest {
+protected:
+  ShutdownCoordinatorTest() : CoordinatorTest(private_context()) {}
+  static rclcpp::Context::SharedPtr private_context() {
+    auto context = std::make_shared<rclcpp::Context>();
+    rclcpp::InitOptions options;
+    options.auto_initialize_logging(false);
+    context->init(0, nullptr, options);
+    return context;
+  }
+};
+
+TEST_F(ShutdownCoordinatorTest, ShutdownWithActiveGoalDoesNotPublishRemovedResult) {
+  hold_navigation = true;
+  ASSERT_TRUE(send("shutdown-active"));
+  for (int i = 0; i < 100 && nav_handles.empty(); ++i)
+    pump();
+  ASSERT_EQ(nav_handles.size(), 1u);
+  ASSERT_TRUE(transfers.empty());
+  executor.remove_node(coordinator);
+  ASSERT_TRUE(context_->shutdown("active mission regression"));
+  // The real action handle destructor must not publish through an invalid
+  // server when shutdown leaves this mission unfinished.
+  coordinator.reset();
+  nav.reset();
+  nav_handles.clear();
+}
+
+TEST_F(ShutdownCoordinatorTest, LateTransferAfterShutdownCannotCompleteMission) {
+  coordinator->failure = DispatchBoundaryNode::Failure::Deferred;
+  auto handle = send("shutdown-transfer");
+  ASSERT_TRUE(handle);
+  for (int i = 0; i < 200 && !coordinator->pending_callback; ++i)
+    pump();
+  ASSERT_TRUE(coordinator->pending_callback);
+  executor.remove_node(coordinator);
+  ASSERT_TRUE(context_->shutdown("late transfer regression"));
+  std::promise<std::shared_ptr<factory_interfaces::srv::TransferPart::Response>>
+      response;
+  auto value = std::make_shared<factory_interfaces::srv::TransferPart::Response>();
+  value->accepted = true;
+  response.set_value(value);
+  EXPECT_NO_THROW(coordinator->pending_callback(response.get_future().share()));
+  coordinator.reset();
+}
 TEST_F(CoordinatorTest, RejectsInvalidAndBusyGoals) {
   EXPECT_EQ(send("missing_robot", ""), nullptr);
   EXPECT_EQ(send("bad", "other"), nullptr);
@@ -595,7 +1693,9 @@ TEST_F(CoordinatorTest, TwoProductionStacksExposeDistinctRobotLocalEndpoints) {
   auto second = std::make_shared<mission_coordinator::MissionCoordinatorNode>(
       rclcpp::NodeOptions()
           .arguments({"--ros-args", "-r", "__ns:=/amr_02"})
-          .parameter_overrides({{"robot_id", "amr_02"}, {"frame_prefix", "amr_02/"}}));
+          .parameter_overrides({{"robot_id", "amr_02"},
+                                {"frame_prefix", "amr_02/"},
+                                {"resource_leases_enabled", false}}));
   executor.add_node(second);
   pump(30);
   for (const std::string robot : {"amr_01", "amr_02"}) {
@@ -620,10 +1720,18 @@ TEST_F(CoordinatorTest, TwoProductionStacksExposeDistinctRobotLocalEndpoints) {
     }
     EXPECT_EQ(clients.count("/factory/transfer_part"), 1u);
   }
-  EXPECT_THROW(coordinator->set_parameter({"robot_id", "amr_02"}),
-               rclcpp::exceptions::ParameterImmutableException);
-  EXPECT_THROW(coordinator->set_parameter({"frame_prefix", "amr_02/"}),
-               rclcpp::exceptions::ParameterImmutableException);
+  // Humble rejects read-only writes through SetParametersResult. Undeclaration
+  // is the separate operation that raises ParameterImmutableException.
+  for (const auto &parameter : {rclcpp::Parameter("robot_id", "amr_02"),
+                                rclcpp::Parameter("frame_prefix", "amr_02/")}) {
+    EXPECT_TRUE(coordinator->describe_parameter(parameter.get_name()).read_only);
+    const auto result = coordinator->set_parameter(parameter);
+    EXPECT_FALSE(result.successful) << result.reason;
+    EXPECT_THROW(coordinator->undeclare_parameter(parameter.get_name()),
+                 rclcpp::exceptions::ParameterImmutableException);
+  }
+  EXPECT_EQ(coordinator->get_parameter("robot_id").as_string(), "amr_01");
+  EXPECT_EQ(coordinator->get_parameter("frame_prefix").as_string(), "amr_01/");
   executor.remove_node(second);
 }
 
@@ -830,6 +1938,34 @@ TEST_F(CoordinatorTest, SecondNavigationFailureIsTerminal) {
   EXPECT_EQ(result.code, rclcpp_action::ResultCode::ABORTED);
   EXPECT_EQ(result.result->error_code, "NAVIGATION_FAILED");
   EXPECT_TRUE(transfers.empty());
+}
+TEST_F(CoordinatorTest, NavigationDiagnosticsCorrelateAcceptedAndResultIdentities) {
+  EXPECT_TRUE(finish(send("navigation-identities")).result->success);
+  ASSERT_EQ(nav_handles.size(), 2u);
+  std::vector<std::string> accepted, results;
+  for (const auto &entry : events) {
+    if (entry.event == "navigation_action_accepted")
+      accepted.push_back(entry.detail);
+    if (entry.event == "navigation_action_result")
+      results.push_back(entry.detail);
+  }
+  ASSERT_EQ(accepted.size(), 2u);
+  ASSERT_EQ(results.size(), 2u);
+  for (size_t i = 0; i < nav_handles.size(); ++i) {
+    std::ostringstream uuid;
+    for (const auto byte : nav_handles[i]->get_goal_id())
+      uuid << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(byte);
+    const auto identity = "\"uuid\":\"" + uuid.str() + "\"";
+    EXPECT_NE(accepted[i].find(identity), std::string::npos);
+    EXPECT_NE(results[i].find(identity), std::string::npos);
+    EXPECT_NE(accepted[i].find("\"accepted\":true"), std::string::npos);
+    EXPECT_NE(results[i].find("\"matched\":true"), std::string::npos);
+    EXPECT_NE(results[i].find("\"code\":4"), std::string::npos);
+    const auto generation = "\"generation\":" + std::to_string(i + 1);
+    EXPECT_NE(accepted[i].find(generation), std::string::npos);
+    EXPECT_NE(results[i].find(generation), std::string::npos);
+  }
+  EXPECT_NE(accepted[0], accepted[1]);
 }
 TEST_F(CoordinatorTest, FaultForAnotherMissionNeverRejectsNavigationAndResetRemovesIt) {
   configure_fault("nav_reject_twice", "other");

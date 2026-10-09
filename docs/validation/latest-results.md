@@ -1,11 +1,142 @@
 # Measured validation results
 
+The fleet simulation evidence below is from 8 October 2026. Final local gates
+are measured on 9 October; the historical Version 1 sections retain their
+3 October source boundaries and do not establish fleet verification.
+See the [fleet quick start](../../README.md#fleet-quick-start) and
+[fleet operations](../fleet-operations.md) for commands, artifact anatomy and
+the distinction between physical simulation and synthetic DDS scaling proof.
+
+## Fleet evidence: 8 October 2026
+
+The ordinary, unmodified-middleware command
+`scripts/run_fleet_acceptance.sh --headless --scenario all --timeout 900`
+passes from one frozen Task 16 source tree. Its retained, ignored artifact
+directory is `artifacts/fleet/20261008T130900Z-acceptance-wjqmyunu`.
+Private receipts retain exact lease identities; public state and screenshots
+publish no lease credentials. The run predates a later, isolated Version 1
+endpoint compatibility repair. That repair selects root mission and Nav2
+endpoints only when the existing explicit legacy flags are true; the normal
+fleet endpoint strings remain unchanged and real DDS isolation tests verify
+that boundary. The fleet receipt and media therefore remain applicable to
+normal fleet behavior, but they are not a byte-identical source receipt for
+the final commit. The final-tree CI and Version 1 checks below verify the
+later compatibility branches separately. A subsequent shared contact-process
+shutdown guard handles only the exact native WaitSet error after ROS context
+invalidation; contact, geometry and freshness behavior are unchanged. Its
+active-context and unrelated-error regressions, complete simulation package
+and actual Version 1 clean-child receipt verify that shutdown-only change.
+
+| Scenario | Observed proof | Case wall seconds |
+| --- | --- | --- |
+| Nominal | Two automatic missions select distinct eligible robots deterministically and deliver both payloads; 1,099 actual-world samples | 236.245 |
+| Contention | Original pinned `amr_01` payload remains compatible; both robots complete under exact capacity-one lease and physical-occupancy checks; 1,130 world samples | 242.833 |
+| Robot failure | Pre-pickup reassignment is blocked until stop and exact clearance proof; post-pickup mission remains `RECOVERY_REQUIRED` with its carrier | Bounded DDS probe |
+| Charging | Initially low robot reaches 80% with independent simulated contact while its peer delivers; peer then drops below 30%, receives a distinct later dock lease, reaches 80% and exits; 1,163 world samples | 249.979 |
+| Ten agents | Ten synthetic DDS agents register, heartbeat, cost, schedule and complete ten bounded missions without changing production configuration or code | 1.353 |
+
+Each physical scenario observes 18 active namespaced Nav2 lifecycle nodes.
+Every scenario's 42 launch children exits zero, its launch wrapper exits zero,
+owned process groups clear without escalation, and owned PLC and broker cleanup
+passes. Failure and scale probes also leave no owned process group.
+The physical overlap threshold remains twice the configured robot radius,
+0.30 m, with only the documented numerical tolerance. Static waypoint and
+holding-bay validation retains its separate conservative 0.60 m clearance.
+These samples are simulation evidence, not a physical safety certification or
+continuous-time collision proof.
+
+One contention startup log reports FastDDS
+`failed to send response to /amr_02/smoother_server/get_state (timeout)`.
+The lifecycle readiness gate subsequently passes; all mission evidence and child
+exits pass. Charging shutdown also records an upstream
+`rclpy.task.Future.__del__` `KeyboardInterrupt` after the fleet manager has
+already exited zero. Both diagnostics are retained, not suppressed. Neither
+causes missing evidence, nonzero child status or surviving processes. No
+middleware profile, timeout extension or weakened assertion is used.
+
+### Current fleet media provenance
+
+The supported visible `DISPLAY=:0 scripts/run_fleet_demo.sh` passes charging
+and a fresh-world nominal scenario in
+`artifacts/fleet/20261008T132337Z-demo-2hb6spye`. Charging takes 249.352 wall
+seconds with 1,161 world samples; nominal takes 234.648 wall seconds with
+1,084 samples. Both scenarios retain their receipts and clean child exits.
+
+The [fleet GIF](../assets/two-robot-fleet.gif) uses only the charging scenario's
+owned native Gazebo window: 1,840 source frames at 1920 × 950 and 10 frames/s
+over 184 wall seconds. The recorder ends when the owned window closes, leaving
+a retained X11 end-of-window diagnostic; its valid MP4 exits zero. The published
+GIF selects 460 real frames, crops and scales the world view, adds descriptive
+labels, and plays at 4× wall speed. It is 1200 × 658, 46 seconds and 1,089,043
+bytes. There is no interpolation, generated image or fabricated robot motion.
+The inspected source and GIF frames show an empty pickup robot, orange motor
+riding that robot, motor arriving on inspection, and the peer on the charging
+pad. The far lower-right departure is partly outside the original camera view;
+the numeric clearance and exit proof comes from the separate world-pose audit.
+
+The [dashboard screenshot](../assets/fleet-dashboard.png) is an unmodified
+full-page browser capture from the final headless charging run. It shows
+`amr_01` loaded at 30% and `amr_02` charging at 67%, with their actual resource
+ownership and mission. Full-page inspection confirms readable identities,
+no clipped page content and no raw lease credentials. The dashboard is a
+read-only observer; its pixels do not replace physical simulation assertions.
+
+The fresh complete CI, unrestricted Gazebo package checks and Version 1
+restart/scenario matrix are separate gates. Their counts come from their own
+fresh result roots, not from historical aggregates or the receipts above.
+No new hosted workflow result is claimed for the fleet source.
+
 The evidence uses real Gazebo rendering, Nav2/AMCL, ROS 2 DDS, Mosquitto, and a
 deterministic Modbus TCP PLC simulator. A test's total wall time includes setup,
 assertions, and cleanup. Mission duration instead comes from the correlated
 `mission_started` and `mission_finished` source timestamps in simulation time.
 
-## Current local verification
+## Final Task 16 local gates: 9 October 2026
+
+The final `scripts/run_ci_checks.sh` exits zero from a frozen runtime, test
+and script tree. A retained SHA-256 manifest matches before and after the run.
+Its unique root is `artifacts/ci/20261009T033003Z-run.MJ3aZg`; subsequent stages
+source only that root's fresh install. The table is a measured receipt, not a
+claim about a future hosted workflow or independent review. This receipt prose
+is added after the run and checked separately; no runtime, test or script is
+changed after the frozen gate.
+
+| Command or gate | Observed result |
+| --- | --- |
+| Fresh CI build and serial package tests | All 12 packages build in 55.1 wall seconds and test in 4 minutes |
+| Explicit `colcon test-result --verbose --test-result-base artifacts/ci/20261009T033003Z-run.MJ3aZg/test-results` | 1,608 records; zero errors, failures or skips |
+| CI pure / contract and schema / bounded fleet stages | 297 passed in 220.50 seconds / 63 passed / 30 passed in 22.97 seconds |
+| Real Chrome dashboard | Desktop and 360 px mobile layout, live transitions, stale/reconnect handling, fresh snapshot and credential redaction pass without console or network exceptions |
+| Real protocol and DDS integration | 95 passed in 67.88 seconds, including the complete protocol-fault suite |
+| Complete repository `.venv/bin/python3 -m pytest -q tests` | 395 passed in 534.98 seconds; zero failures, errors or skips |
+| Current Version 1 `scripts/run_all_scenarios.sh` | 12/12 expected outcomes, 73/73 trace predicates and 12/12 verified owned cleanups; root `reports/20261009T112506-cb66baeb7b89` |
+| Complete affected simulation package | 50 passed, including real Gazebo topics and navigation; two inherited Xacro warnings |
+| Focused actual Version 1 success and cleanup | All physical, transfer, duplicate and restart assertions pass; 25/25 launch children exit zero, wrapper exits 130 and owned services/processes disappear |
+
+CI intentionally excludes the explicit rendered Gazebo package checks described
+in the README. The earlier unrestricted package run has its own fresh root,
+`artifacts/ci/20261008T140635Z-full.fqpltn`: all 12 packages and 1,610 records
+pass with zero errors, failures or skips. That run predates the isolated legacy
+endpoint and shutdown-only repairs described above; it is not relabeled as a
+byte-identical final-tree run. The final CI includes all affected agent and
+fleet packages, real legacy-root/normal-namespace isolation, and the 23-case
+restart matrix. Current real Version 1 physical cases and the complete affected
+simulation package verify the later compatibility and shutdown changes.
+
+The repository suite and Version 1 matrix use the explicit fresh unrestricted
+install rather than the checkout's older `install/`. The subsequent CI-only
+change selects serial package scheduling and is verified by its real runner
+contract in final CI. Package-local tests remain isolated under colcon; they
+are not merged into one incompatible pytest import namespace. These categories
+overlap and must not be added as distinct tests. Historical failing XML and
+diagnostic artifacts remain retained, not removed to make an aggregate green.
+Independent final review and a new hosted run remain separate, unobserved gates.
+
+## Current local verification — historical Version 1 (3 October 2026)
+
+This section retains the original Version 1 receipt and its historical use of
+"current". Its revisions, counts and timings are not the final fleet results.
+Use the 9 October Task 16 table above for the final exact-tree local gates.
 
 The verified development source is revision
 `6b4f300f64cbd22270f69722278df0d083904340`, checked on 3 October 2026 from a

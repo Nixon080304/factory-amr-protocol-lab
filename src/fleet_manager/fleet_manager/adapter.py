@@ -10,6 +10,7 @@ FleetCore on their creating thread.
 from dataclasses import dataclass, field, replace
 from functools import wraps
 import math
+import re
 import queue
 import secrets
 import sqlite3
@@ -78,6 +79,7 @@ class _Flight:
     handle: object = None
     cancelling: bool = False
     retired: bool = False
+    lost_wall_ns: int | None = None
 
 
 def robot_endpoints(robot):
@@ -152,6 +154,7 @@ class FleetAdapter:
         *,
         clock=time.monotonic,
         reconciliation_timeout=5.0,
+        diagnostic=None,
     ):
         self.config, self.journal, self.transport, self.clock = (
             config,
@@ -169,6 +172,7 @@ class FleetAdapter:
             journal,
         )
         self._callbacks = queue.SimpleQueue()
+        self.diagnostic = diagnostic
         self._rounds = {}
         self._retry_at = {}
         self._path_pending_since = {}
@@ -186,6 +190,51 @@ class FleetAdapter:
         self._source_times = {}
         self._contacts = {}
         self._resource_clearances = []
+
+    def diagnose_dock(self, event, charge, **fields):
+        """Read-only action evidence, never authority or journal state."""
+        self._diagnose(
+            event, robot_id=charge.robot_id, generation=charge.generation, **fields
+        )
+
+    def diagnose_cost(self, event, robot_id, mission_id, **fields):
+        """Observe a cost transition without changing its scheduling result."""
+        self._diagnose(event, robot_id=robot_id, mission_id=mission_id, **fields)
+
+    def _diagnose(self, event, **fields):
+        if self.diagnostic is None:
+            return
+        try:
+            rows = self.resources.observer_snapshot() or ()
+            tokens = []
+            for row in rows:
+                for lease in (row.lease, *row.former_leases):
+                    if lease is not None:
+                        tokens.extend((lease.lease_id, lease.mission_id))
+
+            def clean(value, message=False):
+                if isinstance(value, str):
+                    for token in tokens:
+                        if token:
+                            value = value.replace(token, "[redacted]")
+                    if message:
+                        value = re.sub(r"[A-Za-z0-9_-]{16,}", "[redacted]", value)
+                    return value[:256]
+                if isinstance(value, float) and not math.isfinite(value):
+                    return None
+                return value
+
+            self.diagnostic(
+                dict(
+                    event=event,
+                    **{
+                        name: clean(value, name in ("message", "reason"))
+                        for name, value in fields.items()
+                    },
+                )
+            )
+        except Exception:
+            pass
 
     def _reconcile_startup(self, now):
         if self.state != "RECONCILING":
@@ -442,6 +491,22 @@ class FleetAdapter:
                 )
                 snapshot = replace(snapshot, mode=mode)
         self.registry.observe(snapshot, now)
+        if (
+            source_time_ns is not None
+            and robot_is_ready(snapshot)
+            and snapshot.payload_state == "EMPTY"
+            and not snapshot.mission_id
+        ):
+            for mission_id, flight in tuple(self._flights.items()):
+                if (
+                    flight.robot_id == snapshot.robot_id
+                    and flight.lost_wall_ns is not None
+                    and source_time_ns > flight.lost_wall_ns
+                ):
+                    # The coordinator's fresh AVAILABLE/EMPTY observation is a
+                    # restart-generation stop proof. Physical claims still need
+                    # exact outside-resource clearance before FleetCore assigns.
+                    del self._flights[mission_id]
         self._startup_observed.add(snapshot.robot_id)
         if snapshot.pose is not None:
             self._dock_seen.add(snapshot.robot_id)
@@ -569,7 +634,8 @@ class FleetAdapter:
                 for mission_id, flight in tuple(self._flights.items()):
                     if flight.robot_id == robot.robot_id:
                         flight.retired = True
-                        del self._flights[mission_id]
+                        if flight.lost_wall_ns is None:
+                            flight.lost_wall_ns = time.time_ns()
                 charge = self._dock_flights.get(robot.robot_id)
                 if charge is not None:
                     self.core.charging_result(
@@ -599,14 +665,43 @@ class FleetAdapter:
                 # Reserving all queued robots still fences mission assignment.
                 self._start_charging(charge)
             previous[charge.dock_id] = charge
-        for record in self.journal.load_active():
+        active = self.journal.load_active()
+        automatic_round = next(
+            (
+                record.request.mission_id
+                for record in active
+                if record.request.requested_robot_id is None
+                and record.request.mission_id in self._rounds
+            ),
+            None,
+        )
+        for record in active:
             if record.state not in (MissionState.QUEUED, MissionState.REASSIGNING):
                 continue
             mission_id = record.request.mission_id
+            if mission_id in self._flights:
+                # Offline work keeps its old action fence until a terminal DDS
+                # reply or fresh post-loss stopped observation proves retirement.
+                continue
+            automatic = record.request.requested_robot_id is None
+            if automatic and automatic_round not in (None, mission_id):
+                # Cost callbacks may finish in any order. Only one automatic
+                # round can reserve, in durable first-event acceptance order.
+                # A head without a decision yields during its existing backoff.
+                continue
             round_ = self._rounds.get(mission_id)
             if round_ is not None:
                 if not round_.pending or now >= round_.deadline:
+                    for robot_id in sorted(round_.pending):
+                        self.diagnose_cost(
+                            "fleet_cost_timeout",
+                            robot_id,
+                            mission_id,
+                            deadline=round_.deadline,
+                        )
                     self._close_round(mission_id)
+                    if automatic:
+                        automatic_round = None
                     reserved = {flight.robot_id for flight in self._flights.values()}
                     estimates = {
                         robot_id: estimate
@@ -614,6 +709,13 @@ class FleetAdapter:
                         if robot_id not in reserved
                     }
                     decision = self.core.assign(mission_id, estimates, now)
+                    self.diagnose_cost(
+                        "fleet_cost_decision",
+                        decision.robot_id or record.request.requested_robot_id or "",
+                        mission_id,
+                        assigned=decision.robot_id is not None,
+                        reason=decision.reason,
+                    )
                     if decision.robot_id is None:
                         if record.request.requested_robot_id:
                             pin = record.request.requested_robot_id
@@ -671,6 +773,8 @@ class FleetAdapter:
             ]
             round_ = _Round(now + 1.0, set(candidates))
             self._rounds[mission_id] = round_
+            if automatic:
+                automatic_round = mission_id
             for robot_id in candidates:
 
                 def callback(
@@ -724,6 +828,17 @@ class FleetAdapter:
             if handle is not None:
                 self.transport.cancel(handle, lambda _: None)
             return
+        if not getattr(flight, "dock_acceptance_reported", False):
+            flight.dock_acceptance_reported = True
+            self.diagnose_dock(
+                "fleet_dock_acceptance",
+                charge,
+                accepted=handle is not None and not bool(error),
+                message=error,
+                mapped_state="RECOVERY_REQUIRED"
+                if error or handle is None
+                else "PENDING",
+            )
         if error or handle is None:
             self.core.charging_result(charge.robot_id, charge.generation, False)
             flight.retired = True
@@ -737,6 +852,18 @@ class FleetAdapter:
     def _dock_result(self, charge, flight, reply):
         if not self._dock_current(charge, flight):
             return
+        self.diagnose_dock(
+            "fleet_dock_result",
+            charge,
+            success=reply.success,
+            error_code=reply.error_code,
+            message=reply.message,
+            mapped_state="COMPLETED"
+            if reply.success
+            else "CANCELLED"
+            if reply.error_code == "CANCELLED"
+            else "RECOVERY_REQUIRED",
+        )
         # Terminal dock success is emitted only after verified exit and release.
         self.core.charging_result(
             charge.robot_id,
@@ -753,6 +880,24 @@ class FleetAdapter:
         if self._rounds.get(mission_id) is not round_ or received_at >= round_.deadline:
             return  # A response after timeout belongs to an obsolete round.
         round_.pending.discard(robot_id)
+        reason = None
+        try:
+            if estimate is None:
+                reason = "no estimate returned"
+            elif not estimate.feasible:
+                reason = estimate.reason or "cost infeasible"
+            elif not math.isfinite(estimate.path_cost) or estimate.path_cost < 0:
+                reason = "invalid path cost"
+            elif not EnergyPolicy(self.config.energy).mission_is_safe(estimate):
+                reason = "predicted battery below reserve or invalid"
+        except Exception:
+            # The dispatcher may discard this candidate after a concurrent
+            # reservation. Observational inspection must not fail first.
+            reason = "unreadable estimate"
+        if reason is not None:
+            self.diagnose_cost(
+                "fleet_cost_candidate_rejected", robot_id, mission_id, reason=reason
+            )
         if estimate is not None:
             round_.estimates[robot_id] = estimate
 
@@ -840,6 +985,11 @@ class FleetAdapter:
             self._emit(record, feedback.state, feedback.detail, feedback.progress)
 
     def _result(self, mission_id, flight, reply):
+        if self._flights.get(mission_id) is flight and flight.lost_wall_ns is not None:
+            # Exact old-assignment completion permits retiring its local handle,
+            # never completing the reassigned mission or clearing physical claims.
+            del self._flights[mission_id]
+            return
         if not self._current(mission_id, flight):
             return
         record = self.core.record_robot_result(
@@ -1014,9 +1164,13 @@ class FleetAdapter:
                 response.update(lease_id="", current_owner="")
             return response
         if operation == "release":
-            released = self.resources.release(
-                LeaseKey(*identity, request.lease_id), now
-            )
+            key = LeaseKey(*identity, request.lease_id)
+            released = self.resources.release(key, now)
+            if released:
+                # Persist this exact release together with the promoted waiter
+                # snapshot. The query-only journal proves an atomic A-to-B
+                # handoff without exposing authority tokens to public traces.
+                self._resource_clearances.append(key)
             return {
                 "released": released,
                 "reason": "released" if released else "lease mismatch",

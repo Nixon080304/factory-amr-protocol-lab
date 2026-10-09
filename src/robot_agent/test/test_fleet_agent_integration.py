@@ -76,11 +76,11 @@ def integrated(tmp_path):
     journal.close()
 
 
-def complete(planner):
-    index = 0
+def complete(planner, index=0):
     while index < len(planner.calls):
         planner.finish(index, 5)
         index += 1
+    return index
 
 
 def test_pinned_cold_cache_waits_for_bounded_paths_then_dispatches(integrated):
@@ -98,20 +98,44 @@ def test_pinned_cold_cache_waits_for_bounded_paths_then_dispatches(integrated):
 
 
 def test_mixed_routes_each_reach_execution_without_cache_starvation(integrated):
-    fleet, journal, transport, _, planners, wall, observe = integrated
+    fleet, journal, transport, agents, planners, wall, observe = integrated
+    started = wall[0]
     fleet.submit(MissionRequest("forward", "assembly", "inspection", "motor"))
     fleet.submit(MissionRequest("reverse", "inspection", "assembly", "motor"))
     fleet.tick()
     fleet.tick()
-    for planner in planners.values():
-        complete(planner)
+    finished = {robot_id: complete(planner) for robot_id, planner in planners.items()}
     wall[0] += 1.01
     observe()
     fleet.tick()
     fleet.tick()
+    # Automatic cost rounds now follow durable FIFO order. The later route's
+    # cache expires during its original bounded retry, so finish only newly
+    # created external planner requests rather than replaying old callbacks.
+    while len(transport.goals) < 2 and wall[0] - started < 4.0:
+        fleet.tick()
+        for robot_id, planner in planners.items():
+            finished[robot_id] = complete(planner, finished[robot_id])
+        fleet.tick()
+        if len(transport.goals) < 2:
+            wall[0] += 0.25
+            for agent in agents.values():
+                # A running robot publishes stationary odometry while waiting.
+                # Do not fabricate healthy fleet state over stale agent input.
+                assert agent.odometry(wall[0], 0, 0, agent.frame_prefix + "odom")
+                assert agent.localization(wall[0], 0, 0, 0, agent.frame_prefix + "map")
+            observe()
+    assert wall[0] - started < 4.0, "mixed routes must not starve under FIFO retries"
     assert len(transport.goals) == 2
     assert {g.request.mission_id for g in transport.goals} == {"forward", "reverse"}
     assert {journal.get(m).state for m in ("forward", "reverse")} == {"ASSIGNED"}
+    # Each agent plans both two-leg routes; only the later selected agent needs
+    # one fresh two-leg retry. More calls would hide cache churn or starvation.
+    assert [len(planners[robot].calls) for robot in sorted(planners)] == [4, 6]
+    fleet.tick()
+    fleet.tick()
+    assert len(transport.goals) == 2
+    assert sum(len(planner.calls) for planner in planners.values()) == 10
 
 
 def test_pinned_permanent_pending_has_firm_deadline(integrated):

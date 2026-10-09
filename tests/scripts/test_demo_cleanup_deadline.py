@@ -425,11 +425,96 @@ def descendants(pid):
     for child in children:
         try:
             record = identity(int(child))
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
+            # A stat file opened before exit can report ESRCH when read after
+            # the parent reaps the process, rather than ENOENT during open.
             continue
         records.append(record)
         records.extend(descendants(record["pid"]))
     return records
+
+
+def verify_wrapper_startup_setsid(previous, record, inner):
+    """Validate a wrapper observed before Popen completes its real setsid."""
+    assert previous["pid"] == record["pid"]
+    assert previous["start_ticks"] == record["start_ticks"]
+    assert previous["parent"] == inner["pid"]
+    assert (
+        previous["group"]
+        == previous["session"]
+        == inner["group"]
+        == inner["session"]
+        == inner["pid"]
+    )
+    assert record["group"] == record["session"] == record["pid"]
+    assert record["parent"] in (inner["pid"], os.getpid())
+
+
+def test_descendants_handles_exit_after_stat_open(monkeypatch):
+    process = subprocess.Popen(["sleep", "300"], start_new_session=True)
+    stat_path = Path(f"/proc/{process.pid}/stat")
+    original_open = Path.open
+    observed = []
+
+    def open_then_reap(path, *args, **kwargs):
+        handle = original_open(path, *args, **kwargs)
+        if path == stat_path:
+            observed.append(process.pid)
+            process.kill()
+            process.wait(timeout=5)
+        return handle
+
+    monkeypatch.setattr(Path, "open", open_then_reap)
+    try:
+        records = descendants(os.getpid())
+        assert observed == [process.pid]
+        assert all(record["pid"] != process.pid for record in records)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+
+@pytest.mark.parametrize(
+    "invalid_field", [None, "pid", "start_ticks", "group", "session", "parent"]
+)
+def test_wrapper_startup_setsid_preserves_exact_owned_identity(invalid_field):
+    script = (
+        "import json, os, runpy\n"
+        f"identity = runpy.run_path({str(Path(__file__).resolve())!r})['identity']\n"
+        "inner = identity(os.getpid())\n"
+        "pid = os.fork()\n"
+        "if pid == 0:\n"
+        " before = identity(os.getpid())\n"
+        " os.setsid()\n"
+        " after = identity(os.getpid())\n"
+        " print(json.dumps(dict(inner=inner, before=before, after=after)), flush=True)\n"
+        " os._exit(0)\n"
+        "os.waitpid(pid, 0)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        start_new_session=True,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=5,
+    )
+    transition = json.loads(result.stdout)
+    before, after, inner = (transition[key] for key in ("before", "after", "inner"))
+    if invalid_field is None:
+        verify_wrapper_startup_setsid(before, after, inner)
+    else:
+        invalid_values = dict(
+            pid=after["pid"] + 1,
+            start_ticks=str(int(after["start_ticks"]) + 1),
+            group=inner["pid"],
+            session=inner["pid"],
+            parent=0,
+        )
+        invalid = dict(after, **{invalid_field: invalid_values[invalid_field]})
+        with pytest.raises(AssertionError):
+            verify_wrapper_startup_setsid(before, invalid, inner)
 
 
 def setsid_adapter(directory, arguments):
@@ -599,20 +684,30 @@ def guard_safety(directory, controlled=False, fault=False):
                             inner.pid,
                             sentinel.pid,
                         )
-                        wrapper_pid = initial_parents[record["pid"]]
-                        assert wrapper_pid in captured
-                        assert initial_parents[wrapper_pid] == inner.pid
-                        assert previous["group"] == previous["session"] == wrapper_pid
-                        assert record["group"] == record["session"] == record["pid"]
-                        assert record["parent"] in (wrapper_pid, os.getpid())
-                        if controlled:
-                            transition = json.loads(
-                                (directory / "adapter-after.json").read_text()
+                        if initial_parents[record["pid"]] == inner.pid:
+                            verify_wrapper_startup_setsid(previous, record, inner_owner)
+                        else:
+                            wrapper_pid = initial_parents[record["pid"]]
+                            assert wrapper_pid in captured
+                            assert initial_parents[wrapper_pid] == inner.pid
+                            assert (
+                                previous["group"] == previous["session"] == wrapper_pid
                             )
-                            assert all(
-                                transition[key] == record[key]
-                                for key in ("pid", "start_ticks", "group", "session")
-                            )
+                            assert record["group"] == record["session"] == record["pid"]
+                            assert record["parent"] in (wrapper_pid, os.getpid())
+                            if controlled:
+                                transition = json.loads(
+                                    (directory / "adapter-after.json").read_text()
+                                )
+                                assert all(
+                                    transition[key] == record[key]
+                                    for key in (
+                                        "pid",
+                                        "start_ticks",
+                                        "group",
+                                        "session",
+                                    )
+                                )
                         emit("verified_startup_setsid", before=previous, after=record)
                 assert record["group"] != os.getpgrp()
                 captured[record["pid"]] = record

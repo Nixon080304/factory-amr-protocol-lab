@@ -1,6 +1,8 @@
 """MQTT adapter real ROS exchanges; only the broker transport is replaced."""
 
 import json
+import os
+import queue
 import threading
 import time
 
@@ -372,7 +374,7 @@ class Broker:
 @pytest.fixture
 def rig(request):
     context = Context()
-    rclpy.init(context=context, domain_id=77)
+    rclpy.init(context=context, domain_id=int(os.environ.get("ROS_DOMAIN_ID", "77")))
     broker = Broker()
     node = MqttGatewayNode(mqtt_client=broker, context=context)
     peer = rclpy.create_node("mqtt_action_peer", context=context)
@@ -667,7 +669,7 @@ def test_inflight_duplicate_never_overlaps_acceptance_phase(rig):
 @pytest.mark.parametrize(
     "changes",
     [
-        {"part": "gear"},
+        {"part": "unsupported"},
         {"pickup": "inspection"},
         {"dropoff": "assembly"},
         {"robot_id": "not_configured"},
@@ -709,6 +711,31 @@ def test_known_id_conflicts_precede_configuration_validation(rig, changes):
             for s in statuses(broker)
         )
     )
+    assert node.registry.state_for("M-001") == saved
+
+
+def test_supported_gear_conflicts_with_known_id_and_executes_for_new_id(rig):
+    broker, node, executed, _, wait, _ = rig
+    request(broker)
+    wait(lambda: any(s["state"] == "COMPLETED" for s in statuses(broker)))
+    saved = node.registry.state_for("M-001")
+    request(broker, part="gear")
+    wait(
+        lambda: any(s["error_code"] == "MISSION_ID_CONFLICT" for s in statuses(broker))
+    )
+    assert node.registry.state_for("M-001") == saved
+    assert len(executed) == 1
+    request(broker, "new-gear", part="gear")
+    wait(
+        lambda: any(
+            s["mission_id"] == "new-gear" and s["state"] == "COMPLETED"
+            for s in statuses(broker)
+        )
+    )
+    assert [(goal.mission_id, goal.part) for goal in executed] == [
+        ("M-001", "motor"),
+        ("new-gear", "gear"),
+    ]
     assert node.registry.state_for("M-001") == saved
 
 
@@ -848,7 +875,25 @@ def test_destroyed_result_client_finishes_acceptance_exactly_once(rig):
     node.timer.cancel()
     request(broker, "result-transport")
     node._drain()
-    wait(lambda: not node.completions.empty())
+    held_completions = []
+
+    def acceptance_queued():
+        # Feedback can precede the goal response. Hold both in original order
+        # until the actual accepted response reaches the adapter boundary.
+        while True:
+            try:
+                held_completions.append(node.completions.get_nowait())
+            except queue.Empty:
+                break
+        return any(kind == "accepted" for kind, _, _ in held_completions)
+
+    wait(acceptance_queued)
+    acceptance = next(
+        future for kind, _, future in held_completions if kind == "accepted"
+    )
+    assert acceptance.result().accepted
+    for completion in held_completions:
+        node.completions.put(completion)
     node.action.destroy()
     node._drain()
     # Restore an owned real client for normal node teardown and executor polling.
@@ -870,4 +915,7 @@ def test_destroyed_result_client_finishes_acceptance_exactly_once(rig):
     ]
     assert statuses(broker)[0]["state"] == "RECEIVED"
     assert statuses(broker)[-1]["state"] == "FAILED"
+    assert (
+        len([s for s in statuses(broker) if s["state"] in ("COMPLETED", "FAILED")]) == 1
+    )
     peer.destroy_subscription(subscription)

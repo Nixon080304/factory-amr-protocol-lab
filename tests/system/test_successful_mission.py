@@ -66,6 +66,8 @@ def yaw(quaternion):
 
 
 def test_successful_factory_mission():
+    from legacy_readiness import manager_ready
+
     assert (ROOT / "scripts/run_demo.sh").is_file(), "full demo script missing"
     assert (ROOT / "src/factory_bringup/launch/demo.launch.py").is_file(), (
         "full bringup missing"
@@ -76,7 +78,7 @@ def test_successful_factory_mission():
     from factory_interfaces.msg import ProtocolEvent, StationDetection
     import cv2
     from cv_bridge import CvBridge
-    from factory_simulation.entity_probe import get_entity_pose
+    from factory_simulation.entity_probe import get_entity_pose, WorldPoseProbe
     from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
     from lifecycle_msgs.srv import GetState
     import rclpy
@@ -103,9 +105,11 @@ def test_successful_factory_mission():
     )
     output.mkdir(parents=True, exist_ok=True)
     ports = set()
-    while len(ports) < 3:
+    while len(ports) < 4:
         ports.add(free_port())
-    broker_port, plc_port, gazebo_port = ports
+    broker_port, plc_port, gazebo_port, dashboard_port = ports
+    journal_path = output / "fleet.sqlite3"
+    assert not journal_path.exists(), "system test must own a fresh fleet journal"
     environment = {
         **os.environ,
         "FACTORY_ROS_DOMAIN_ID": os.environ["ROS_DOMAIN_ID"],
@@ -115,6 +119,8 @@ def test_successful_factory_mission():
         "FACTORY_COMPOSE_PROJECT": "factory-system-" + uuid.uuid4().hex,
         "GAZEBO_MASTER_URI": f"http://127.0.0.1:{gazebo_port}",
         "FACTORY_OUTPUT_DIR": str(output),
+        "FACTORY_DASHBOARD_PORT": str(dashboard_port),
+        "FACTORY_JOURNAL_PATH": str(journal_path),
         "DISPLAY": os.environ.get("DISPLAY", ":0"),
     }
     preexisting_containers = set(
@@ -137,7 +143,7 @@ def test_successful_factory_mission():
 
     def on_connect(client, userdata, flags, reason, properties):
         client.subscribe("factory/missions/+/status", qos=1)
-        client.subscribe("factory/robots/amr_01/availability", qos=1)
+        client.subscribe("factory/fleet/availability", qos=1)
 
     def on_message(client, userdata, message):
         if message.topic.endswith("/status"):
@@ -250,7 +256,7 @@ def test_successful_factory_mission():
         record_owned_resource(
             "compose_projects", environment["FACTORY_COMPOSE_PROJECT"]
         )
-        for port in (broker_port, plc_port, gazebo_port):
+        for port in (broker_port, plc_port, gazebo_port, dashboard_port):
             record_owned_resource("ports", port)
     process = subprocess.Popen(
         [str(ROOT / "scripts/run_demo.sh"), "--headless"],
@@ -315,7 +321,13 @@ def test_successful_factory_mission():
         assert connected, f"broker missing; log={output / 'demo.log'}"
         client.loop_start()
         wait(
-            lambda: "online" in availability and poses and images and payloads,
+            lambda: (
+                "online" in availability
+                and poses
+                and images
+                and payloads
+                and manager_ready(dashboard_port, output / "startup-snapshot.json")
+            ),
             75,
             "full system readiness missing",
         )
@@ -552,6 +564,7 @@ def test_successful_factory_mission():
             detail = json.loads(transfer[0].detail)
             assert detail == {
                 "station_id": station,
+                "part": "motor",
                 "transfer_kind": "LOADING" if leg == "pickup" else "UNLOADING",
                 "cycle_counter": 1,
             }
@@ -578,16 +591,28 @@ def test_successful_factory_mission():
             registers[1] == 1 and not coils[1] and not coils[2]
             for registers, coils in after
         )
-        # Let the final conveyor animation settle and verify independent world poses.
-        wait(
-            lambda: (
-                node.get_clock().now().nanoseconds / 1e9 > stamp(events[-1].stamp) + 1.5
-            ),
-            5,
-            "settling clock",
-        )
-        robot = get_entity_pose(node, "factory_amr")
-        part = get_entity_pose(node, "factory_part")
+        # Logical completion precedes bounded asynchronous conveyor animation.
+        # Require observed placement, not an assumed minimum animation time.
+        settling_deadline = min(deadline, time.monotonic() + 5.0)
+        part = None
+        world_probe = WorldPoseProbe(node)
+        try:
+
+            def payload_placed():
+                nonlocal part
+                remaining = settling_deadline - time.monotonic()
+                assert remaining > 0, "5 s independent placement deadline"
+                # A missing response fails here; never replace a timed-out call.
+                part = world_probe.pose("factory_part", timeout_sec=min(1.0, remaining))
+                return (
+                    math.hypot(part.position.x - 3, part.position.y - 2) < 0.01
+                    and abs(part.position.z - 0.65) < 0.01
+                )
+
+            wait(payload_placed, 5, "independent final payload placement")
+            robot = world_probe.pose("factory_amr", timeout_sec=1.0)
+        finally:
+            world_probe.close()
         assert math.hypot(part.position.x - 3, part.position.y - 2) < 0.01
         assert abs(part.position.z - 0.65) < 0.01
         final = {}
@@ -676,7 +701,15 @@ def test_successful_factory_mission():
             "consumed payload did not require restart",
         )
         refused = [item for item in statuses if item["mission_id"] == "M-002"]
-        assert [item["state"] for item in refused] == ["RECEIVED", "FAILED"], refused
+        refused_states = []
+        for item in refused:
+            state = item["state"]
+            # Bounded cost backoff can repeat queued progress, not acceptance,
+            # assignment or terminal outcomes. Never hide those duplicates.
+            if state == "QUEUED" and refused_states[-1:] == ["QUEUED"]:
+                continue
+            refused_states.append(state)
+        assert refused_states == ["RECEIVED", "QUEUED", "ASSIGNED", "FAILED"], refused
         assert refused[-1]["error_code"] == "RESTART_REQUIRED"
         wait(
             lambda: any(

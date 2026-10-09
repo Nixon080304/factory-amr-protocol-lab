@@ -445,7 +445,8 @@ class MissionJournal:
     def load_active(self) -> tuple[MissionRecord, ...]:
         rows = self._connection.execute(
             "SELECT * FROM missions WHERE state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED') "
-            "ORDER BY created_at, mission_id"
+            "ORDER BY (SELECT MIN(sequence) FROM mission_events "
+            "WHERE mission_events.mission_id = missions.mission_id), created_at, mission_id"
         ).fetchall()
         return tuple(_record(row) for row in rows)
 

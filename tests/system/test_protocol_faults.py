@@ -37,7 +37,7 @@ for package in (
 ):
     sys.path.insert(0, str(ROOT / "src" / package))
 
-from factory_interfaces.action import ExecuteFactoryMission
+from factory_interfaces.action import ExecuteFleetMission
 from factory_interfaces.msg import FaultCommand, ProtocolEvent
 from factory_interfaces.srv import SetFault, TransferPart
 from fault_injector.node import FaultInjectorNode
@@ -244,51 +244,56 @@ def rig():
 
         def execute(handle):
             executed.append(handle.request.mission_id)
+            robot_id = handle.request.requested_robot_id
+            assert robot_id == "amr_01"
             handle.publish_feedback(
-                ExecuteFactoryMission.Feedback(state="LOADING", station="assembly")
+                ExecuteFleetMission.Feedback(
+                    state="LOADING", assigned_robot_id=robot_id
+                )
             )
             assert release.wait(timeout=6)
             future = transfer.call_async(
                 TransferPart.Request(
                     mission_id=handle.request.mission_id,
-                    robot_id=handle.request.robot_id,
-                    station_id="assembly",
-                    part="motor",
+                    robot_id=robot_id,
+                    station_id=handle.request.pickup_station,
+                    part=handle.request.part,
                 )
             )
             wait(future.done)
             response = future.result()
             if response.accepted:
                 handle.publish_feedback(
-                    ExecuteFactoryMission.Feedback(
-                        state="NAVIGATING_TO_DROPOFF", station="inspection"
+                    ExecuteFleetMission.Feedback(
+                        state="NAVIGATING_TO_DROPOFF", assigned_robot_id=robot_id
                     )
                 )
                 handle.publish_feedback(
-                    ExecuteFactoryMission.Feedback(
-                        state="UNLOADING", station="inspection"
+                    ExecuteFleetMission.Feedback(
+                        state="UNLOADING", assigned_robot_id=robot_id
                     )
                 )
                 future = transfer.call_async(
                     TransferPart.Request(
                         mission_id=handle.request.mission_id,
-                        robot_id=handle.request.robot_id,
-                        station_id="inspection",
-                        part="motor",
+                        robot_id=robot_id,
+                        station_id=handle.request.dropoff_station,
+                        part=handle.request.part,
                     )
                 )
                 wait(future.done)
                 response = future.result()
             if response.accepted:
                 handle.succeed()
-                result = ExecuteFactoryMission.Result(
-                    success=True, final_state="COMPLETED"
+                result = ExecuteFleetMission.Result(
+                    success=True, final_state="COMPLETED", assigned_robot_id=robot_id
                 )
             else:
                 handle.abort()
-                result = ExecuteFactoryMission.Result(
+                result = ExecuteFleetMission.Result(
                     success=False,
                     final_state="FAILED",
+                    assigned_robot_id=robot_id,
                     # The navigation driver preserves the coordinator's public
                     # error meaning; service suffixes describe physical outcome.
                     error_code=response.error_code.removesuffix(
@@ -301,8 +306,8 @@ def rig():
 
         server = ActionServer(
             peer,
-            ExecuteFactoryMission,
-            "/factory/execute_mission",
+            ExecuteFleetMission,
+            "/factory/execute_fleet_mission",
             execute,
             callback_group=group,
         )
@@ -332,7 +337,7 @@ def rig():
         def configure(
             name,
             mission="M-fault",
-            station="assembly",
+            station=None,
             activation=None,
             duration=1.0,
             **extra,
@@ -340,7 +345,9 @@ def rig():
             values = dict(
                 name=name,
                 mission_id=mission,
-                station=station,
+                station=station
+                if station is not None or name == "mqtt_disconnect"
+                else "assembly",
                 activation_point=activation
                 or ("request" if name.startswith("mqtt_") else "transfer_start"),
                 duration=duration,
@@ -428,7 +435,13 @@ def test_modbus_fault_outcome_cleanup_and_trace(rig, name, error):
     if name == "modbus_delay":
         retries = [e for e in rig["events"] if e.event == "retry"]
         assert len(retries) == 1 and retries[0].mission_id == "M-fault"
-        assert json.loads(retries[0].detail) == {"attempt": 1, "delay_sec": 0.5}
+        assert retries[0].robot_id == "amr_01"
+        assert json.loads(retries[0].detail) == {
+            "attempt": 1,
+            "delay_sec": 0.5,
+            "station_id": "assembly",
+            "part": "motor",
+        }
     wait(
         lambda: any(
             e.event == "fault_reset" and e.mission_id == "M-fault"
@@ -571,7 +584,9 @@ def test_control_listener_disabled_by_default_and_shutdown_closes_pending_client
 
 def test_set_and_reset_fail_without_owning_gateway_acknowledgements():
     context = Context()
-    rclpy.init(context=context, domain_id=90)
+    rclpy.init(
+        context=context, domain_id=int(os.environ.get("FACTORY_SCENARIO_DOMAIN", "90"))
+    )
     control = FaultInjectorNode(
         context=context, parameter_overrides=[Parameter("ack_timeout_sec", value=0.1)]
     )
@@ -609,7 +624,9 @@ def test_set_and_reset_fail_without_owning_gateway_acknowledgements():
 @pytest.mark.parametrize("delay,accepted", [(0.04, True), (0.25, False)])
 def test_bounded_acknowledgements_on_single_thread_executor(delay, accepted):
     context = Context()
-    rclpy.init(context=context, domain_id=90)
+    rclpy.init(
+        context=context, domain_id=int(os.environ.get("FACTORY_SCENARIO_DOMAIN", "90"))
+    )
     control = FaultInjectorNode(
         context=context, parameter_overrides=[Parameter("ack_timeout_sec", value=0.12)]
     )
@@ -645,6 +662,9 @@ def test_bounded_acknowledgements_on_single_thread_executor(delay, accepted):
                             command_id=message.command_id,
                             acknowledged=True,
                             owner=owner,
+                            mission_id=message.mission_id,
+                            robot_id=message.robot_id,
+                            station=message.station,
                         )
                     )
                 pending.remove((deadline, message))
@@ -713,7 +733,9 @@ def test_inspection_target_keeps_pickup_safe_then_fails_dropoff(rig):
 
 def test_owned_executor_drains_queued_handlers_before_node_destruction():
     context = Context()
-    rclpy.init(context=context, domain_id=90)
+    rclpy.init(
+        context=context, domain_id=int(os.environ.get("FACTORY_SCENARIO_DOMAIN", "90"))
+    )
     node = rclpy.create_node("queued_shutdown_probe", context=context)
     publisher = node.create_publisher(ProtocolEvent, "/factory/protocol_events", 10)
     executor = MultiThreadedExecutor(num_threads=1, context=context)
@@ -781,15 +803,15 @@ def test_disconnect_reset_waits_for_broker_subscription(rig, recover_before_dead
         paused = True
         future = rig["reset"].call_async(Trigger.Request())
         if recover_before_deadline:
-            wait(
-                lambda: (
-                    future.done()
-                    or any(
-                        owners == {"mqtt_gateway"}
-                        for _, owners, _ in rig["control"]._pending.values()
+
+            def reset_waits_only_for_mqtt():
+                with rig["control"]._lock:
+                    return any(
+                        owners == {("mqtt_gateway", "")}
+                        for _, owners, _, _ in rig["control"]._pending.values()
                     )
-                )
-            )
+
+            wait(lambda: future.done() or reset_waits_only_for_mqtt())
             assert not future.done(), (
                 "reset acknowledged before request subscription restored"
             )

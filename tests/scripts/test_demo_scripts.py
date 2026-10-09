@@ -13,6 +13,167 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 
 
+@pytest.mark.parametrize("kind", ["relative", "missing", "unreadable", "empty"])
+def test_demo_rejects_invalid_explicit_install_before_services(tmp_path, kind):
+    setup = tmp_path / "setup.bash"
+    setup.write_text("export DEMO_SELECTED_INSTALL=unexpected\n")
+    value = str(setup)
+    if kind == "relative":
+        value = "install/setup.bash"
+    elif kind == "missing":
+        value = str(tmp_path / "missing.bash")
+    elif kind == "unreadable":
+        setup.chmod(0)
+        assert not os.access(setup, os.R_OK)
+    else:
+        value = ""
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("FACTORY_")
+    }
+    environment["FACTORY_INSTALL_SETUP"] = value
+    result = subprocess.run(
+        [str(ROOT / "scripts/run_demo.sh"), "--invalid-option"],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == 2
+    assert "FACTORY_INSTALL_SETUP requires an absolute readable setup file" in (
+        result.stderr
+    )
+    assert "Usage:" not in result.stderr
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_demo_sources_exact_install_and_builds_only_default(tmp_path, explicit):
+    # Execute the production install-selection block without starting Docker or
+    # robots. Only the external build command is intercepted; source is real.
+    script = (ROOT / "scripts/run_demo.sh").read_text()
+    block = (
+        "# Incremental colcon builds changed inputs."
+        + script.split("# Incremental colcon builds changed inputs.", 1)[1].split(
+            '\nmkdir -p "$project_root/artifacts"', 1
+        )[0]
+    )
+    default = tmp_path / "install/setup.bash"
+    default.parent.mkdir()
+    default.write_text("export DEMO_SELECTED_INSTALL=default\n")
+    fresh = tmp_path / "fresh install/setup.bash"
+    fresh.parent.mkdir()
+    fresh.write_text("export DEMO_SELECTED_INSTALL=fresh\n")
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in ("FACTORY_INSTALL_SETUP", "DEMO_SELECTED_INSTALL")
+    }
+    if explicit:
+        environment["FACTORY_INSTALL_SETUP"] = str(fresh)
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'set -eu; colcon() { printf "BUILD:%s\\n" "$*"; }; '
+            + block
+            + '\nprintf "INSTALL:%s\\n" "$DEMO_SELECTED_INSTALL"',
+        ],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == (
+        ["INSTALL:fresh"]
+        if explicit
+        else ["BUILD:build --symlink-install", "INSTALL:default"]
+    )
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("FACTORY_DASHBOARD_PORT", "0"),
+        ("FACTORY_DASHBOARD_PORT", "65536"),
+        ("FACTORY_DASHBOARD_PORT", "wrong"),
+        ("FACTORY_JOURNAL_PATH", "relative.sqlite3"),
+        ("FACTORY_JOURNAL_PATH", ""),
+    ],
+)
+def test_demo_rejects_invalid_owned_observer_options(name, value):
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("FACTORY_")
+    }
+    environment[name] = value
+    result = subprocess.run(
+        [str(ROOT / "scripts/run_demo.sh"), "--invalid-option"],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == 2
+    assert name in result.stderr
+    assert "Usage:" not in result.stderr
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_demo_forwards_exact_owned_observer_options(tmp_path, explicit):
+    script = (ROOT / "scripts/run_demo.sh").read_text()
+    # Execute the real launch argument boundary without external ROS processes.
+    block = script.split("setsid ros2 launch factory_bringup demo.launch.py", 1)
+    assert len(block) == 2
+    prefix = block[0].split("# Demo launch arguments\n")
+    assert len(prefix) == 2, "owned observer launch argument selection is missing"
+    launch = (
+        prefix[1]
+        + "setsid ros2 launch factory_bringup demo.launch.py"
+        + block[1].split("\nlaunch_pid=$!", 1)[0]
+        + "\nwait"
+    )
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in ("FACTORY_DASHBOARD_PORT", "FACTORY_JOURNAL_PATH")
+    }
+    journal = str(tmp_path / "fresh journal.sqlite3")
+    if explicit:
+        environment.update(FACTORY_DASHBOARD_PORT="31701", FACTORY_JOURNAL_PATH=journal)
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            "set -eu; gui=false; rviz=false; FACTORY_MQTT_PORT=1883; "
+            "FACTORY_PLC_PORT=1502; output_dir=/tmp/evidence; "
+            'setsid() { printf "%s\\n" "$@"; }; ' + launch,
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        "ros2",
+        "launch",
+        "factory_bringup",
+        "demo.launch.py",
+        "gui:=false",
+        "rviz:=false",
+        "broker_port:=1883",
+        "plc_port:=1502",
+        "output_dir:=/tmp/evidence",
+        *(["dashboard_port:=31701", f"journal_path:={journal}"] if explicit else []),
+    ]
+
+
 @pytest.mark.parametrize(
     "name,value,error",
     [

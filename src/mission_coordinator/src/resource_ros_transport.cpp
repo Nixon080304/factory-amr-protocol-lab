@@ -55,7 +55,11 @@ public:
     switch (operation) {
     case ResourceOperation::Acquire:
       return dispatch<Acquire>(acquire, key, callback, [](const auto &r) {
-        return ResourceReply{r.granted, r.lease_id, r.lease_ttl_sec, r.reason};
+        const bool waiting =
+            !r.granted && r.lease_id.empty() && r.lease_ttl_sec == 0 &&
+            (r.reason == "queued" || r.reason == "reconciliation required");
+        return ResourceReply{r.granted, r.lease_id, r.lease_ttl_sec, r.reason,
+                             false,     false,      waiting};
       });
     case ResourceOperation::Renew:
       return dispatch<Renew>(renew, key, callback, [](const auto &r) {

@@ -15,6 +15,52 @@ from fleet_manager.models import CostEstimate, MissionRequest, RobotSnapshot
 from fake_robot_agent import FakeRobots
 
 
+@pytest.mark.parametrize(
+    "shutdown, message, handled",
+    [
+        (
+            True,
+            "Unable to convert call argument to Python object (compile in debug mode for details)",
+            True,
+        ),
+        (
+            False,
+            "Unable to convert call argument to Python object (compile in debug mode for details)",
+            False,
+        ),
+        (True, "unexpected callback failure", False),
+    ],
+)
+def test_manual_take_shutdown_race_preserves_unrelated_errors(
+    shutdown, message, handled
+):
+    from types import SimpleNamespace
+    from fleet_manager.node import FleetManagerNode
+    from std_msgs.msg import Bool
+
+    live = [True]
+    host = object.__new__(FleetManagerNode)
+    host._context = SimpleNamespace(ok=lambda: live[0])
+
+    class Handle:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def take_message(self, *args):
+            live[0] = not shutdown
+            raise RuntimeError(message)
+
+    subscription = SimpleNamespace(handle=Handle())
+    if handled:
+        assert host._take_message(subscription, Bool) is None
+    else:
+        with pytest.raises(RuntimeError, match=message.split(" (")[0]):
+            host._take_message(subscription, Bool)
+
+
 def adapter_api():
     try:
         return importlib.import_module("fleet_manager.adapter")
@@ -78,6 +124,98 @@ def test_real_ros_legacy_fleet_constructor_has_one_matching_robot(tmp_path):
         context.shutdown()
 
 
+@pytest.mark.parametrize("legacy", [False, True])
+def test_real_legacy_dispatch_uses_root_action_without_changing_fleet_isolation(
+    tmp_path, legacy
+):
+    import time
+    import rclpy
+    from factory_interfaces.action import ExecuteFactoryMission
+    from rclpy.action import ActionServer
+    from rclpy.context import Context
+    from rclpy.executors import SingleThreadedExecutor
+    from rclpy.parameter import Parameter
+    from fleet_manager.node import FleetManagerNode
+
+    context = Context()
+    rclpy.init(context=context, domain_id=79)
+    manager, peer, server = None, None, None
+    executor = SingleThreadedExecutor(context=context)
+    goals, accepted, replies = [], [], []
+
+    def execute(handle):
+        goals.append(handle.request)
+        handle.succeed()
+        return ExecuteFactoryMission.Result(success=True, final_state="COMPLETED")
+
+    try:
+        peer = rclpy.create_node("legacy_root_peer", context=context)
+        server = ActionServer(
+            peer, ExecuteFactoryMission, "/factory/execute_mission", execute
+        )
+        manager = FleetManagerNode(
+            context=context,
+            parameter_overrides=[
+                Parameter(
+                    "fleet_file",
+                    value=str(
+                        Path(__file__).resolve().parents[2]
+                        / "factory_bringup/config/fleet.yaml"
+                    ),
+                ),
+                Parameter("journal_path", value=str(tmp_path / "fleet.sqlite3")),
+                Parameter("legacy_single_robot", value=legacy),
+            ],
+        )
+        executor.add_node(peer)
+        executor.add_node(manager)
+        until = time.monotonic() + 2
+        while time.monotonic() < until:
+            executor.spin_once(timeout_sec=0.02)
+        robot = manager.adapter.config.robots[0]
+        if not legacy:
+            assert len(manager.actions) == 2
+            assert all(
+                not client.server_is_ready() for client in manager.actions.values()
+            ), "a root V1 server must not satisfy normal robot-local clients"
+            assert (
+                len({client._action_name for client in manager.actions.values()}) == 2
+            )
+        else:
+            assert manager.actions[robot.robot_id].server_is_ready(), (
+                "legacy_single_robot must resolve its actual root coordinator action"
+            )
+            assert (
+                manager.costs[robot.robot_id].srv_name
+                == robot.namespace.rstrip("/") + "/factory/estimate_mission_cost"
+            )
+            manager.send_goal(
+                robot.robot_id,
+                request("legacy"),
+                lambda _: None,
+                replies.append,
+                lambda handle, error: accepted.append((handle, error)),
+            )
+            until = time.monotonic() + 3
+            while not replies and time.monotonic() < until:
+                executor.spin_once(timeout_sec=0.02)
+            assert len(goals) == len(accepted) == len(replies) == 1
+            assert (
+                goals[0].robot_id == robot.robot_id and goals[0].mission_id == "legacy"
+            )
+            assert accepted[0][0].accepted and accepted[0][1] == ""
+            assert replies[0].success
+    finally:
+        if server is not None:
+            server.destroy()
+        executor.shutdown()
+        if manager is not None:
+            manager.destroy_node()
+        if peer is not None:
+            peer.destroy_node()
+        context.shutdown()
+
+
 def test_charging_action_endpoint_uses_configured_namespace(rig):
     api, adapter, *_ = rig
     robot = replace(
@@ -112,7 +250,7 @@ def test_ros_dock_goal_serializes_config_and_fences_failed_result(rig):
     )
     assert goals[0].dock_id == "dock_01" and goals[0].target_percent == 80.0
     assert goals[0].staging_pose.header.frame_id == "amr_01/map"
-    assert goals[0].staging_pose.pose.position.x == 3.5
+    assert goals[0].staging_pose.pose.position.x == 5.4
     assert goals[0].charging_pose.pose.position.x == 4.0
     response.set_result(
         SimpleNamespace(accepted=True, get_result_async=lambda: completed)
@@ -405,6 +543,116 @@ def dispatch(rig, mission_id="m1", pin=None):
     adapter.tick()
     adapter.tick()
     return robots.goals[-1]
+
+
+def delayed_costs(robots):
+    """Delay only the external cost replies; keep dispatch and SQLite real."""
+    callbacks = {}
+
+    def estimate(robot_id, request, callback):
+        callbacks.setdefault(request.mission_id, {})[robot_id] = callback
+
+    robots.estimate = estimate
+    return callbacks
+
+
+def answer_costs(callbacks, mission_id):
+    for robot_id, callback in callbacks.get(mission_id, {}).items():
+        callback(CostEstimate(True, 9 if robot_id == "amr_01" else 2, 50))
+
+
+@pytest.mark.parametrize("head,tail", [("first", "second"), ("z_head", "a_tail")])
+def test_automatic_reservations_follow_acceptance_not_cost_reply_order(rig, head, tail):
+    _, adapter, journal, robots, _ = rig
+    callbacks = delayed_costs(robots)
+    adapter.submit(request(head))
+    adapter.submit(request(tail))
+    adapter.tick()
+    answer_costs(callbacks, tail)
+    adapter.tick()
+    assert robots.goals == []
+    assert journal.get(tail).state == "QUEUED"
+    answer_costs(callbacks, head)
+    adapter.tick()
+    answer_costs(callbacks, tail)
+    adapter.tick()
+    assert [(g.request.mission_id, g.robot_id) for g in robots.goals] == [
+        (head, "amr_02"),
+        (tail, "amr_01"),
+    ]
+
+
+def test_cancelled_automatic_head_does_not_block_tail_or_accept_late_cost(rig):
+    _, adapter, journal, robots, _ = rig
+    callbacks = delayed_costs(robots)
+    adapter.submit(request("head"))
+    adapter.submit(request("tail"))
+    adapter.tick()
+    adapter.cancel("head")
+    adapter.tick()
+    answer_costs(callbacks, "head")
+    answer_costs(callbacks, "tail")
+    adapter.tick()
+    assert journal.get("head").state == "CANCELLED"
+    assert [(g.request.mission_id, g.robot_id) for g in robots.goals] == [
+        ("tail", "amr_02")
+    ]
+
+
+def test_no_decision_head_yields_backoff_without_parallel_automatic_round(rig):
+    _, adapter, journal, robots, now = rig
+    callbacks = delayed_costs(robots)
+    adapter.submit(request("head"))
+    adapter.tick()
+    now[0] += 1.0
+    adapter.tick()  # Original one-second cost deadline, then one-second backoff.
+    assert journal.get("head").state == "QUEUED" and robots.goals == []
+    adapter.submit(request("tail"))
+    now[0] += 0.5
+    adapter.tick()
+    answer_costs(callbacks, "head")  # Retired round cannot reserve a robot.
+    now[0] += 0.5  # Head backoff expires while the tail round is still pending.
+    adapter.tick()
+    answer_costs(callbacks, "head")
+    answer_costs(callbacks, "tail")
+    adapter.tick()
+    assert [(g.request.mission_id, g.robot_id) for g in robots.goals] == [
+        ("tail", "amr_02")
+    ]
+    adapter.tick()
+    answer_costs(callbacks, "head")
+    adapter.tick()
+    assert journal.get("head").assigned_robot_id == "amr_01"
+
+
+def test_pinned_round_is_independent_of_pending_automatic_head(rig):
+    _, adapter, journal, robots, _ = rig
+    callbacks = delayed_costs(robots)
+    adapter.submit(request("head"))
+    adapter.submit(request("pin", "amr_02"))
+    adapter.tick()
+    answer_costs(callbacks, "pin")
+    adapter.tick()
+    assert journal.get("pin").assigned_robot_id == "amr_02"
+    assert journal.get("head").state == "QUEUED"
+    answer_costs(callbacks, "head")
+    adapter.tick()
+    assert journal.get("head").assigned_robot_id == "amr_01"
+
+
+def test_rejected_automatic_head_frees_reservation_for_tail(rig):
+    _, adapter, journal, robots, _ = rig
+    robots.auto_accept = False
+    adapter.submit(request("head"))
+    adapter.submit(request("tail"))
+    adapter.tick()
+    adapter.tick()
+    robots.goals[0].accepted(None, "")
+    adapter.tick()
+    for _ in range(3):
+        adapter.tick()
+    assert journal.get("head").state == "FAILED"
+    assert journal.get("tail").assigned_robot_id == "amr_01"
 
 
 @pytest.mark.parametrize("pin,want", [(None, "amr_02"), ("amr_01", "amr_01")])
@@ -887,6 +1135,16 @@ def test_offline_before_pickup_reassigns_and_old_callbacks_cannot_finish_new_goa
     adapter.tick()
     adapter.tick()
     adapter.tick()
+    assert len(robots.goals) == 1
+    assert journal.get("m1").state == "REASSIGNING"
+    now[0] += 1.1
+    old.result(api.RobotReply(False, "ROBOT_OFFLINE"))
+    adapter.observe(
+        RobotSnapshot(old.robot_id, "AVAILABLE", Pose2D(0, 0, 0), 80, "EMPTY")
+    )
+    robots.costs[old.robot_id] = None
+    for _ in range(3):
+        adapter.tick()
     assert len(robots.goals) == 2
     assert robots.goals[-1].robot_id == "amr_01"
     old.feedback(api.RobotFeedback("UNLOADING", "stale", 0.9))
@@ -895,6 +1153,35 @@ def test_offline_before_pickup_reassigns_and_old_callbacks_cannot_finish_new_goa
     assert journal.get("m1").assigned_robot_id == "amr_01"
     assert journal.get("m1").state == "ASSIGNED"
     assert journal.get("m1").payload_ownership == "NOT_PICKED_UP"
+
+
+def test_offline_flight_requires_terminal_or_source_after_loss_for_stop_proof(rig):
+    old = dispatch(rig)
+    _, adapter, journal, robots, now = rig
+    robots.costs[old.robot_id] = None
+    now[0] += 5.1
+    adapter.observe(RobotSnapshot("amr_01", "AVAILABLE", Pose2D(0, 0, 0), 80, "EMPTY"))
+    adapter.tick()
+    assert journal.get("m1").state == "REASSIGNING"
+    # New receipt of a pre-loss source sample must not prove a stopped goal.
+    adapter.observe(
+        RobotSnapshot(old.robot_id, "AVAILABLE", Pose2D(0, 0, 0), 80, "EMPTY"),
+        source_time_ns=adapter.startup_wall_ns + 1,
+    )
+    now[0] += 1.1
+    for _ in range(3):
+        adapter.tick()
+    assert len(robots.goals) == 1
+    assert old.robot_id in {f.robot_id for f in adapter._flights.values()}
+    adapter.observe(
+        RobotSnapshot(old.robot_id, "AVAILABLE", Pose2D(0, 0, 0), 80, "EMPTY"),
+        source_time_ns=__import__("time").time_ns() + 1,
+    )
+    now[0] += 1.1
+    for _ in range(3):
+        adapter.tick()
+    assert len(robots.goals) == 2
+    assert robots.goals[-1].robot_id != old.robot_id
 
 
 @pytest.mark.parametrize("stage", ["LOADING", "NAVIGATING_TO_DROPOFF"])
@@ -928,6 +1215,32 @@ def test_resource_service_translation_fences_wrong_lease_and_reports_ttl(rig):
     assert adapter.resource("release", request)["released"]
     with pytest.raises(ValueError):
         adapter.resource("clear_reconciliation", request)
+
+
+def test_atomic_waiter_handoff_persists_exact_released_identity(rig):
+    from fleet_manager.resources import LeaseKey
+    from types import SimpleNamespace
+
+    _, adapter, journal, _, _ = rig
+    first = SimpleNamespace(
+        robot_id="amr_01", mission_id="first", resource_id="assembly"
+    )
+    first.lease_id = adapter.resource("acquire", first)["lease_id"]
+    second = SimpleNamespace(
+        robot_id="amr_02", mission_id="second", resource_id="assembly"
+    )
+    assert not adapter.resource("acquire", second)["granted"]
+    assert adapter.resource("release", first)["released"]
+    promoted = adapter.resource("acquire", second)
+    assert promoted["granted"] and promoted["lease_id"] != first.lease_id
+    assert journal.claim_resolved(
+        LeaseKey(first.robot_id, first.mission_id, first.resource_id, first.lease_id)
+    )
+    assert not journal.claim_resolved(
+        LeaseKey(
+            second.robot_id, second.mission_id, second.resource_id, promoted["lease_id"]
+        )
+    )
 
 
 def test_unhealthy_robot_cannot_renew_resource_lease(rig):
@@ -1191,7 +1504,22 @@ def test_real_ros_two_robot_fleet_action(scenario, tmp_path):
         deadline = time.monotonic() + timeout
         while not predicate() and time.monotonic() < deadline:
             executor.spin_once(timeout_sec=0.02)
-        assert predicate()
+        assert predicate(), {
+            "missions": [
+                (r.state, r.assigned_robot_id, r.payload_ownership)
+                for r in fleet.journal.load_active()
+            ],
+            "robots": [
+                (
+                    r,
+                    fleet.adapter.registry.get(r, time.monotonic()).mode,
+                    fleet.adapter.registry.get(r, time.monotonic()).mission_id,
+                )
+                for r in ("amr_01", "amr_02")
+            ],
+            "goals": [len(first.goals), len(second.goals)],
+            "retry": fleet.adapter._retry_at,
+        }
 
     try:
         wait(
@@ -1325,6 +1653,17 @@ def test_real_ros_two_robot_fleet_action(scenario, tmp_path):
             if scenario == "offline":
                 wait(lambda: bool(second.goals))
                 second.heartbeat_timer.cancel()
+                wait(lambda: fleet.journal.get("ros").state == "REASSIGNING")
+                assert not first.goals
+                second.failed = True
+                for active in second.active.values():
+                    active.execute()
+                second.active.clear()
+                # Stop proof comes from a fresh empty heartbeat, not loss time.
+                second.heartbeat_timer.reset()
+                for service in tuple(second.services):
+                    if service.srv_name.endswith("factory/estimate_mission_cost"):
+                        second.destroy_service(service)
             wait(result.done)
             assert result.result().result.success
             want = (

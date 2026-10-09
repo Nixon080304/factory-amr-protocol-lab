@@ -46,3 +46,7 @@ class RobotRegistry:
     def eligible(self, now: float) -> tuple[RobotSnapshot, ...]:
         states = (self.get(robot_id, now) for robot_id in self._states)
         return tuple(state for state in states if robot_is_ready(state))
+
+    def observed_after(self, robot_id: str, boundary: float) -> bool:
+        """Require a new receipt after a persisted loss, never stale telemetry."""
+        return self._receipts.get(robot_id, -math.inf) > boundary

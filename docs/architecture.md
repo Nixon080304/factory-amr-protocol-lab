@@ -1,5 +1,55 @@
 # Architecture and successful mission
 
+The fleet adds one central owner for assignment, resource authority and durable
+mission state. Robot-local navigation and immediate stopping remain local.
+The dashboard is a loopback GET/SSE observer; it has no command endpoint.
+
+```mermaid
+flowchart LR
+    Client[Mission client] -->|MQTT QoS 1| Gateway[MQTT gateway]
+    Gateway -->|ExecuteFleetMission / DDS| Fleet[Fleet manager]
+    Fleet --> Journal[(SQLite WAL journal)]
+    Fleet -->|ExecuteFactoryMission / DDS| Robot1[Namespaced robot stack 1]
+    Fleet -->|ExecuteFactoryMission / DDS| Robot2[Namespaced robot stack 2]
+    Robot1 & Robot2 -->|Exact lease services / DDS| Fleet
+    Robot1 & Robot2 -->|TransferPart / DDS| Modbus[Modbus gateway]
+    Modbus -->|Modbus TCP| Stations[Assembly and inspection PLC]
+    Fleet -->|Read-only snapshots / SSE| Dashboard[Local dashboard]
+```
+
+Each namespaced stack has its own prefixed map/odom/base/sensor frame tree,
+Nav2 and AMCL nodes, camera perception, cost endpoint, energy agent and local
+mission action. The manager selects `(path_cost, robot_id)` among healthy,
+available candidates predicted to retain at least 20% charge. Idle robots below
+30% enter the dock queue; charging requires independently simulated contact,
+fresh localization and an exact live dock lease, and stops at 80%.
+The dock lease remains held through arrival at a configured robot-specific
+exit bay. The supplied two-robot layout validates low-battery startup and
+inspection-parking dock approaches; reverse-route docking and general
+free-floor multi-agent path planning are not demonstrated guarantees.
+
+Automatic assignment rounds run in first-journal-event acceptance order, so
+later cost replies cannot reserve an earlier request's cheapest eligible robot.
+Only cost evaluation is serialized; assigned robots execute concurrently.
+Bounded no-decision backoff lets feasible later work progress, while pinned
+rounds remain independent.
+
+Capacity-one leases cover the central aisle, complete station approaches and
+dock. A station lease precedes final approach and remains until verified exit;
+a successful transfer alone is not clearance. Expiry quarantines authority
+until fresh world-frame observations prove clearance. Before-pickup loss blocks
+reassignment until the former goal is stopped, payload is EMPTY, and exact
+quarantine is cleared. After-pickup loss retains the carrier and becomes
+`RECOVERY_REQUIRED`. Restart loads durable evidence and reconciles fresh robot
+observations before granting authority. See [fleet operations](fleet-operations.md).
+
+## Original single-robot architecture
+
+The diagram and measurements below describe the retained Version 1 command.
+The fleet action and namespaces above replace its direct northbound action
+routing in the new demonstration. Historical hosted results do not certify a
+new fleet revision.
+
 The lab separates mission decisions from communication transports and Gazebo
 APIs. All robot nodes share simulation time. The committed map and station
 poses share world coordinates.

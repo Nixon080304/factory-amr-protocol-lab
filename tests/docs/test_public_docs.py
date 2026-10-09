@@ -78,7 +78,9 @@ def test_public_prose_has_no_private_or_unfinished_content():
         assert not re.search(r"\+65[ -]?\d{4}[ -]?\d{4}", text)
 
 
-@pytest.mark.parametrize("name", ["factory-overview.png", "amr-closeup.png"])
+@pytest.mark.parametrize(
+    "name", ["factory-overview.png", "amr-closeup.png", "fleet-dashboard.png"]
+)
 def test_native_png_evidence_is_decodable(name):
     assets = ROOT / "docs/assets"
     png = (assets / name).read_bytes()
@@ -99,6 +101,40 @@ def test_native_png_evidence_is_decodable(name):
             image_data += data
         offset += size + 12
     assert len(zlib.decompress(image_data)) == height * (1 + width * channels)
+
+
+def test_fleet_recording_is_animated_bounded_and_decodable():
+    gif = (ROOT / "docs/assets/two-robot-fleet.gif").read_bytes()
+    assert gif[:6] in (b"GIF87a", b"GIF89a")
+    assert 100_000 < len(gif) < 10_000_000
+    width, height = struct.unpack("<HH", gif[6:10])
+    assert width >= 640 and height >= 360
+    packed = gif[10]
+    offset = 13 + (3 * 2 ** ((packed & 7) + 1) if packed & 128 else 0)
+    frames = []
+
+    def skip_blocks(position):
+        while gif[position]:
+            position += 1 + gif[position]
+        return position + 1
+
+    while gif[offset] != 0x3B:
+        kind = gif[offset]
+        offset += 1
+        if kind == 0x21:
+            offset = skip_blocks(offset + 1)
+        else:
+            assert kind == 0x2C, "invalid GIF image descriptor"
+            packed = gif[offset + 8]
+            offset += 9
+            if packed & 128:
+                offset += 3 * 2 ** ((packed & 7) + 1)
+            start = offset
+            offset = skip_blocks(offset + 1)
+            frames.append(gif[start:offset])
+    assert offset == len(gif) - 1
+    assert len(frames) >= 30
+    assert len(set(frames)) >= 20, "recording must not repeat one static screenshot"
 
 
 def test_recording_is_present_and_diagrams_describe_real_components():

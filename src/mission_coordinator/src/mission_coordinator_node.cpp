@@ -10,6 +10,11 @@
 
 namespace mission_coordinator {
 namespace {
+double wall_time() {
+  return std::chrono::duration<double>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
 RobotContext local_robot(rclcpp::Node *node) {
   rcl_interfaces::msg::ParameterDescriptor identity;
   identity.read_only = true;
@@ -25,13 +30,16 @@ RobotContext local_robot(rclcpp::Node *node) {
 } // namespace
 MissionCoordinatorNode::MissionCoordinatorNode(const rclcpp::NodeOptions &options)
     : Node("mission_coordinator", options), robot_(local_robot(this)),
-      navigation_(this),
-      resources_(make_resource_transport(this), robot_.robot_id,
-                 [] {
-                   return std::chrono::duration<double>(
-                              std::chrono::steady_clock::now().time_since_epoch())
-                       .count();
-                 }),
+      navigation_(this, [this](const auto &name,
+                               const auto &detail) { event(name, "", detail); }),
+      resources_(
+          make_resource_transport(this), robot_.robot_id,
+          [] {
+            return std::chrono::duration<double>(
+                       std::chrono::steady_clock::now().time_since_epoch())
+                .count();
+          },
+          declare_parameter("resource_wait_timeout_sec", 120.0)),
       resource_gate_(resources_, machine_) {
   if (!has_parameter("use_sim_time")) {
     declare_parameter("use_sim_time", true);
@@ -51,11 +59,40 @@ MissionCoordinatorNode::MissionCoordinatorNode(const rclcpp::NodeOptions &option
   }
   leases_enabled_ =
       declare_parameter("resource_leases_enabled", std::string(get_namespace()) != "/");
+  if (leases_enabled_) {
+    // Pair separation is 2 * (configured robot radius + arrival tolerance).
+    // The default preserves the existing 0.35 m + 0.25 m conservative envelope.
+    station_clearance_distance_ =
+        declare_parameter("stations.clearance_distance", 1.20);
+    if (!std::isfinite(station_clearance_distance_) || station_clearance_distance_ <= 0)
+      throw std::invalid_argument(
+          "station clearance distance must be finite and positive");
+    for (const auto &station : poses_) {
+      station_bounds_.emplace(
+          station.first,
+          TrafficBoundary(declare_parameter<std::vector<double>>(
+              "stations." + station.first + ".bounds", std::vector<double>{})));
+      auto staging = declare_parameter<std::vector<double>>(
+          "stations." + station.first + ".staging_pose", std::vector<double>{});
+      if (staging.size() != 3 ||
+          !std::all_of(staging.begin(), staging.end(),
+                       [](double v) { return std::isfinite(v); }) ||
+          !station_bounds_.at(station.first)
+               .outside(staging[0], staging[1], station_clearance_distance_ / 2))
+        throw std::invalid_argument("station staging must clear the station footprint");
+      station_staging_[station.first] = staging;
+      station_exit_[station.first] = declare_parameter<std::vector<double>>(
+          "stations." + station.first + ".exit_pose", std::vector<double>{});
+    }
+  }
   const auto route_names = declare_parameter<std::vector<std::string>>(
       "route_names", {"to_assembly", "assembly_to_inspection"});
   for (const auto &name : route_names) {
     auto ids = declare_parameter<std::vector<std::string>>(
         "routes." + name + ".resources", std::vector<std::string>{});
+    if (leases_enabled_ && ids.size() > 1)
+      throw std::invalid_argument("leased routes require one traffic segment until "
+                                  "handoff bays are configured");
     auto &route = routes_[name];
     for (const auto &id : ids) {
       auto staging = declare_parameter<std::vector<double>>(
@@ -79,10 +116,51 @@ MissionCoordinatorNode::MissionCoordinatorNode(const rclcpp::NodeOptions &option
       route.push_back({id, staging, exit, boundary});
     }
   }
+  if (leases_enabled_) {
+    for (const auto &station : poses_) {
+      auto &exit = station_exit_.at(station.first);
+      const auto &staging = station_staging_.at(station.first);
+      if (exit.size() != 3 ||
+          !std::all_of(exit.begin(), exit.end(),
+                       [](double v) { return std::isfinite(v); }) ||
+          !station_bounds_.at(station.first)
+               .outside(exit[0], exit[1], station_clearance_distance_ / 2) ||
+          std::hypot(staging[0] - exit[0], staging[1] - exit[1]) <=
+              station_clearance_distance_)
+        throw std::invalid_argument(
+            "explicit station parking must clear bounds and the waiting pose");
+      for (const auto &route : routes_) {
+        for (const auto &segment : route.second) {
+          if (!segment.boundary.segment_outside(staging[0], staging[1],
+                                                station.second[0], station.second[1],
+                                                station_clearance_distance_ / 2))
+            throw std::invalid_argument(
+                "station approach must clear all traffic bounds");
+          if (!segment.boundary.segment_outside(station.second[0], station.second[1],
+                                                exit[0], exit[1],
+                                                station_clearance_distance_ / 2))
+            throw std::invalid_argument(
+                "station parking path must clear traffic bounds");
+          for (const auto &point : {segment.staging, segment.exit}) {
+            if (std::hypot(staging[0] - point[0], staging[1] - point[1]) <=
+                station_clearance_distance_)
+              throw std::invalid_argument(
+                  "station wait pose must be separated from traffic waypoints");
+            if (std::hypot(exit[0] - point[0], exit[1] - point[1]) <=
+                station_clearance_distance_)
+              throw std::invalid_argument(
+                  "station parking must be separated from traffic waypoints");
+          }
+        }
+      }
+    }
+  }
   timeout_ = declare_parameter("perception_timeout_sec", 10.0);
+  refresh_timeout_ = declare_parameter("localization_refresh_timeout_sec", 1.0);
   navigation_timeout_ = declare_parameter("navigation_timeout_sec", 120.0);
   if (!std::isfinite(timeout_) || timeout_ <= 0 ||
-      !std::isfinite(navigation_timeout_) || navigation_timeout_ <= 0) {
+      !std::isfinite(navigation_timeout_) || navigation_timeout_ <= 0 ||
+      !std::isfinite(refresh_timeout_) || refresh_timeout_ <= 0) {
     throw std::invalid_argument("timeouts must be finite and positive");
   }
   events_ = create_publisher<factory_interfaces::msg::ProtocolEvent>(
@@ -97,6 +175,9 @@ MissionCoordinatorNode::MissionCoordinatorNode(const rclcpp::NodeOptions &option
   states_ = create_publisher<std_msgs::msg::String>(RobotContext::state_topic,
                                                     rclcpp::QoS(100).reliable());
   transfer_client_ = create_client<Transfer>("/factory/transfer_part");
+  // All coordinator callbacks use the default mutually exclusive callback group.
+  // Refresh is asynchronous; no callback waits for this robot-local service.
+  refresh_client_ = create_client<std_srvs::srv::Empty>("request_nomotion_update");
   localization_ = create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
       RobotContext::pose_topic, rclcpp::SensorDataQoS(),
       [this](geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr message) {
@@ -109,8 +190,7 @@ MissionCoordinatorNode::MissionCoordinatorNode(const rclcpp::NodeOptions &option
         const double stamp = rclcpp::Time(message->header.stamp).seconds();
         // A sensor can arrive before the matching /clock update. Keep one
         // current-leg candidate; localized() still forbids future evidence.
-        pose_valid_ =
-            goal_ && stamp >= localization_started_ &&
+        const bool source_valid =
             message->header.frame_id == robot_.local_frame(RobotContext::map_frame) &&
             std::isfinite(p.position.x) && std::isfinite(p.position.y) &&
             std::isfinite(p.position.z) && std::isfinite(p.orientation.x) &&
@@ -120,8 +200,29 @@ MissionCoordinatorNode::MissionCoordinatorNode(const rclcpp::NodeOptions &option
                      p.orientation.y * p.orientation.y +
                      p.orientation.z * p.orientation.z +
                      p.orientation.w * p.orientation.w - 1.0) < 0.01;
+        pose_valid_ = source_valid && goal_ && stamp >= localization_started_ &&
+                      (!leases_enabled_ || stamp > mission_pose_floor_);
+        if (source_valid && stamp <= now().seconds())
+          last_current_pose_stamp_ = std::max(last_current_pose_stamp_, stamp);
+        pose_receipt_ = wall_time();
         pose_ = p;
         pose_stamp_ = stamp;
+        refresh_buffered_pose_ = refresh_active_ && source_valid &&
+                                 stamp > refresh_source_stamp_ &&
+                                 stamp < refresh_epoch_ && stamp <= now().seconds() &&
+                                 pose_receipt_ >= refresh_sent_;
+        if (refresh_active_ && owns_goal(mission_generation_)) {
+          std::ostringstream detail;
+          detail << std::setprecision(17) << "{\"source_stamp\":" << stamp
+                 << ",\"epoch\":" << refresh_epoch_
+                 << ",\"source_floor\":" << refresh_source_stamp_
+                 << ",\"mission_floor\":" << mission_pose_floor_
+                 << ",\"receipt_after_sec\":" << pose_receipt_ - refresh_sent_
+                 << ",\"acknowledged\":" << (refresh_ready_ ? "true" : "false")
+                 << ",\"source_valid\":" << (source_valid ? "true" : "false")
+                 << ",\"pose_current\":" << (pose_current() ? "true" : "false") << "}";
+          event("localization_refresh_pose", "", detail.str());
+        }
       });
   detections_ = create_subscription<factory_interfaces::msg::StationDetection>(
       RobotContext::detection_topic, rclcpp::SensorDataQoS(),
@@ -131,6 +232,8 @@ MissionCoordinatorNode::MissionCoordinatorNode(const rclcpp::NodeOptions &option
   server_ = rclcpp_action::create_server<Mission>(
       this, RobotContext::mission_action,
       [this](auto, auto request) {
+        if (!get_node_base_interface()->get_context()->is_valid())
+          return rclcpp_action::GoalResponse::REJECT;
         std::string error;
         if (!std::regex_match(request->mission_id, std::regex("[A-Za-z0-9_-]{1,64}")) ||
             !robot_.accepts_robot(request->robot_id) ||
@@ -148,8 +251,13 @@ MissionCoordinatorNode::MissionCoordinatorNode(const rclcpp::NodeOptions &option
         return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
       },
       [this](auto handle) {
-        if (handle != goal_) {
+        if (handle != goal_ || !owns_goal(mission_generation_)) {
           return rclcpp_action::CancelResponse::REJECT;
+        }
+        if (station_exiting_) {
+          navigation_.cancel();
+          deferred_error_ = "MISSION_CANCELED";
+          return rclcpp_action::CancelResponse::ACCEPT;
         }
         auto result = machine_.cancel();
         if (waiting_resource_) {
@@ -164,6 +272,10 @@ MissionCoordinatorNode::MissionCoordinatorNode(const rclcpp::NodeOptions &option
         return rclcpp_action::CancelResponse::ACCEPT;
       },
       [this](auto handle) {
+        if (!get_node_base_interface()->get_context()->is_valid()) {
+          server_.reset();
+          return;
+        }
         if (restart_required_) {
           // Goal rejection cannot carry a typed reason. Acknowledge transport,
           // then return the lifecycle error without starting physical execution.
@@ -175,12 +287,26 @@ MissionCoordinatorNode::MissionCoordinatorNode(const rclcpp::NodeOptions &option
               "Restart the full simulation before another payload mission";
           event("mission_rejected", "FAILED", result->error_code,
                 handle->get_goal()->mission_id);
-          handle->abort(result);
+          try {
+            handle->abort(result);
+          } catch (const std::exception &) {
+            if (get_node_base_interface()->get_context()->is_valid())
+              throw;
+            server_.reset();
+          }
           reserved_ = false;
           return;
         }
         goal_ = handle;
+        drop_pose_refresh();
+        localization_started_ = now().seconds();
+        mission_pose_floor_ = pose_stamp_;
         finishing_ = waiting_resource_ = crossing_resource_ = false;
+        station_staged_ = station_exiting_ = station_terminal_exit_ = false;
+        waiting_traffic_pose_ = clearing_traffic_ = false;
+        waiting_navigation_pose_ = false;
+        pending_navigation_target_.clear();
+        departure_station_.clear();
         held_resource_.clear();
         active_route_.clear();
         route_index_ = 0;
@@ -195,6 +321,21 @@ MissionCoordinatorNode::MissionCoordinatorNode(const rclcpp::NodeOptions &option
         navigate();
       });
   timer_ = create_wall_timer(std::chrono::milliseconds(20), [this] { tick(); });
+}
+MissionCoordinatorNode::~MissionCoordinatorNode() {
+  ++mission_generation_;
+  drop_pose_refresh();
+  if (!get_node_base_interface()->get_context()->is_valid()) {
+    // Humble automatically publishes cancellation from an unfinished goal's
+    // destructor. Retire its server first after shutdown, so that callback's
+    // weak server reference cannot publish through an invalid ROS context.
+    server_.reset();
+  }
+  goal_.reset();
+}
+bool MissionCoordinatorNode::owns_goal(uint64_t generation) {
+  return goal_ && server_ && generation == mission_generation_ &&
+         get_node_base_interface()->get_context()->is_valid();
 }
 std::string MissionCoordinatorNode::state_name() const {
   static const std::vector<std::string> names = {"IDLE",
@@ -229,7 +370,7 @@ void MissionCoordinatorNode::event(const std::string &name, const std::string &o
   events_->publish(message);
 }
 void MissionCoordinatorNode::transition(const TransitionResult &result) {
-  if (!result.accepted || !goal_) {
+  if (!result.accepted || !owns_goal(mission_generation_)) {
     return;
   }
   RCLCPP_INFO(get_logger(),
@@ -263,20 +404,94 @@ void MissionCoordinatorNode::navigate() {
       }
       active_route_ = route->second;
     }
+    if (!held_resource_.empty() && station_bounds_.count(held_resource_) &&
+        held_resource_ != machine_.current_station()) {
+      station_exiting_ = true;
+      departure_station_ = held_resource_;
+      if (!active_route_.empty()) {
+        const auto &segment = active_route_[route_index_];
+        if (!traffic_pose_clear(segment.boundary)) {
+          waiting_traffic_pose_ = true;
+          request_pose_refresh();
+          return;
+        }
+        waiting_traffic_pose_ = false;
+        drop_pose_refresh();
+        wait_for_resource(
+            segment.resource, [this] { navigate(); }, departure_station_);
+        return;
+      }
+      const auto &exit = station_exit_.at(held_resource_);
+      if (exit.size() != 3 ||
+          !station_bounds_.at(held_resource_)
+               .outside(exit[0], exit[1], station_clearance_distance_ / 2)) {
+        finish("RESOURCE_EXIT_UNCONFIRMED");
+        return;
+      }
+      navigate_target(exit);
+      return;
+    }
     if (route_index_ < active_route_.size()) {
       const auto &segment = active_route_[route_index_];
-      navigate_target(crossing_resource_ ? segment.exit : segment.staging);
+      if (held_resource_ != segment.resource) {
+        if (!traffic_pose_clear(segment.boundary)) {
+          waiting_traffic_pose_ = true;
+          request_pose_refresh();
+          return;
+        }
+        waiting_traffic_pose_ = false;
+        drop_pose_refresh();
+        wait_for_resource(segment.resource, [this] { navigate(); });
+      } else {
+        if (!crossing_resource_ && !traffic_pose_clear(segment.boundary)) {
+          // Localization and /clock may arrive on different callback turns.
+          // Retain both leases, but dispatch no motion until evidence is current.
+          waiting_traffic_pose_ = true;
+          request_pose_refresh();
+          return;
+        }
+        waiting_traffic_pose_ = false;
+        drop_pose_refresh();
+        navigate_target(clearing_traffic_
+                            ? station_staging_.at(machine_.current_station())
+                        : crossing_resource_ ? segment.exit
+                                             : segment.staging);
+      }
+      return;
+    }
+    const auto station = machine_.current_station();
+    if (held_resource_ != station) {
+      if (!station_staged_) {
+        const auto staging = station_staging_.at(station);
+        if (staging.size() != 3) {
+          finish("RESOURCE_ROUTE_MISSING");
+          return;
+        }
+        navigate_target(staging);
+      } else
+        wait_for_resource(station, [this] { navigate(); });
       return;
     }
   }
   navigate_target(poses_.at(machine_.current_station()));
 }
 void MissionCoordinatorNode::navigate_target(const std::vector<double> &coordinates) {
-  if (!held_resource_.empty() &&
-      !resources_.authorized(held_resource_, machine_.mission().mission_id)) {
+  if ((!held_resource_.empty() &&
+       !resources_.authorized(held_resource_, machine_.mission().mission_id)) ||
+      (!departure_station_.empty() &&
+       !resources_.authorized(departure_station_, machine_.mission().mission_id))) {
     finish("RESOURCE_LEASE_LOST");
     return;
   }
+  if (leases_enabled_ && !pose_current()) {
+    pending_navigation_target_ = coordinates;
+    waiting_navigation_pose_ = true;
+    request_pose_refresh();
+    return;
+  }
+  waiting_navigation_pose_ = false;
+  pending_navigation_target_.clear();
+  drop_pose_refresh();
   navigation_target_ = coordinates;
   navigation_completed_ = false;
   pose_valid_ = false;
@@ -301,8 +516,7 @@ void MissionCoordinatorNode::navigate_target(const std::vector<double> &coordina
          << coordinates[2] << "]}";
   event("navigation_goal_requested", "", detail.str());
   auto done = [this, generation](bool success) {
-    if (!goal_ || generation != mission_generation_ ||
-        active_phase_.find("navigation_") != 0) {
+    if (!owns_goal(generation) || active_phase_.find("navigation_") != 0) {
       return;
     }
     event(active_phase_ + "_finished", success ? "SUCCEEDED" : "FAILED");
@@ -312,8 +526,13 @@ void MissionCoordinatorNode::navigate_target(const std::vector<double> &coordina
       phase_started_ = now().seconds();
       if (localized()) {
         navigation_arrived();
-      }
+      } else if (leases_enabled_ && !pose_current())
+        request_pose_refresh();
     } else {
+      if (station_exiting_) {
+        finish("NAVIGATION_FAILED");
+        return;
+      }
       auto result = machine_.navigation_failed();
       transition(result);
       if (result.state == MissionState::Failed) {
@@ -324,7 +543,7 @@ void MissionCoordinatorNode::navigate_target(const std::vector<double> &coordina
       event("navigation_recovery_started");
       navigation_.clear_costmaps(
           [this, generation](bool cleared) {
-            if (!goal_ || generation != mission_generation_ ||
+            if (!owns_goal(generation) ||
                 machine_.state() != MissionState::Recovering) {
               return;
             }
@@ -338,8 +557,7 @@ void MissionCoordinatorNode::navigate_target(const std::vector<double> &coordina
             navigate();
           },
           [this, generation](const std::string &service) {
-            if (goal_ && generation == mission_generation_ &&
-                machine_.state() == MissionState::Recovering) {
+            if (owns_goal(generation) && machine_.state() == MissionState::Recovering) {
               event("costmap_cleared", "SUCCEEDED",
                     "{\"service\":\"" + service + "\"}");
             }
@@ -352,36 +570,166 @@ void MissionCoordinatorNode::navigate_target(const std::vector<double> &coordina
     navigation_.navigate(pose, done);
   }
 }
+bool MissionCoordinatorNode::traffic_pose_clear(const TrafficBoundary &boundary) const {
+  return pose_current() && boundary.outside(pose_.position.x, pose_.position.y, 0.35);
+}
+bool MissionCoordinatorNode::pose_current() const {
+  const auto time = now().seconds();
+  return pose_valid_ && pose_stamp_ >= localization_started_ && pose_stamp_ <= time &&
+         time - pose_stamp_ <= 1.5 && wall_time() - pose_receipt_ <= 1.5 &&
+         (!refresh_active_ ||
+          (refresh_ready_ && pose_stamp_ > refresh_source_stamp_ &&
+           pose_stamp_ >= refresh_epoch_ && pose_receipt_ >= refresh_sent_ &&
+           pose_receipt_ - refresh_sent_ <= refresh_timeout_ &&
+           refresh_ack_receipt_ >= refresh_sent_ &&
+           refresh_ack_receipt_ - refresh_sent_ <= refresh_timeout_));
+}
+void MissionCoordinatorNode::drop_pose_refresh() {
+  ++refresh_sequence_;
+  if (refresh_request_id_ >= 0 && refresh_client_)
+    refresh_client_->remove_pending_request(refresh_request_id_);
+  refresh_request_id_ = -1;
+  refresh_active_ = refresh_ready_ = false;
+  refresh_ack_receipt_ = -1;
+  refresh_buffered_pose_ = false;
+  refresh_attempts_ = 0;
+}
+void MissionCoordinatorNode::request_pose_refresh() {
+  if (!leases_enabled_ || !owns_goal(mission_generation_) || finishing_)
+    return;
+  if (!refresh_active_) {
+    refresh_active_ = true;
+    refresh_ready_ = false;
+    refresh_ack_receipt_ = -1;
+    refresh_buffered_pose_ = false;
+    refresh_attempts_ = 0;
+    refresh_sent_ = wall_time();
+    refresh_epoch_ = now().seconds();
+    refresh_source_stamp_ = std::max(mission_pose_floor_, last_current_pose_stamp_);
+    if (pose_valid_ && pose_stamp_ <= refresh_epoch_)
+      refresh_source_stamp_ = std::max(refresh_source_stamp_, pose_stamp_);
+    ++refresh_sequence_;
+    event("localization_refresh_started");
+  }
+  if (refresh_request_id_ >= 0 || !refresh_client_->service_is_ready())
+    return;
+  if (refresh_ready_) {
+    // AMCL can consume a buffered scan on an acknowledged no-motion update.
+    // Reissue only that valid-but-pre-epoch candidate. Never move the original
+    // epoch, source floor or steady deadline, and never authorize stale poses.
+    if (!refresh_buffered_pose_ || refresh_attempts_ >= 10 ||
+        wall_time() - refresh_last_attempt_ < 0.1)
+      return;
+    refresh_ready_ = false;
+    refresh_ack_receipt_ = -1;
+    ++refresh_sequence_;
+    event("localization_refresh_reissued");
+  }
+  refresh_last_attempt_ = wall_time();
+  ++refresh_attempts_;
+  std::ostringstream attempt_detail;
+  attempt_detail << std::setprecision(17) << "{\"attempt\":" << refresh_attempts_
+                 << ",\"elapsed_sec\":" << refresh_last_attempt_ - refresh_sent_ << "}";
+  event("localization_refresh_requested", "", attempt_detail.str());
+  const auto generation = mission_generation_, sequence = refresh_sequence_;
+  try {
+    auto pending = refresh_client_->async_send_request(
+        std::make_shared<std_srvs::srv::Empty::Request>(),
+        [this, generation,
+         sequence](rclcpp::Client<std_srvs::srv::Empty>::SharedFuture reply) {
+          if (!owns_goal(generation) || finishing_ || sequence != refresh_sequence_ ||
+              !refresh_active_)
+            return;
+          refresh_request_id_ = -1;
+          try {
+            if (!reply.get())
+              throw std::runtime_error("empty localization refresh reply");
+            refresh_ready_ = true;
+            refresh_ack_receipt_ = wall_time();
+            std::ostringstream detail;
+            detail << std::setprecision(17) << "{\"acknowledgement_after_sec\":"
+                   << refresh_ack_receipt_ - refresh_sent_ << "}";
+            event("localization_refresh_finished", "SUCCEEDED", detail.str());
+          } catch (const std::exception &) {
+            event("localization_refresh_finished", "FAILED");
+            finish("LOCALIZATION_REFRESH_FAILED");
+          }
+        });
+    refresh_request_id_ = pending.request_id;
+  } catch (const std::exception &) {
+    finish("LOCALIZATION_REFRESH_FAILED");
+  }
+}
 void MissionCoordinatorNode::wait_for_resource(const std::string &resource,
-                                               std::function<void()> effect) {
+                                               std::function<void()> effect,
+                                               const std::string &departure_source) {
   waiting_resource_ = true;
   const auto generation = mission_generation_;
-  resource_gate_.acquire(resource, std::move(effect),
-                         [this, generation, resource](const ResourceNotice &notice) {
-                           if (!goal_ || generation != mission_generation_ ||
-                               finishing_)
-                             return;
-                           event("resource_lease", "", notice.reason);
-                           if (notice.state == ResourceState::Waiting) {
-                             auto feedback = std::make_shared<Mission::Feedback>();
-                             feedback->state = "WAITING_FOR_RESOURCE";
-                             feedback->station = machine_.current_station();
-                             feedback->detail = resource + ": " + notice.reason;
-                             goal_->publish_feedback(feedback);
-                             std_msgs::msg::String state;
-                             state.data = feedback->state;
-                             states_->publish(state);
-                           } else if (notice.state == ResourceState::Granted) {
-                             waiting_resource_ = false;
-                             held_resource_ = resource;
-                           } else if (notice.state == ResourceState::Lost) {
-                             navigation_.cancel();
-                             restart_required_ = true;
-                             finish("RESOURCE_LEASE_LOST");
-                           }
-                         });
+  resource_gate_.acquire(
+      resource, std::move(effect),
+      [this, generation, resource](const ResourceNotice &notice) {
+        if (!owns_goal(generation) || finishing_)
+          return;
+        event("resource_lease", "", notice.reason);
+        if (notice.state == ResourceState::Waiting) {
+          auto feedback = std::make_shared<Mission::Feedback>();
+          feedback->state = "WAITING_FOR_RESOURCE";
+          feedback->station = machine_.current_station();
+          feedback->detail = resource + ": " + notice.reason;
+          goal_->publish_feedback(feedback);
+          std_msgs::msg::String state;
+          state.data = feedback->state;
+          states_->publish(state);
+        } else if (notice.state == ResourceState::Granted) {
+          waiting_resource_ = false;
+          held_resource_ = resource;
+        } else if (notice.state == ResourceState::Lost) {
+          navigation_.cancel();
+          const bool wait_timeout = notice.reason == "RESOURCE_WAIT_TIMEOUT";
+          if (!wait_timeout)
+            restart_required_ = true;
+          finish(wait_timeout ? "RESOURCE_WAIT_TIMEOUT" : "RESOURCE_LEASE_LOST");
+        }
+      },
+      departure_source);
 }
 void MissionCoordinatorNode::navigation_arrived() {
+  drop_pose_refresh();
+  if (leases_enabled_ && station_exiting_) {
+    navigation_completed_ = false;
+    const auto source =
+        departure_station_.empty() ? held_resource_ : departure_station_;
+    if (!resources_.authorized(source, machine_.mission().mission_id) ||
+        !station_bounds_.at(source).outside(pose_.position.x, pose_.position.y,
+                                            station_clearance_distance_ / 2)) {
+      finish("RESOURCE_EXIT_UNCONFIRMED");
+      return;
+    }
+    const auto generation = mission_generation_;
+    resources_.exited(source, machine_.mission().mission_id);
+    waiting_resource_ = true;
+    resource_gate_.release(source, [this, generation, source](bool cleared) {
+      if (!owns_goal(generation) || finishing_)
+        return;
+      if (!cleared) {
+        finish("RESOURCE_RELEASE_FAILED");
+        return;
+      }
+      if (held_resource_ == source)
+        held_resource_.clear();
+      departure_station_.clear();
+      waiting_resource_ = station_exiting_ = false;
+      if (station_terminal_exit_) {
+        const auto result = machine_.transfer_succeeded();
+        transition(result);
+        finish(result.error_code);
+      } else {
+        crossing_resource_ = !active_route_.empty();
+        navigate();
+      }
+    });
+    return;
+  }
   if (leases_enabled_ && route_index_ < active_route_.size()) {
     navigation_completed_ = false;
     auto segment = active_route_[route_index_];
@@ -390,16 +738,23 @@ void MissionCoordinatorNode::navigation_arrived() {
       return;
     }
     if (!crossing_resource_) {
-      wait_for_resource(segment.resource, [this] {
-        crossing_resource_ = true;
-        navigate();
-      });
+      crossing_resource_ = true;
+      navigate();
+    } else if (!clearing_traffic_) {
+      clearing_traffic_ = true;
+      navigate();
     } else {
+      if (!station_bounds_.at(machine_.current_station())
+               .outside(pose_.position.x, pose_.position.y,
+                        station_clearance_distance_ / 2)) {
+        finish("RESOURCE_EXIT_UNCONFIRMED");
+        return;
+      }
       const auto generation = mission_generation_;
       resources_.exited(segment.resource, machine_.mission().mission_id);
       waiting_resource_ = true;
       resource_gate_.release(segment.resource, [this, generation](bool cleared) {
-        if (!goal_ || generation != mission_generation_ || finishing_)
+        if (!owns_goal(generation) || finishing_)
           return;
         if (!cleared) {
           restart_required_ = true;
@@ -407,11 +762,30 @@ void MissionCoordinatorNode::navigation_arrived() {
           return;
         }
         held_resource_.clear();
-        waiting_resource_ = crossing_resource_ = false;
+        waiting_resource_ = crossing_resource_ = clearing_traffic_ = false;
         ++route_index_;
+        if (route_index_ == active_route_.size()) {
+          const auto station = machine_.current_station();
+          if (!station_bounds_.at(station).outside(pose_.position.x, pose_.position.y,
+                                                   station_clearance_distance_ / 2)) {
+            finish("RESOURCE_EXIT_UNCONFIRMED");
+            return;
+          }
+          station_staged_ = true;
+        }
         navigate();
       });
     }
+  } else if (leases_enabled_ && held_resource_ != machine_.current_station()) {
+    navigation_completed_ = false;
+    if (!station_bounds_.at(machine_.current_station())
+             .outside(pose_.position.x, pose_.position.y,
+                      station_clearance_distance_ / 2)) {
+      finish("RESOURCE_EXIT_UNCONFIRMED");
+      return;
+    }
+    station_staged_ = true;
+    navigate();
   } else
     verify_station();
 }
@@ -517,8 +891,9 @@ void MissionCoordinatorNode::verify_station() {
   event(active_phase_ + "_started");
 }
 bool MissionCoordinatorNode::localized() const {
-  if (!pose_valid_ || pose_stamp_ > now().seconds() ||
-      pose_stamp_ < localization_started_) {
+  const auto time = now().seconds();
+  if (!pose_valid_ || pose_stamp_ > time || pose_stamp_ < localization_started_ ||
+      (leases_enabled_ && !pose_current())) {
     return false;
   }
   const auto &target = navigation_target_;
@@ -630,12 +1005,7 @@ void MissionCoordinatorNode::dispatch_transfer(
     std::shared_ptr<Transfer::Request> request, TransferCallback callback) {
   transfer_client_->async_send_request(request, std::move(callback));
 }
-void MissionCoordinatorNode::transfer() {
-  if (leases_enabled_) {
-    wait_for_resource(machine_.current_station(), [this] { transfer_effect(); });
-  } else
-    transfer_effect();
-}
+void MissionCoordinatorNode::transfer() { transfer_effect(); }
 void MissionCoordinatorNode::transfer_effect() {
   if (leases_enabled_ && !resources_.authorized(machine_.current_station(),
                                                 machine_.mission().mission_id)) {
@@ -657,7 +1027,7 @@ void MissionCoordinatorNode::transfer_effect() {
   try {
     dispatch_transfer(request, [this, generation](
                                    rclcpp::Client<Transfer>::SharedFuture future) {
-      if (!goal_ || generation != mission_generation_) {
+      if (!owns_goal(generation)) {
         return;
       }
       TransitionResult result;
@@ -682,10 +1052,16 @@ void MissionCoordinatorNode::transfer_effect() {
         }
         event("transfer_result", response->accepted ? "SUCCEEDED" : "FAILED",
               response->error_code);
-        result = response->accepted
-                     ? machine_.transfer_succeeded()
-                     : machine_.transfer_failed(error_code.empty() ? "PLC_TIMEOUT"
-                                                                   : error_code);
+        if (!response->accepted)
+          result =
+              machine_.transfer_failed(error_code.empty() ? "PLC_TIMEOUT" : error_code);
+        else if (leases_enabled_ && machine_.state() == MissionState::Unloading &&
+                 !goal_->is_canceling())
+          // Keep the public mission nonterminal until physical clearance and
+          // exact lease release are acknowledged. Cancellation still fences exit.
+          result = {true, MissionState::Completed, ""};
+        else
+          result = machine_.transfer_succeeded();
       } catch (const std::exception &error) {
         RCLCPP_ERROR(get_logger(), "Mission %s: %s",
                      machine_.mission().mission_id.c_str(), error.what());
@@ -695,7 +1071,7 @@ void MissionCoordinatorNode::transfer_effect() {
         result = machine_.transfer_failed("PLC_TIMEOUT");
       }
       auto continue_mission = [this, generation, result](bool cleared) {
-        if (!goal_ || generation != mission_generation_ || finishing_)
+        if (!owns_goal(generation) || finishing_)
           return;
         if (!cleared) {
           restart_required_ = true;
@@ -721,14 +1097,21 @@ void MissionCoordinatorNode::transfer_effect() {
           confirmed = future.get()->accepted;
         } catch (const std::exception &) {
         }
-        if (!confirmed) {
+        if (!confirmed || result.state == MissionState::Failed) {
           restart_required_ = true;
           finish(result.error_code);
           return;
         }
-        waiting_resource_ = true;
-        resources_.exited(held_resource_, machine_.mission().mission_id);
-        resource_gate_.release(held_resource_, continue_mission);
+        station_staged_ = false;
+        if (result.state == MissionState::Completed) {
+          station_exiting_ = station_terminal_exit_ = true;
+          navigate_target(station_exit_.at(held_resource_));
+        } else {
+          transition(result);
+          active_route_.clear();
+          route_index_ = 0;
+          navigate();
+        }
       } else
         continue_mission(true);
     });
@@ -744,14 +1127,39 @@ void MissionCoordinatorNode::transfer_effect() {
   }
 }
 void MissionCoordinatorNode::tick() {
+  if (!get_node_base_interface()->get_context()->is_valid())
+    return;
   resources_.tick();
   if (!goal_) {
+    return;
+  }
+  if (!held_resource_.empty() && !waiting_resource_ &&
+      !resources_.authorized(held_resource_, machine_.mission().mission_id)) {
+    finish("RESOURCE_LEASE_LOST");
+    return;
+  }
+  if (!departure_station_.empty() && !waiting_resource_ &&
+      !resources_.authorized(departure_station_, machine_.mission().mission_id)) {
+    finish("RESOURCE_LEASE_LOST");
     return;
   }
   if (finishing_) {
     if (!resources_.cleanup_pending(machine_.mission().mission_id))
       finish(pending_finish_error_);
     return;
+  }
+  if (refresh_active_) {
+    // Timely complete DDS proof remains valid if executor pressure delays this
+    // timer. ACK and pose receipts, not consumption time, own the deadline.
+    if (pose_current() && pose_receipt_ - refresh_sent_ <= refresh_timeout_) {
+      drop_pose_refresh();
+    } else if (wall_time() - refresh_sent_ >= refresh_timeout_) {
+      finish(refresh_request_id_ < 0 && !refresh_ready_
+                 ? "LOCALIZATION_REFRESH_FAILED"
+                 : "LOCALIZATION_REFRESH_TIMEOUT");
+      return;
+    } else
+      request_pose_refresh();
   }
   if (!deferred_error_.empty()) {
     auto error = deferred_error_;
@@ -763,17 +1171,29 @@ void MissionCoordinatorNode::tick() {
   consume_detections();
   if (waiting_resource_ || finishing_)
     return;
+  if (waiting_navigation_pose_) {
+    const auto target = pending_navigation_target_;
+    navigate_target(target);
+    return;
+  }
+  if (waiting_traffic_pose_) {
+    navigate();
+    return;
+  }
   const double elapsed = now().seconds() - phase_started_;
   if (navigation_completed_) {
     if (localized()) {
       navigation_arrived();
     } else if (elapsed >= timeout_ || elapsed < 0) {
       finish("STATION_NOT_CONFIRMED");
-    }
+    } else if (leases_enabled_ && !pose_current())
+      request_pose_refresh();
     return;
   }
   if (machine_.state() == MissionState::VerifyingPickup ||
       machine_.state() == MissionState::VerifyingDropoff) {
+    if (leases_enabled_ && !pose_current())
+      request_pose_refresh();
     if (elapsed >= timeout_ || elapsed < 0) {
       auto result = machine_.perception_timed_out();
       transition(result);
@@ -786,10 +1206,11 @@ void MissionCoordinatorNode::tick() {
   }
 }
 void MissionCoordinatorNode::finish(const std::string &error) {
-  if (!goal_) {
+  if (!owns_goal(mission_generation_)) {
     return;
   }
   finishing_ = true;
+  drop_pose_refresh();
   const bool safe_cleanup = resource_gate_.cancel();
   navigation_.cancel();
   if (!safe_cleanup && resources_.cleanup_pending(machine_.mission().mission_id)) {
@@ -822,18 +1243,38 @@ void MissionCoordinatorNode::finish(const std::string &error) {
   result->error_code = error;
   result->message = error.empty() ? "Mission completed" : error;
   event("mission_finished", result->final_state, error);
-  if (error.empty()) {
-    goal_->succeed(result);
-  } else if (error == "MISSION_CANCELED" && goal_->is_canceling()) {
-    goal_->canceled(result);
-  } else {
-    goal_->abort(result);
+  // Revoke this generation before publication; no continuation can publish a
+  // second result or apply an effect to this retiring goal.
+  auto handle = std::move(goal_);
+  ++mission_generation_;
+  try {
+    if (get_node_base_interface()->get_context()->is_valid()) {
+      if (error.empty()) {
+        handle->succeed(result);
+      } else if (error == "MISSION_CANCELED" && handle->is_canceling()) {
+        handle->canceled(result);
+      } else {
+        handle->abort(result);
+      }
+    } else {
+      server_.reset();
+    }
+  } catch (const std::exception &) {
+    // Shutdown can invalidate the context between the ownership check and the
+    // action transition/publication. Never mask errors in a live context.
+    if (get_node_base_interface()->get_context()->is_valid())
+      throw;
+    server_.reset();
   }
-  goal_.reset();
   reserved_ = false;
   pose_valid_ = false;
   navigation_completed_ = false;
   waiting_resource_ = crossing_resource_ = finishing_ = false;
+  station_staged_ = station_exiting_ = station_terminal_exit_ = false;
+  waiting_traffic_pose_ = clearing_traffic_ = false;
+  waiting_navigation_pose_ = false;
+  pending_navigation_target_.clear();
+  departure_station_.clear();
   pending_finish_error_.clear();
   active_route_.clear();
   route_index_ = 0;
@@ -841,7 +1282,6 @@ void MissionCoordinatorNode::finish(const std::string &error) {
   stamps_.clear();
   pending_detections_.clear();
   last_stamp_ = received_stamp_ = -1;
-  ++mission_generation_;
   machine_.reset();
 }
 } // namespace mission_coordinator

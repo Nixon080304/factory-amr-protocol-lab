@@ -1,5 +1,95 @@
 # Factory AMR Protocol Lab
 
+Two simulated AMRs share a factory aisle, assembly and inspection stations,
+and one charging dock. A central fleet manager chooses an eligible robot by
+path cost, keeps exact resource leases, and journals missions in SQLite. Each
+robot keeps its own Nav2, localization, camera, battery and execution stack.
+MQTT is the mission boundary; ROS 2 DDS is the robot boundary; Modbus TCP is
+the station boundary. This is a simulation project, not a physical safety system.
+
+![Real two-robot Gazebo pickup, transport, delivery and charging](docs/assets/two-robot-fleet.gif)
+
+Orange motor travels on `amr_01` from the blue assembly bench to the green
+inspection bench while `amr_02` charges on the green dock. This is real Gazebo
+window capture at 4× playback, not generated motion or a dashboard animation.
+
+![Live fleet dashboard showing loaded worker and charging robot](docs/assets/fleet-dashboard.png)
+
+The read-only dashboard shows robot identity, modeled battery, payload,
+assignment and capacity-one ownership. Lease credentials are not published.
+See [capture provenance and measured proof](docs/validation/latest-results.md#fleet-evidence-8-october-2026).
+
+## Fleet quick start
+
+After the dependency setup below and `colcon build --symlink-install`, start
+the automatic demonstration in one command:
+
+```bash
+DISPLAY=:0 scripts/run_fleet_demo.sh
+```
+
+Within the first minute the dashboard and both robot stacks start. The full
+run takes several minutes: one robot charges from 25% to 80% while the other
+delivers a motor. The working robot subsequently charges on a distinct dock
+lease after the first robot exits safely, then two automatic missions run in a
+fresh world. Each run
+prints its local dashboard URL and unique artifact directory. Ctrl+C stops
+only processes and services created by that run. `--headless` omits Gazebo
+windows; rendered camera detection still needs a working display.
+
+The fleet supports two full Gazebo/Nav2 stacks. Ten synthetic DDS agents prove
+registration, heartbeat, cost, deterministic assignment and bounded completion;
+ten simultaneous Gazebo worlds or physical robots are not claimed. Adding an
+agent changes configuration rather than scheduler or robot-specific branches.
+Lease-enabled routes currently support one traffic segment per station leg.
+Multi-segment routes are rejected until protected handoff bays exist; this is
+a route-geometry limitation, not a robot-count limit.
+More than two physical contenders need distinct protected waiting bays; the
+supplied waiting layout is not a ten-robot Gazebo safety claim.
+Dock exits use dedicated configured bays. Only the demonstrated assembly-to-
+inspection direction has validated post-mission dock approaches; free-floor
+travel relies on Nav2 obstacle avoidance, not general multi-agent path planning.
+Each simulated robot has one part lifecycle; each acceptance scenario starts
+a fresh world. Battery percentages come from a deterministic simulation model.
+
+```bash
+scripts/run_ci_checks.sh
+DISPLAY=:0 scripts/run_fleet_acceptance.sh --headless --scenario all --timeout 900
+```
+
+The first command runs the local non-Gazebo gate, including a real browser and
+ten-agent DDS proof. The second explicitly runs real two-robot Gazebo/Nav2,
+MQTT and ownership-enabled Modbus scenarios plus robot-failure and scale proof.
+Receipts include exact leases, sampled world poses, fleet snapshots and child
+exit status. Current fleet changes require their own hosted workflow result;
+the previously observed hosted result below belongs to Version 1.
+
+See [fleet operations](docs/fleet-operations.md) for failure semantics,
+artifact anatomy, process ownership and troubleshooting. The implementation
+runs on Ubuntu 22.04/ROS 2 Humble with Gazebo Classic, a rendering display,
+Docker and local build tools. Two Nav2 stacks are a laptop workload; CPU,
+graphics-driver and memory constraints can lengthen startup and execution.
+Dependencies and initial build are not included in the 60-second startup.
+The local evidence machine has 16 logical CPU threads and 16 GiB RAM with a
+working graphics driver. This is an observed test platform, not a guaranteed
+minimum; software rendering or memory pressure can exceed the bounded deadline.
+
+```mermaid
+flowchart LR
+    Client[Mission client] -->|MQTT QoS 1| Gateway[MQTT gateway]
+    Gateway -->|Fleet action / DDS| Fleet[Fleet manager + SQLite]
+    Fleet -->|Assignment + exact leases / DDS| Robots[Two namespaced AMR stacks]
+    Robots -->|Transfer service / DDS| Modbus[Modbus gateway]
+    Modbus -->|Modbus TCP| PLC[Assembly + inspection PLC]
+    Fleet -->|Read-only SSE| Dashboard[Local fleet dashboard]
+```
+
+## Version 1 evidence and compatibility
+
+The following recording and source-bound results document the original
+single-robot path. Its pinned `amr_01` JSON request remains valid through the
+fleet boundary; the original `scripts/run_demo.sh` command is retained.
+
 A ROS 2 Humble simulation of a mobile robot carrying a motor part from assembly
 to inspection. Nav2 and AMCL navigate on a committed map, a rendered RGB camera
 confirms ArUco markers, MQTT accepts missions, and real Modbus TCP handshakes
@@ -111,15 +201,20 @@ Each stage prints RUN/PASS/FAIL. The first failed stage stops the runner and
 preserves its exit code; the success line appears only after every stage passes.
 
 The gates check Python formatting and lint, C++ formatting and correctness/
-portability lint, a symlink build of all 10 ROS packages, package tests and fresh
+portability lint, a symlink build of all 12 ROS packages, package tests and fresh
 colcon results, pure Python tests, ROS interface contracts, MQTT JSON schemas,
 and real Mosquitto/Modbus integration fixtures. C++ performance suggestions are
 advisory and are not part of the blocking lint categories. Colcon restricts
 Python discovery to each package's `test` directory and excludes the rendered
 camera and Gazebo payload tests; CTest excludes the simulation-topic and
-navigation-goal launch tests. A unique result directory under `build/` retains
-only this run's colcon results for inspection. Existing local result files are
-preserved. The protocol fixtures own ephemeral loopback services and verify
+navigation-goal and two-robot fleet launch tests. The runner also checks bounded
+fleet/failure/ten-agent behavior and the real dashboard browser. Each run prints
+a unique `artifacts/ci/<run-id>/` directory containing its fresh build, install,
+logs and `test-results`. Test generation and result inspection use that exact
+root; the remaining stages source that fresh install. Existing local result
+files are preserved. A bare result scan of an old `build/` tree can include
+historical RED runs and is not current verification. The protocol fixtures own
+ephemeral loopback services and verify
 cleanup. Their bounded navigation driver is not physical autonomy coverage.
 The additional QoS/reset tests use actual DDS and ROS service endpoints, without
 starting Gazebo.
@@ -137,11 +232,18 @@ set -e
 source .venv/bin/activate
 source /opt/ros/humble/setup.bash
 export PYTHONNOUSERSITE=1 ROS_LOCALHOST_ONLY=1
-colcon build --symlink-install
-source install/setup.bash
-DISPLAY=:0 colcon test --event-handlers console_direct+
-colcon test-result --verbose
-DISPLAY=:0 python3 -m pytest -q tests src/*/test
+mkdir -p artifacts
+verification_root=$(mktemp -d "$PWD/artifacts/full-verification.XXXXXX")
+colcon --log-base "$verification_root/log" build --symlink-install \
+  --test-result-base "$verification_root/test-results" \
+  --build-base "$verification_root/build" --install-base "$verification_root/install"
+source "$verification_root/install/setup.bash"
+export FACTORY_INSTALL_SETUP="$verification_root/install/setup.bash"
+DISPLAY=:0 colcon --log-base "$verification_root/log" test --executor sequential --return-code-on-test-failure \
+  --build-base "$verification_root/build" --install-base "$verification_root/install" \
+  --test-result-base "$verification_root/test-results" --event-handlers console_direct+
+colcon test-result --verbose --test-result-base "$verification_root/test-results"
+DISPLAY=:0 .venv/bin/python3 -m pytest -q tests
 DISPLAY=:0 timeout 300s python3 -m pytest -q tests/system/test_successful_mission.py -s
 git diff --check
 ```
@@ -149,9 +251,20 @@ git diff --check
 The system test runs actual Gazebo motion, AMCL/Nav2, rendered camera detection,
 an owned broker and PLC, and MQTT mission delivery. It checks exactly one
 execution, both PLC counters, payload transitions, final independent world and
-localization poses, duplicate suppression, and observer artifacts. Domain 80
-is reserved for this test; package tests use 72–79. Services, ports, Gazebo
-master, and output directory are isolated per run.
+localization poses, duplicate suppression, and observer artifacts. The direct
+success probe defaults to domain 80. Fleet and Version 1 scenario runners and
+restart fixtures share cross-process locked domains in 20–69, excluding the
+inherited domain and unsafe host UDP port ranges. Standalone physical package
+probes use explicit isolated domains. Services, ports, Gazebo master, and
+output directory are isolated per run.
+
+Keep package tests in the unrestricted colcon command above. ROS launch_testing
+imports test modules by basename, and different packages intentionally have
+their own `test_node` modules and helpers. A monolithic `tests src/*/test`
+pytest invocation merges those namespaces and is not a valid repository gate.
+Unrestricted colcon tests every package in its own process; the following
+repository-level pytest command tests all top-level suites without omitting
+any package coverage or disabling launch_testing.
 
 ## Repeatable fault scenarios
 
@@ -215,7 +328,7 @@ share packages to the model browser. A retained GUI receipt contains 407
 missing-`model.config` diagnostics. This known browser noise is separate from
 actual mesh-resolution failures and is not a diagnosed Gazebo crash cause.
 
-The current supported GUI receipt at development revision
+The source-bound Version 1 GUI receipt at development revision
 `6b4f300f64cbd22270f69722278df0d083904340` records 24/24 zero child exits. It
 includes a production shutdown correction covered by focused lifecycle tests.
 An earlier attempt at revision `f47a4b779c90c17ae3fdf53416e98d8361726433`
@@ -229,5 +342,6 @@ failures, exact clocks, correction scope, and the passing receipt.
 
 Licensed under Apache-2.0. See [LICENSE](LICENSE).
 
-Shutdown exception policy is repeated across six entry points. Future policy
-changes must remain synchronized until a narrowly scoped common-module refactor.
+Shutdown exception policy remains localized in ROS entry points. Keep each guard
+narrow: inactive context and the exact observed shutdown error only. Active
+context and unrelated errors must remain visible.

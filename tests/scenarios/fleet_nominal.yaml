@@ -1,0 +1,7 @@
+name: nominal
+proof: gazebo_nav2
+timeout_sec: 300
+missions:
+  - {mission_id: fleet-auto-01, pickup: assembly, dropoff: inspection, part: motor}
+  - {mission_id: fleet-auto-02, pickup: assembly, dropoff: inspection, part: motor}
+assertions: [eligible_deterministic_assignment, two_completed, confirmed_payload_delivery, distinct_robots]

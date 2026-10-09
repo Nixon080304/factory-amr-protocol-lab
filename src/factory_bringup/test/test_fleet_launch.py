@@ -4,6 +4,8 @@
 from dataclasses import replace
 import importlib
 from pathlib import Path
+import math
+from types import MappingProxyType
 import xml.etree.ElementTree as ET
 
 from fleet_manager.config import Pose2D, RobotConfig, load_fleet_config
@@ -24,14 +26,140 @@ def production():
     return importlib.import_module("factory_bringup.fleet_launch")
 
 
+def test_launch_selects_installed_general_and_dock_trees():
+    module = production()
+    config = fleet(2)
+    share = Path(module.get_package_share_directory("factory_bringup"))
+    for robot in config.robots:
+        parameters = module.agent_parameters(config, robot, {})
+        assert parameters.get("dock.behavior_tree") == str(
+            share / "behavior_trees/dock_to_pose.xml"
+        )
+        assert Path(parameters["dock.behavior_tree"]).is_file()
+        path = module.nav2_parameters(
+            module.robot_launch_spec(robot), PACKAGE / "config/nav2_params.yaml"
+        ).perform(LaunchContext())
+        navigator = yaml.safe_load(Path(path).read_text())[robot.namespace.strip("/")][
+            "bt_navigator"
+        ]["ros__parameters"]
+        assert navigator.get("default_nav_to_pose_bt_xml") == str(
+            share / "behavior_trees/navigate_to_pose.xml"
+        )
+        assert navigator.get("default_nav_through_poses_bt_xml") == str(
+            share / "behavior_trees/navigate_through_poses.xml"
+        )
+        assert Path(navigator["default_nav_to_pose_bt_xml"]).is_file()
+        assert Path(navigator["default_nav_through_poses_bt_xml"]).is_file()
+        for path, controller, checker in (
+            (parameters["dock.behavior_tree"], "DockFollowPath", "dock_goal_checker"),
+            (
+                navigator["default_nav_to_pose_bt_xml"],
+                "GeneralFollowPath",
+                "general_goal_checker",
+            ),
+            (
+                navigator["default_nav_through_poses_bt_xml"],
+                "GeneralFollowPath",
+                "general_goal_checker",
+            ),
+        ):
+            follows = ET.parse(path).findall(".//FollowPath")
+            assert len(follows) == 1
+            assert follows[0].get("controller_id") == controller
+            assert follows[0].get("goal_checker_id") == checker
+
+
+def test_custom_navigation_trees_remain_explicit_overrides(tmp_path):
+    module = production()
+    source = tmp_path / "custom.yaml"
+    explicit = {
+        "default_nav_to_pose_bt_xml": "/operator/custom_pose.xml",
+        "default_nav_through_poses_bt_xml": "/operator/custom_poses.xml",
+    }
+    source.write_text(yaml.safe_dump({"bt_navigator": {"ros__parameters": explicit}}))
+    robot = fleet(2).robots[0]
+    path = module.nav2_parameters(module.robot_launch_spec(robot), source).perform(
+        LaunchContext()
+    )
+    values = yaml.safe_load(Path(path).read_text())["amr_01"]["bt_navigator"][
+        "ros__parameters"
+    ]
+    assert values["default_nav_to_pose_bt_xml"] == "/operator/custom_pose.xml"
+    assert values["default_nav_through_poses_bt_xml"] == "/operator/custom_poses.xml"
+
+
+def test_two_real_coordinators_receive_distinct_resolved_terminal_bays():
+    config = fleet(2)
+    values = [
+        production().coordinator_parameters(config, robot) for robot in config.robots
+    ]
+    assert [params["stations.inspection.exit_pose"] for params in values] == [
+        [4.2, 0.0, 0.0],
+        [5.0, 2.4, 0.0],
+    ]
+    assert [params["frame_prefix"] + "map" for params in values] == [
+        "amr_01/map",
+        "amr_02/map",
+    ]
+
+
+def test_launch_rejects_station_file_divergence_from_authoritative_approach():
+    config = fleet(2)
+    approaches = dict(config.station_approach)
+    approaches["inspection"] = Pose2D(3.1, 0.8, math.pi / 2)
+    with pytest.raises(
+        ValueError, match="diverges from authoritative station_approach"
+    ):
+        production().fleet_launch_actions(
+            replace(config, station_approach=MappingProxyType(approaches)),
+            gui="false",
+            rviz="false",
+        )
+
+
+def test_launch_rejects_foreign_station_pose_frame(tmp_path, monkeypatch):
+    module = production()
+    document = yaml.safe_load((PACKAGE / "config/stations.yaml").read_text())
+    document["frame_id"] = "amr_02/map"
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config/stations.yaml").write_text(yaml.safe_dump(document))
+    original = module.get_package_share_directory
+    monkeypatch.setattr(
+        module,
+        "get_package_share_directory",
+        lambda package: (
+            str(tmp_path) if package == "factory_bringup" else original(package)
+        ),
+    )
+    with pytest.raises(ValueError, match="fleet approaches require the map frame"):
+        module.fleet_launch_actions(fleet(2), gui="false", rviz="false")
+
+
 def test_coordinator_parameters_carry_validated_routes_for_every_robot():
     # A missing route or copied identity would leave the coordinator ungated.
     module = production()
     config = fleet(10)
     for robot in config.robots:
         params = module.coordinator_parameters(config, robot)
+        assert params["stations.clearance_distance"] == 0.60
         assert params["robot_id"] == robot.robot_id
         assert params["frame_prefix"] == robot.frame_prefix
+        assert params["stations.assembly.bounds"] == [-3.5, -0.8, -1.7, 2.5]
+        assert params["stations.assembly.staging_pose"] == [
+            -2.3,
+            -2.2,
+            1.5707963267948966,
+        ]
+        assert params["stations.inspection.bounds"] == [1.7, -0.8, 3.5, 2.5]
+        for station in ("assembly", "inspection"):
+            pose = config.station_exit_poses[station][robot.robot_id]
+            assert params[f"stations.{station}.exit_pose"] == [pose.x, pose.y, pose.yaw]
+            approach = config.station_approach[station]
+            assert params[f"stations.{station}.pose"] == [
+                approach.x,
+                approach.y,
+                approach.yaw,
+            ]
         assert params["resource_leases_enabled"] is True
         assert tuple(params["routes.to_assembly.resources"]) == ("central_aisle",)
         assert params["routes.to_assembly.central_aisle.staging_pose"] == [
@@ -78,17 +206,50 @@ def fleet(size):
     config = load_fleet_config(PACKAGE / "config/fleet.yaml")
     if size == 2:
         return config
+    robots = tuple(
+        RobotConfig(
+            f"cart_{i:02}",
+            f"/warehouse/cart_{i:02}",
+            f"floor/cart_{i:02}/",
+            # Bounded north fan-out clears idle bays and committed map footprints.
+            # Namespace inspection still does not claim ten-robot physical motion.
+            Pose2D(
+                7.04 * math.cos(math.pi / 2 + (i - 5.5) * 0.09),
+                -3.5 + 7.04 * math.sin(math.pi / 2 + (i - 5.5) * 0.09),
+                i / 10,
+            ),
+            100.0,
+        )
+        for i in range(1, size + 1)
+    )
+    # Namespace-only launch inspection uses generic configuration-derived bays.
+    # These fan-out poses are not a ten-robot physical world or motion claim.
+    parking = MappingProxyType(
+        {
+            station: MappingProxyType(
+                {
+                    robot.robot_id: Pose2D(
+                        sign * (3 + 10 * math.cos(i * 0.12)),
+                        0.8 + 10 * math.sin(i * 0.12),
+                        0.0 if sign > 0 else math.pi,
+                    )
+                    for i, robot in enumerate(robots)
+                }
+            )
+            for station, sign in (("assembly", -1), ("inspection", 1))
+        }
+    )
     return replace(
         config,
-        robots=tuple(
-            RobotConfig(
-                f"cart_{i:02}",
-                f"/warehouse/cart_{i:02}",
-                f"floor/cart_{i:02}/",
-                Pose2D(float(i), -3.0, i / 10),
-                100.0,
-            )
-            for i in range(1, size + 1)
+        robots=robots,
+        station_exit_poses=parking,
+        docks=MappingProxyType(
+            {
+                name: replace(
+                    dock, exit_poses=MappingProxyType({}), departure_stations=()
+                )
+                for name, dock in config.docks.items()
+            }
         ),
     )
 
@@ -114,7 +275,7 @@ def test_each_configured_robot_gets_energy_agent_station_frames_and_dock(size):
         assert params["station_names"] == ("assembly", "inspection")
         assert params["stations.assembly.pose"] == (-3.0, 0.8, 1.5707963267948966)
         assert params["dock_id"] == "dock_01"
-        assert params["dock.charging_pose"] == (4.0, -2.0, 0.0)
+        assert params["dock.charging_pose"] == (4.0, -2.0, math.pi)
         assert params["energy.reserve_percent"] == 20.0
         assert params["energy.dock_allowance_m"] == 10.0
 
@@ -343,7 +504,14 @@ def test_navigation_actions_resolve_lifecycle_nodes_and_localization_parameters(
             resolved.append(node.node_name)
             if node.node_package == "nav2_lifecycle_manager":
                 params = evaluate_parameters(context, node._Node__parameters)[0]
-                assert tuple(params["node_names"]) == spec.navigation_nodes
+                # Nav2 bonds use server basenames inside the robot namespace.
+                assert tuple(params["node_names"]) == tuple(
+                    name.rsplit("/", 1)[-1] for name in spec.navigation_nodes
+                )
+                assert (
+                    tuple(f"{spec.namespace}/{name}" for name in params["node_names"])
+                    == spec.navigation_nodes
+                )
             else:
                 assert ("/tf", "tf") in node.expanded_remapping_rules
         assert set(spec.navigation_nodes) <= set(resolved)
@@ -408,6 +576,7 @@ def test_installed_fleet_entrypoint_consumes_config_and_world_overrides(size, tm
     from launch.launch_description_sources import PythonLaunchDescriptionSource
 
     data = yaml.safe_load((PACKAGE / "config/fleet.yaml").read_text())
+    model = fleet(size)
     data["robots"] = [
         {
             "robot_id": robot.robot_id,
@@ -416,10 +585,50 @@ def test_installed_fleet_entrypoint_consumes_config_and_world_overrides(size, tm
             "spawn": [robot.spawn.x, robot.spawn.y, robot.spawn.yaw],
             "battery_start_percent": robot.battery_start_percent,
         }
-        for robot in fleet(size).robots
+        for robot in model.robots
     ]
+    data["station_exit_poses"] = {
+        station: {
+            robot_id: [pose.x, pose.y, pose.yaw] for robot_id, pose in poses.items()
+        }
+        for station, poses in model.station_exit_poses.items()
+    }
+    if size != 2:
+        for dock in data["docks"].values():
+            dock.pop("exit_poses", None)
+            dock.pop("departure_stations", None)
     config = tmp_path / "fleet.yaml"
     config.write_text(yaml.safe_dump(data))
+    # The scale-only fixture must satisfy the same full initial-route validator;
+    # namespace inspection is not permission to use overlapping idle bays.
+    validated = load_fleet_config(config)
+    assert len(validated.robots) == size
+    if size != 2:
+        from PIL import Image
+
+        metadata = yaml.safe_load((PACKAGE / "maps/factory_map.yaml").read_text())
+        raster = Image.open(PACKAGE / "maps" / metadata["image"])
+        resolution = metadata["resolution"]
+        origin_x, origin_y, _ = metadata["origin"]
+        for index, robot in enumerate(validated.robots):
+            assert all(
+                math.hypot(robot.spawn.x - other.spawn.x, robot.spawn.y - other.spawn.y)
+                >= 0.60
+                for other in validated.robots[:index]
+            )
+            for dx in range(-6, 7):
+                for dy in range(-6, 7):
+                    if math.hypot(dx * resolution, dy * resolution) > 0.30:
+                        continue
+                    column = math.floor((robot.spawn.x - origin_x) / resolution) + dx
+                    row = (
+                        raster.height
+                        - 1
+                        - math.floor((robot.spawn.y - origin_y) / resolution)
+                        - dy
+                    )
+                    assert 0 <= column < raster.width and 0 <= row < raster.height
+                    assert raster.getpixel((column, row)) >= 254
     share = Path(get_package_share_directory("factory_bringup"))
     context = LaunchContext()
     context.launch_configurations.update(

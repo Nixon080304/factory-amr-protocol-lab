@@ -16,6 +16,9 @@ struct ResourceReply {
   std::string reason;
   bool reconciliation_required{false};
   bool ownership_resolved{false};
+  // True only for an authoritative capacity/backpressure service response.
+  // A transport failure is never a healthy wait, regardless of its reason text.
+  bool authoritative_wait{false};
 };
 class ResourceTransport {
 public:
@@ -39,7 +42,7 @@ class ResourceAdapter {
 public:
   using Notice = std::function<void(const ResourceNotice &)>;
   ResourceAdapter(std::shared_ptr<ResourceTransport> transport, std::string robot_id,
-                  std::function<double()> clock);
+                  std::function<double()> clock, double wait_timeout = 120.0);
   void acquire(const std::string &resource, const std::string &mission,
                Notice callback);
   void tick();

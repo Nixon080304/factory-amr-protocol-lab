@@ -1,0 +1,4 @@
+name: robot_failure
+proof: production_dds
+timeout_sec: 60
+assertions: [before_pickup_stop_clear_then_reassign, after_pickup_recovery_retains_carrier]

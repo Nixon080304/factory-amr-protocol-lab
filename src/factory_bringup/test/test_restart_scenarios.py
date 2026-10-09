@@ -1,5 +1,6 @@
 """Kill and restart the real fleet node against SQLite and real DDS fake agents."""
 
+import importlib
 import os
 from pathlib import Path
 import signal
@@ -19,6 +20,16 @@ from fleet_manager.models import MissionRequest, RobotSnapshot
 from fleet_manager.resources import LeaseKey, LeaseRequest, ResourceManager
 
 ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT / "tests/system"))
+
+
+@pytest.fixture
+def isolated_restart_domain():
+    reservation = importlib.import_module("fleet_isolation").Domain()
+    try:
+        yield reservation.id
+    finally:
+        reservation.close()
 
 
 MATRIX = [
@@ -92,7 +103,7 @@ MATRIX = [
 
 @pytest.mark.parametrize("state,ownership,held,mode,position,want", MATRIX)
 def test_actual_kill_restart_failure_matrix(
-    tmp_path, state, ownership, held, mode, position, want
+    tmp_path, state, ownership, held, mode, position, want, isolated_restart_domain
 ):
     import rclpy
     from factory_interfaces.action import ExecuteFactoryMission
@@ -111,6 +122,11 @@ def test_actual_kill_restart_failure_matrix(
         # Migration from Task 13 has neither station geometry nor lease history.
         data = yaml.safe_load(fleet_file.read_text())
         data.pop("resource_bounds", None)
+        data.pop("station_staging", None)
+        data.pop("station_approach", None)
+        data.pop("station_exit_poses", None)
+        for dock in data["docks"].values():
+            dock.pop("departure_stations", None)
         fleet_file = tmp_path / "legacy-fleet.yaml"
         fleet_file.write_text(yaml.safe_dump(data))
     config = load_fleet_config(fleet_file)
@@ -181,7 +197,7 @@ def test_actual_kill_restart_failure_matrix(
         journal.save_resources(resources.snapshot(2), 2)
     journal.close()
     context = Context()
-    domain_id = 100 + MATRIX.index((state, ownership, held, mode, position, want))
+    domain_id = isolated_restart_domain
     rclpy.init(context=context, domain_id=domain_id)
     peer = rclpy.create_node("restart_agents", context=context)
     executor = SingleThreadedExecutor(context=context)

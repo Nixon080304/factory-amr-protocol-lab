@@ -4,6 +4,23 @@ set -euo pipefail
 export PYTHONNOUSERSITE=1
 project_root=$(cd -- "${BASH_SOURCE[0]%/*}/.." && pwd)
 cd "$project_root"
+if [[ ${FACTORY_INSTALL_SETUP+x} ]]; then
+    [[ $FACTORY_INSTALL_SETUP == /* && -f $FACTORY_INSTALL_SETUP && -r $FACTORY_INSTALL_SETUP ]] || {
+        printf 'FACTORY_INSTALL_SETUP requires an absolute readable setup file\n' >&2
+        exit 2
+    }
+fi
+if [[ ${FACTORY_DASHBOARD_PORT+x} ]]; then
+    [[ $FACTORY_DASHBOARD_PORT =~ ^[0-9]+$ && ${#FACTORY_DASHBOARD_PORT} -le 5 ]] &&
+        ((10#$FACTORY_DASHBOARD_PORT >= 1 && 10#$FACTORY_DASHBOARD_PORT <= 65535)) || {
+        printf 'FACTORY_DASHBOARD_PORT must be an integer from 1 to 65535\n' >&2
+        exit 2
+    }
+fi
+if [[ ${FACTORY_JOURNAL_PATH+x} && $FACTORY_JOURNAL_PATH != /* ]]; then
+    printf 'FACTORY_JOURNAL_PATH must be absolute\n' >&2
+    exit 2
+fi
 [[ -f .venv/bin/activate ]] || { printf 'Run scripts/setup_dev.sh first.\n' >&2; exit 1; }
 set +u
 source .venv/bin/activate
@@ -121,16 +138,22 @@ for row in rows:
         raise SystemExit("Reused Compose ports must match the requested localhost ports")'
 fi
 # Incremental colcon builds changed inputs. Fail before sourcing stale installs.
-colcon build --symlink-install
+if [[ ! ${FACTORY_INSTALL_SETUP+x} ]]; then
+    colcon build --symlink-install
+fi
 set +u
-source install/setup.bash
+source "${FACTORY_INSTALL_SETUP:-install/setup.bash}"
 set -u
 mkdir -p "$project_root/artifacts"
 output_dir=${FACTORY_OUTPUT_DIR:-$(mktemp -d "$project_root/artifacts/demo-XXXXXXXX")}
 mkdir -p "$output_dir"
 printf 'ROS domain: %s; Compose project: %s; trace directory: %s\n' "$ROS_DOMAIN_ID" "$FACTORY_COMPOSE_PROJECT" "$output_dir"
+# Demo launch arguments
+observer_arguments=()
+[[ ! ${FACTORY_DASHBOARD_PORT+x} ]] || observer_arguments+=("dashboard_port:=$FACTORY_DASHBOARD_PORT")
+[[ ! ${FACTORY_JOURNAL_PATH+x} ]] || observer_arguments+=("journal_path:=$FACTORY_JOURNAL_PATH")
 setsid ros2 launch factory_bringup demo.launch.py "gui:=$gui" "rviz:=$rviz" \
-    "broker_port:=$FACTORY_MQTT_PORT" "plc_port:=$FACTORY_PLC_PORT" "output_dir:=$output_dir" &
+    "broker_port:=$FACTORY_MQTT_PORT" "plc_port:=$FACTORY_PLC_PORT" "output_dir:=$output_dir" "${observer_arguments[@]}" &
 launch_pid=$!
 setsid ros2 run factory_bringup factory_wait_ready &
 readiness_pid=$!

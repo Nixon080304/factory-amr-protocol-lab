@@ -64,7 +64,9 @@ def create_ros_robot(context, robot_id, namespace, cost=1.0, *, cost_available=T
 
     node = rclpy.create_node(f"fake_{robot_id}", namespace=namespace, context=context)
     node.goals = []
+    node.cost_requests = []
     node.finish = True
+    node.failed = False
     node.stage = "NAVIGATING_TO_DROPOFF"
     node.active = {}
     publisher = node.create_publisher(RobotState, "factory/robot_state", 10)
@@ -90,6 +92,7 @@ def create_ros_robot(context, robot_id, namespace, cost=1.0, *, cost_available=T
     node.heartbeat_timer = node.create_timer(0.1, heartbeat)
 
     def estimate(request, response):
+        node.cost_requests.append(request)
         response.feasible = True
         response.path_cost = cost
         response.predicted_final_battery = 50.0
@@ -112,15 +115,21 @@ def create_ros_robot(context, robot_id, namespace, cost=1.0, *, cost_available=T
         )
 
     def execute(handle):
-        success = not handle.is_cancel_requested
+        success = not handle.is_cancel_requested and not node.failed
         if success:
             handle.succeed()
-        else:
+        elif handle.is_cancel_requested:
             handle.canceled()
+        else:
+            handle.abort()
         return ExecuteFactoryMission.Result(
             success=success,
             final_state="COMPLETED" if success else "FAILED",
-            error_code="" if success else "CANCELLED",
+            error_code=""
+            if success
+            else "ROBOT_OFFLINE"
+            if node.failed
+            else "CANCELLED",
         )
 
     node.server = ActionServer(

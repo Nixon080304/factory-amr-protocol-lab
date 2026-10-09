@@ -94,6 +94,14 @@ def main(args=None):
             for message in ("context is invalid", "context is not valid")
         ):
             raise
+    except RuntimeError as error:
+        # SIGINT can interrupt generated Image conversion inside native take.
+        # Keep active-context and unrelated detector errors visible.
+        if rclpy.ok() or str(error) != (
+            "Unable to convert call argument to Python object "
+            "(compile in debug mode for details)"
+        ):
+            raise
     finally:
         executor.shutdown()
         if node is not None:

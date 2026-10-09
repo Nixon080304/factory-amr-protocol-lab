@@ -183,7 +183,7 @@ def test_modbus_entrypoint_drains_owned_worker_before_node_destruction(
                 raise RuntimeError("queued callback failed")
 
         # Saturate the owned Humble pool, then queue an actual ROS timer handler.
-        for _ in range(2):
+        for _ in range(executor._executor._max_workers):
             executor._executor.submit(lambda: release.wait(timeout=2))
         node = executor.get_nodes()[0]
         node.create_timer(0.001, callback, clock=rclpy.clock.Clock())
@@ -197,9 +197,13 @@ def test_modbus_entrypoint_drains_owned_worker_before_node_destruction(
 
     monkeypatch.setattr(module.ModbusGatewayNode, "destroy_node", destroy)
     monkeypatch.setattr(module.MultiThreadedExecutor, "spin", stopped)
-    if queued_error:
-        with pytest.raises(RuntimeError, match="queued callback failed"):
+    try:
+        if queued_error:
+            with pytest.raises(RuntimeError, match="queued callback failed"):
+                module.main(args=["--ros-args", *entrypoint_args])
+        else:
             module.main(args=["--ros-args", *entrypoint_args])
-    else:
-        module.main(args=["--ros-args", *entrypoint_args])
+    finally:
+        release.set()
+        rclpy.try_shutdown()
     assert destroyed == [True]

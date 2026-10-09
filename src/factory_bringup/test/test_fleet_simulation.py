@@ -19,7 +19,7 @@ from nav_msgs.msg import Odometry
 import pytest
 import rclpy
 from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
-from sensor_msgs.msg import Image, LaserScan
+from sensor_msgs.msg import Image, JointState, LaserScan
 from std_msgs.msg import String
 from tf2_msgs.msg import TFMessage
 
@@ -70,6 +70,7 @@ class TestFleetSimulation(unittest.TestCase):
                     ("odom", Odometry),
                     ("scan", LaserScan),
                     ("camera/image_raw", Image),
+                    ("joint_states", JointState),
                 ):
                     topic = f"/{robot}/{name}"
                     qos = (
@@ -93,13 +94,47 @@ class TestFleetSimulation(unittest.TestCase):
                         qos_profile_sensor_data,
                     )
                 )
+                subscriptions.append(
+                    node.create_subscription(
+                        TFMessage,
+                        f"/{robot}/tf_static",
+                        lambda message, robot=robot: receive_tf(robot, message),
+                        QoSProfile(
+                            depth=10, durability=DurabilityPolicy.TRANSIENT_LOCAL
+                        ),
+                    )
+                )
             deadline = time.monotonic() + 100
+            lifecycle_clients = {}
+            lifecycle_names = (
+                "map_server",
+                "amcl",
+                "controller_server",
+                "smoother_server",
+                "planner_server",
+                "behavior_server",
+                "bt_navigator",
+                "waypoint_follower",
+                "velocity_smoother",
+            )
+            # Retain all reverse DDS response readers before startup sampling.
+            # Forward service discovery alone does not prove that a freshly
+            # created client's response reader is known by the server writer.
+            for robot in ("amr_01", "amr_02"):
+                for name in lifecycle_names:
+                    client = node.create_client(GetState, f"/{robot}/{name}/get_state")
+                    clients.append(client)
+                    lifecycle_clients[robot, name] = client
+            self.assertEqual(len(clients), 18)
 
             def ready():
-                return len(messages) == 8 and all(
+                return len(messages) == 10 and all(
                     {
                         (f"{robot}/map", f"{robot}/odom"),
                         (f"{robot}/odom", f"{robot}/base_footprint"),
+                        (f"{robot}/base_link", f"{robot}/base_scan"),
+                        (f"{robot}/base_link", f"{robot}/camera_link"),
+                        (f"{robot}/camera_link", f"{robot}/camera_optical_frame"),
                     }
                     <= transforms[robot]
                     for robot in ("amr_01", "amr_02")
@@ -107,9 +142,13 @@ class TestFleetSimulation(unittest.TestCase):
 
             while not ready() and time.monotonic() < deadline:
                 rclpy.spin_once(node, timeout_sec=0.05)
+            self.assertTrue(
+                ready(),
+                f"missing sensor or dynamic/static TF evidence: {sorted(messages)}, {transforms}",
+            )
             self.assertEqual(
                 len(messages),
-                8,
+                10,
                 f"missing robot description/sensor evidence: {sorted(messages)}",
             )
             for index, robot in enumerate(("amr_01", "amr_02")):
@@ -130,6 +169,17 @@ class TestFleetSimulation(unittest.TestCase):
                     f"{robot}/camera_optical_frame",
                 )
                 self.assertIn((f"{robot}/map", f"{robot}/odom"), transforms[robot])
+                self.assertTrue(
+                    all(
+                        parent.startswith(robot + "/") and child.startswith(robot + "/")
+                        for parent, child in transforms[robot]
+                    ),
+                    f"cross-robot or unprefixed TF in {robot}: {transforms[robot]}",
+                )
+                self.assertEqual(
+                    set(messages[f"/{robot}/joint_states"].name),
+                    {f"{robot}/wheel_left_joint", f"{robot}/wheel_right_joint"},
+                )
                 self.assertIn(
                     (f"{robot}/odom", f"{robot}/base_footprint"), transforms[robot]
                 )
@@ -139,21 +189,10 @@ class TestFleetSimulation(unittest.TestCase):
                 pose = get_entity_pose(
                     node, robot, timeout_sec=min(5.0, deadline - time.monotonic())
                 )
-                self.assertAlmostEqual(pose.position.x, float(index), delta=0.1)
-                self.assertAlmostEqual(pose.position.y, -3.0, delta=0.1)
-                for name in (
-                    "map_server",
-                    "amcl",
-                    "controller_server",
-                    "smoother_server",
-                    "planner_server",
-                    "behavior_server",
-                    "bt_navigator",
-                    "waypoint_follower",
-                    "velocity_smoother",
-                ):
-                    client = node.create_client(GetState, f"/{robot}/{name}/get_state")
-                    clients.append(client)
+                self.assertAlmostEqual(pose.position.x, (-1.1, 5.2)[index], delta=0.1)
+                self.assertAlmostEqual(pose.position.y, -3.4, delta=0.1)
+                for name in lifecycle_names:
+                    client = lifecycle_clients[robot, name]
                     self.assertTrue(
                         client.wait_for_service(
                             timeout_sec=max(0.0, min(2.0, deadline - time.monotonic()))

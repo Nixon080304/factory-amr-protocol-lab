@@ -205,6 +205,52 @@ class FleetCore:
         record = self._journal.get(mission_id)
         if record.state not in _SCHEDULABLE:
             return AssignmentDecision(None, "mission is not schedulable")
+        if record.state == MissionState.REASSIGNING:
+            events = self._journal.events(mission_id)
+            assignment = next(
+                (
+                    event
+                    for event in reversed(events)
+                    if event.state == MissionState.ASSIGNED
+                    and event.detail.get("assigned_robot_id")
+                ),
+                None,
+            )
+            lost = next(
+                (
+                    event
+                    for event in reversed(events)
+                    if event.state == MissionState.REASSIGNING
+                ),
+                None,
+            )
+            if assignment is None or lost is None:
+                return AssignmentDecision(
+                    None, "former assignment requires reconciliation"
+                )
+            former = assignment.detail["assigned_robot_id"]
+            old = self._registry.get(former, now)
+            if not (
+                self._registry.observed_after(former, lost.timestamp)
+                and robot_is_ready(old)
+                and old.payload_state == "EMPTY"
+                and not old.mission_id
+            ):
+                return AssignmentDecision(
+                    None, "former robot stop and empty-payload proof required"
+                )
+            for resource in self._resources.snapshot(now):
+                if resource.reconciliation_required and (
+                    resource.resource_id
+                    in (record.request.pickup_station, record.request.dropoff_station)
+                    or any(
+                        lease.robot_id == former or lease.mission_id == mission_id
+                        for lease in resource.former_leases
+                    )
+                ):
+                    return AssignmentDecision(
+                        None, "former resource clearance required"
+                    )
         reserved = {
             active.assigned_robot_id
             for active in self._journal.load_active()

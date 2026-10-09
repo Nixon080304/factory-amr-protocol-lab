@@ -10,7 +10,8 @@ namespace mission_coordinator {
 // All callbacks use the node's mutually exclusive default callback group.
 class NavigationAdapter {
 public:
-  explicit NavigationAdapter(rclcpp::Node *node);
+  using Diagnostic = std::function<void(const std::string &, const std::string &)>;
+  explicit NavigationAdapter(rclcpp::Node *node, Diagnostic diagnostic = {});
   void navigate(const geometry_msgs::msg::PoseStamped &pose,
                 std::function<void(bool)> done);
   void clear_costmaps(std::function<void(bool)> done,
@@ -24,5 +25,6 @@ private:
   rclcpp_action::ClientGoalHandle<Nav>::SharedPtr goal_;
   rclcpp::Client<Clear>::SharedPtr local_, global_;
   uint64_t generation_{0};
+  Diagnostic diagnostic_;
 };
 } // namespace mission_coordinator

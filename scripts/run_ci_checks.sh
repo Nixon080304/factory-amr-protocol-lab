@@ -7,6 +7,8 @@ project_root=$(cd -- "${BASH_SOURCE[0]%/*}/.." && pwd)
 cd "$project_root"
 # ROS and colcon overlays can reference unset variables.
 set +u
+# Build against the declared ROS underlay, never an inherited project install.
+unset AMENT_PREFIX_PATH CMAKE_PREFIX_PATH COLCON_PREFIX_PATH PYTHONPATH LD_LIBRARY_PATH
 source /opt/ros/humble/setup.bash
 source .venv/bin/activate
 set -u
@@ -34,22 +36,32 @@ run_stage 'C++ lint' cppcheck --enable=warning,portability --error-exitcode=1 \
     --std=c++17 --inline-suppr '-DTEST(suite,name)=void suite##_##name()' \
     '-DTEST_F(suite,name)=void suite##_##name()' -Isrc/mission_coordinator/include \
     src/mission_coordinator/src src/mission_coordinator/test
-run_stage 'ROS build' colcon build --symlink-install --event-handlers console_direct+
+mkdir -p "$project_root/artifacts/ci"
+run_root=$(mktemp -d "$project_root/artifacts/ci/$(date -u +%Y%m%dT%H%M%SZ)-run.XXXXXX")
+result_base="$run_root/test-results"
+mkdir -p "$result_base"
+printf 'CI artifacts: %s\n' "$run_root"
+run_stage 'ROS build' colcon --log-base "$run_root/log" build --symlink-install \
+    --build-base "$run_root/build" --install-base "$run_root/install" \
+    --test-result-base "$result_base" \
+    --event-handlers console_direct+
 set +u
-source install/setup.bash
+source "$run_root/install/setup.bash"
 set -u
-# A unique result base excludes retained local Gazebo XML from this gate.
-# Keep results for inspection; no existing build/test artifacts are deleted.
-result_base=$(mktemp -d "$project_root/build/ci-results.XXXXXX")
+# Use only this invocation's generated results. Retain every historical run.
 printf 'Fresh non-Gazebo colcon results: %s\n' "$result_base"
-run_stage 'ROS tests' colcon test --return-code-on-test-failure \
+run_stage 'ROS tests' colcon --log-base "$run_root/log" test --return-code-on-test-failure \
+    --executor sequential \
+    --build-base "$run_root/build" --install-base "$run_root/install" \
     --test-result-base "$result_base" --event-handlers console_direct+ \
-    --ctest-args ' -E' 'test_simulation_topics|test_navigation_goal' \
+    --ctest-args ' -E' 'test_simulation_topics|test_navigation_goal|test_fleet_simulation' \
     --pytest-args test " --ignore=$project_root/src/station_perception/test/test_camera_integration.py" \
     " --ignore=$project_root/src/payload_simulator/test/test_gazebo_payload.py"
-run_stage 'ROS test results' colcon test-result --verbose --test-result-base "$result_base"
+run_stage 'ROS test results' colcon --log-base "$run_root/log" test-result --verbose --test-result-base "$result_base"
 run_stage 'Pure tests' python3 -m pytest -q tests/scripts tests/scenarios tests/docs src/plc_simulator/test
 run_stage 'Contracts and schemas' python3 -m pytest -q tests/contracts src/mqtt_gateway/test/test_validator.py
+run_stage 'Fleet bounded system' python3 -m pytest -q tests/system/test_two_robot_fleet.py tests/system/test_ten_robot_scale.py tests/system/test_endpoint_readiness.py tests/system/test_legacy_readiness.py
+run_stage 'Fleet dashboard browser' node tests/browser/test_fleet_dashboard.mjs
 # Existing reviewed fixtures own ephemeral loopback Mosquitto/Modbus peers and
 # verify their cleanup. The protocol driver replaces navigation, not services.
 run_stage 'Real protocol integration' python3 -m pytest -q -s tests/integration \

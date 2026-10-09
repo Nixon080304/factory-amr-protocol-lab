@@ -56,11 +56,14 @@ class DockingController:
         contact_timeout=1.0,
         navigation_timeout=60.0,
         service_timeout=1.0,
+        exit_pose=None,
+        diagnostic=None,
     ):
         if (
             not identifier(dock_id)
             or not finite_pose(staging_pose)
             or not finite_pose(charging_pose)
+            or (exit_pose is not None and not finite_pose(exit_pose))
         ):
             raise ValueError("dock requires an identity and finite poses")
         bounds = (
@@ -84,12 +87,15 @@ class DockingController:
         ):
             raise ValueError("dock staging must be outside charging tolerance")
         self.agent, self.transport, self.clock = agent, transport, clock
+        self._diagnostic = diagnostic
         self.dock_id, self.staging, self.charging = (
             dock_id,
             tuple(staging_pose),
             tuple(charging_pose),
         )
         self.tolerance, self.yaw_tolerance = tolerance, yaw_tolerance
+        # V1 leaves the exit unset and returns to the session's initial pose.
+        self.configured_exit = None if exit_pose is None else tuple(exit_pose)
         self.robot_radius = robot_radius
         self.contact_timeout, self.nav_timeout, self.service_timeout = (
             contact_timeout,
@@ -99,6 +105,7 @@ class DockingController:
         self.state, self.active = "IDLE", False
         self.key, self.lease_until, self.renew_at = None, 0.0, 0.0
         self._generation = 0
+        self._last_start_fence = None
         self._pending = None
         self._acquiring = set()
         self._cleanup = set()
@@ -107,11 +114,48 @@ class DockingController:
         self._cancelled = False
         self._nav_cancel, self._nav_done = None, False
         self._nav_sequence = 0
+        self._refresh = None
         self._contact, self._contact_until = False, 0.0
         self.exit_pose = None
         self._next = 0.0
         self._feedback, self._result = None, None
         agent.configure_dock(dock_id, self.charging, tolerance, yaw_tolerance)
+
+    def diagnose(self, event, **fields):
+        """Observer-only bounded evidence; a failed logger cannot alter docking."""
+        if self._diagnostic is not None:
+            try:
+                self._diagnostic(
+                    dict(
+                        event=event,
+                        robot_id=self.agent.robot_id,
+                        generation=self._generation,
+                        state=self.state,
+                        **fields,
+                    )
+                )
+            except Exception:
+                pass
+
+    def evidence(self):
+        now = self.clock()
+
+        def age(receipt):
+            return None if receipt is None else now - receipt
+
+        return dict(
+            mode=self.agent.mode,
+            payload_state=self.agent.payload_state,
+            mission_present=bool(self.agent.mission_id),
+            active=self.active,
+            health_detail=self.agent._health(now),
+            pose=self.agent.pose,
+            pose_source_stamp=self.agent._pose_stamp,
+            pose_receipt_age_sec=age(self.agent._pose_receipt),
+            odom_receipt_age_sec=age(self.agent._odom_receipt),
+            battery_percent=self.agent.energy.battery_percent,
+            lease_present=bool(self.key and self.key.lease_id),
+        )
 
     def at(self, pose):
         current = self.agent.pose
@@ -148,15 +192,22 @@ class DockingController:
     def start(self, target, feedback, result):
         target = percentage(target, "target_percent")
         if not self.can_start():
+            self._start_fence("robot_unavailable")
             return False
         if self.at(self.charging):
             self.agent.mode = "RECOVERY_REQUIRED"
+            self._start_fence("already_at_charging")
             return False
         if not self._clear_for_handoff(self.agent.pose, self.tolerance):
             # The return arrival region must clear the next dock cycle.
             self.agent.mode = "RECOVERY_REQUIRED"
+            self._start_fence("initial_clearance")
             return False
-        self.exit_pose = tuple(self.agent.pose)
+        self.exit_pose = self.configured_exit or tuple(self.agent.pose)
+        if not self._clear_for_handoff(self.exit_pose, self.tolerance):
+            self.agent.mode = "RECOVERY_REQUIRED"
+            self._start_fence("exit_clearance")
+            return False
         self._generation += 1
         self.active, self._cancelled, self._resolved = True, False, False
         self._feedback, self._result, self.target = feedback, result, target
@@ -171,11 +222,25 @@ class DockingController:
         self._navigate("STAGING", self.staging)
         return True
 
+    def _start_fence(self, reason):
+        signature = (self._generation, reason)
+        if signature != self._last_start_fence:
+            self._last_start_fence = signature
+            self.diagnose(
+                "dock_start_fence",
+                reason=reason,
+                exit_pose=self.configured_exit,
+                **self.evidence(),
+            )
+
     def _state(self, state):
+        previous = self.state
         self.state = state
         self.agent._advance()
         self.agent.mode = "CHARGING" if state == "CHARGING" else "DOCKING"
         self._authorize()
+        if previous != state:
+            self.diagnose("dock_state", previous_state=previous, **self.evidence())
         if self._feedback:
             self._feedback(DockFeedback(state, self.agent.energy.battery_percent))
 
@@ -188,6 +253,7 @@ class DockingController:
         )
 
     def _navigate(self, state, pose):
+        self._drop_refresh()
         self._state(state)
         self._nav_sequence += 1
         sequence, generation = self._nav_sequence, self._generation
@@ -216,16 +282,81 @@ class DockingController:
                     False, "NAVIGATION_FAILED", reason, recovery=state != "STAGING"
                 )
             else:
-                self.tick()
+                self._request_localization()
 
         try:
             cancel = self.transport.navigate(
-                pose, self.agent.frame_prefix + "map", completed
+                pose,
+                self.agent.frame_prefix + "map",
+                completed,
+                precise=state == "ENTERING",
             )
             if self.active and sequence == self._nav_sequence and not self._nav_done:
                 self._nav_cancel = cancel
         except Exception as error:
             completed(False, str(error), False)
+
+    def _drop_refresh(self):
+        refresh, self._refresh = self._refresh, None
+        if refresh is not None and refresh["cancel"] is not None:
+            try:
+                refresh["cancel"]()
+            except Exception:
+                # The generation/token fence still rejects late replies.
+                pass
+
+    def _request_localization(self):
+        """One bounded no-motion update per terminal navigation result.
+
+        A service acknowledgement does not prove arrival. Only an accepted pose
+        with a newer source stamp at or after the request's ROS epoch, received
+        after this navigation result, can pass the physical arrival gates.
+        """
+        generation, sequence = self._generation, self._nav_sequence
+        refresh = {
+            "stamp": self.agent._pose_stamp,
+            "sent": self.clock(),
+            "epoch": None,
+            "ready": False,
+            "cancel": None,
+            "reported": set(),
+        }
+        self._refresh = refresh
+
+        def received(success):
+            if (
+                not self.active
+                or generation != self._generation
+                or sequence != self._nav_sequence
+                or self._refresh is not refresh
+            ):
+                return
+            if not success:
+                self._finish(False, "LOCALIZATION_REFRESH_FAILED", recovery=True)
+                return
+            refresh["ready"] = True
+            self.diagnose("dock_refresh_response", success=True)
+            self.tick()
+
+        try:
+            epoch = self.transport.localization_epoch()
+            if type(epoch) not in (int, float) or not math.isfinite(epoch) or epoch < 0:
+                raise ValueError("localization refresh requires a valid ROS epoch")
+            refresh["epoch"] = epoch
+            self.diagnose(
+                "dock_refresh_request",
+                baseline_stamp=refresh["stamp"],
+                request_epoch=epoch,
+            )
+            cancel = self.transport.request_localization(received)
+            if self._refresh is refresh:
+                refresh["cancel"] = cancel
+            elif cancel is not None:
+                cancel()
+        except Exception as error:
+            self._finish(
+                False, "LOCALIZATION_REFRESH_FAILED", str(error), recovery=True
+            )
 
     @staticmethod
     def _ttl(reply, sent):
@@ -388,7 +519,9 @@ class DockingController:
         self._authorize()
         if self.state == "STAGING":
             if self._nav_done:
-                self._clear_staging()
+                # A retained pre-turn pose cannot prove a cancelled approach is
+                # clear. Return navigation also requires a fresh observation.
+                self._navigate("CLEARING", self.exit_pose)
             elif self._nav_cancel:
                 self._request_stop()
         elif self.state == "WAITING_FOR_LEASE":
@@ -413,6 +546,7 @@ class DockingController:
             return
         self.agent._advance()
         self.active = False
+        self._drop_refresh()
         self._contact = False
         self.lease_until = 0.0
         self._authorize()
@@ -458,6 +592,9 @@ class DockingController:
         if self.key.lease_id and now >= self.lease_until:
             self._finish(False, "LEASE_LOST", recovery=True)
             return
+        if self._refresh and now - self._refresh["sent"] >= self.service_timeout:
+            self._finish(False, "LOCALIZATION_REFRESH_TIMEOUT", recovery=True)
+            return
         if self._pending and now - self._pending[2] >= self.service_timeout:
             operation = self._pending[1]
             self._pending = None
@@ -478,7 +615,42 @@ class DockingController:
                 "EXITING": self.exit_pose,
                 "CLEARING": self.exit_pose,
             }[self.state]
-            if self._nav_done and self.at(pose):
+            refreshed = (
+                self._refresh is not None
+                and self._refresh["ready"]
+                and self.agent._pose_stamp > self._refresh["stamp"]
+                and self.agent._pose_stamp >= self._refresh["epoch"]
+                and self.agent._pose_receipt is not None
+                and self.agent._pose_receipt >= self._refresh["sent"]
+            )
+            if self._nav_done and self._refresh is not None:
+                refresh = self._refresh
+                reason = (
+                    "service_pending"
+                    if not refresh["ready"]
+                    else "source_not_newer"
+                    if self.agent._pose_stamp <= refresh["stamp"]
+                    else "source_before_request"
+                    if self.agent._pose_stamp < refresh["epoch"]
+                    else "receipt_before_request"
+                    if self.agent._pose_receipt is None
+                    or self.agent._pose_receipt < refresh["sent"]
+                    else "physical_arrival_pending"
+                    if not self.at(pose)
+                    else "verified"
+                )
+                if reason not in refresh["reported"]:
+                    refresh["reported"].add(reason)
+                    self.diagnose(
+                        "dock_refresh_fence",
+                        reason=reason,
+                        baseline_stamp=refresh["stamp"],
+                        request_epoch=refresh["epoch"],
+                        refresh_age_sec=now - refresh["sent"],
+                        **self.evidence(),
+                    )
+            if self._nav_done and refreshed and self.at(pose):
+                self._drop_refresh()
                 if self.state in (
                     "EXITING",
                     "CLEARING",

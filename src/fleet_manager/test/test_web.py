@@ -68,6 +68,52 @@ def request(dashboard, path="/api/snapshot", method="GET"):
     return response, body
 
 
+@pytest.mark.parametrize("path", ["/api/snapshot", "/api/events"])
+def test_public_http_and_sse_fingerprint_lease_credentials_without_exposing_tokens(
+    dashboard, path
+):
+    value = snapshot()
+    value["resources"] = [
+        {
+            "resource_id": "dock_01",
+            "former_leases": [
+                {
+                    "robot_id": "cart",
+                    "mission_id": "charge",
+                    "resource_id": "dock_01",
+                    "lease_id": "secret-token-a",
+                }
+            ],
+            "nested": {"lease_id": "secret-token-a"},
+        }
+    ]
+    dashboard.hub.publish(value)
+    connection = http.client.HTTPConnection(*dashboard.address, timeout=2)
+    connection.request("GET", path)
+    response = connection.getresponse()
+    try:
+        if path == "/api/events":
+            lines = [response.readline() for _ in range(3)]
+            assert lines[2].startswith(b"data: ")
+            body = lines[2][6:]
+        else:
+            body = response.read()
+        assert b"secret-token-a" not in body
+        assert b'"lease_id"' not in body
+        claims = json.loads(body)["resources"][0]["former_leases"]
+        assert claims == [
+            {
+                "robot_id": "cart",
+                "mission_id": "charge",
+                "resource_id": "dock_01",
+                "lease_fingerprint": "0b0433472146",
+            }
+        ]
+    finally:
+        response.close()
+        connection.close()
+
+
 @pytest.mark.parametrize(
     "host",
     ["0.0.0.0", "192.0.2.1", "127.0.0.2", "::", "example.com", "127.0.0.1\r\nX: bad"],

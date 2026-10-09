@@ -16,6 +16,52 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from station_perception.node import StationDetectorNode
 
 
+@pytest.mark.parametrize(
+    "shutdown, message, handled",
+    [
+        (
+            True,
+            "Unable to convert call argument to Python object (compile in debug mode for details)",
+            True,
+        ),
+        (
+            False,
+            "Unable to convert call argument to Python object (compile in debug mode for details)",
+            False,
+        ),
+        (True, "unrelated detector failure", False),
+    ],
+)
+def test_main_preserves_errors_except_exact_shutdown_message_conversion(
+    monkeypatch, shutdown, message, handled
+):
+    import station_perception.node as module
+
+    live, cleanup = [True], []
+
+    def spin():
+        live[0] = not shutdown
+        raise RuntimeError(message)
+
+    node = SimpleNamespace(destroy_node=lambda: cleanup.append("node"))
+    executor = SimpleNamespace(
+        add_node=lambda n: None,
+        spin=spin,
+        shutdown=lambda: cleanup.append("executor"),
+    )
+    monkeypatch.setattr(module, "StationDetectorNode", lambda: node)
+    monkeypatch.setattr(module, "SingleThreadedExecutor", lambda: executor)
+    monkeypatch.setattr(module.rclpy, "init", lambda **kwargs: None)
+    monkeypatch.setattr(module.rclpy, "ok", lambda: live[0])
+    monkeypatch.setattr(module.rclpy, "try_shutdown", lambda: cleanup.append("context"))
+    if handled:
+        module.main()
+    else:
+        with pytest.raises(RuntimeError, match=message.split(" (")[0]):
+            module.main()
+    assert cleanup == ["executor", "node", "context"]
+
+
 def test_namespaced_camera_and_detection_publish_real_marker(monkeypatch):
     # Only ROS middleware creation is replaced. Detection, image conversion,
     # message construction, source headers, and endpoint arguments stay real.

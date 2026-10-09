@@ -33,6 +33,7 @@ from test_protocol_faults import (
 )
 from fault_injector.models import FaultRequest
 from trace_assertions import assert_successful_transfer_phases
+from legacy_readiness import manager_ready
 
 
 def stamp(value):
@@ -136,6 +137,9 @@ def autonomy_fault_outcome_recovery_and_trace(name, error):
         client.connect("127.0.0.1", broker_port)
         client.loop_start()
         gazebo_port = free_port()
+        dashboard_port = free_port()
+        journal_path = output / "fleet.sqlite3"
+        assert not journal_path.exists(), "scenario must own a fresh fleet journal"
         environment = {
             **os.environ,
             "ROS_DOMAIN_ID": str(domain),
@@ -174,7 +178,10 @@ def autonomy_fault_outcome_recovery_and_trace(name, error):
                     "rviz:=false",
                     f"broker_port:={broker_port}",
                     f"plc_port:={plc.port}",
+                    f"fault_control_port:={plc.fault_control_port}",
                     f"output_dir:={output}",
+                    f"dashboard_port:={dashboard_port}",
+                    f"journal_path:={journal_path}",
                 ],
                 env=environment,
                 cwd=ROOT,
@@ -184,6 +191,7 @@ def autonomy_fault_outcome_recovery_and_trace(name, error):
             )
             record_owned_process(process)
             record_owned_resource("ports", gazebo_port)
+            record_owned_resource("ports", dashboard_port)
             wait(
                 lambda: (
                     subscribed
@@ -201,6 +209,10 @@ def autonomy_fault_outcome_recovery_and_trace(name, error):
                 timeout=65,
             )
             assert ready.returncode == 0, ready.stderr
+            wait(
+                lambda: manager_ready(dashboard_port, output / "startup-snapshot.json"),
+                30,
+            )
             assert call(reset, Trigger.Request()).success
             response = call(
                 configure,

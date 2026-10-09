@@ -63,11 +63,15 @@ class Scenario:
             )
             self.agents[robot.robot_id] = agent
             wire = SimpleNamespace(
-                navigate=lambda pose, frame, callback, robot_id=robot.robot_id: (
+                navigate=lambda pose, frame, callback, *, precise=False, robot_id=robot.robot_id: (
                     self.navigate(robot_id, pose, frame, callback)
                 ),
                 resource=lambda operation, key, callback: callback(
                     SimpleNamespace(**self.fleet.resource(operation, key))
+                ),
+                localization_epoch=lambda agent=agent: agent._pose_stamp,
+                request_localization=lambda callback, robot_id=robot.robot_id: (
+                    self.refresh_localization(robot_id, callback)
                 ),
             )
             self.controllers[robot.robot_id] = docking.DockingController(
@@ -99,6 +103,16 @@ class Scenario:
 
     def navigate(self, robot_id, pose, frame, callback):
         self.moves.setdefault(robot_id, []).append((pose, frame, callback))
+        return lambda: None
+
+    def refresh_localization(self, robot_id, callback):
+        # Match the production no-motion update contract: acknowledgement alone
+        # is not arrival evidence. Deliver a newer source-stamped observation.
+        agent = self.agents[robot_id]
+        stamp = agent._pose_stamp + 1
+        agent.odometry(stamp, 0, 0, agent.frame_prefix + "odom")
+        agent.localization(stamp, *agent.pose, agent.frame_prefix + "map")
+        callback(True)
         return lambda: None
 
     def send_dock_goal(self, robot_id, charge, feedback, result, accepted):
@@ -286,6 +300,7 @@ def test_legacy_demo_effective_fleet_accepts_serialized_dock_goal_and_grants(
     )
     runtime = object.__new__(DockRuntime)
     runtime._reserved = False
+    runtime._last_goal_diagnostic = None
     # Goal validation is exercised on the actual legacy adapter with its controller.
     runtime.controller = scenario.controllers[robot_id]
     assert runtime.goal(goals[0]) == GoalResponse.ACCEPT

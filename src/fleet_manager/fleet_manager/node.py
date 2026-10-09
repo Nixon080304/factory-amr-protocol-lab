@@ -4,6 +4,8 @@
 from pathlib import Path
 from dataclasses import replace
 import fcntl
+import json
+import time
 import sqlite3
 
 from ament_index_python.packages import get_package_share_directory
@@ -106,9 +108,8 @@ class FleetManagerNode(Node):
             ).value
         ).expanduser()
         journal_path.parent.mkdir(parents=True, exist_ok=True)
-        config = manager_config(
-            fleet_file, self.declare_parameter("legacy_single_robot", False).value
-        )
+        legacy_single_robot = self.declare_parameter("legacy_single_robot", False).value
+        config = manager_config(fleet_file, legacy_single_robot)
         self._journal_lock = Path(str(journal_path.resolve()) + ".manager.lock").open(
             "a"
         )
@@ -134,6 +135,9 @@ class FleetManagerNode(Node):
             config,
             self.journal,
             self,
+            diagnostic=lambda row: self.get_logger().info(
+                json.dumps(row, sort_keys=True, allow_nan=False)
+            ),
             reconciliation_timeout=self.declare_parameter(
                 "reconciliation_timeout_sec", 5.0
             ).value,
@@ -143,7 +147,9 @@ class FleetManagerNode(Node):
             self.actions[robot.robot_id] = ActionClient(
                 self,
                 ExecuteFactoryMission,
-                endpoints["action"],
+                "/factory/execute_mission"
+                if legacy_single_robot
+                else endpoints["action"],
                 callback_group=self.protocol_group,
             )
             self.costs[robot.robot_id] = self.create_client(
@@ -214,7 +220,7 @@ class FleetManagerNode(Node):
                 dashboard = FleetDashboard(
                     host=host, port=port, journal_path=journal_path
                 )
-                dashboard.capture(self.adapter)
+                dashboard.capture(self.adapter, self._dispatch_readiness())
                 dashboard.start()
                 self.dashboard = dashboard
                 self.dashboard_events = self.create_subscription(
@@ -235,6 +241,16 @@ class FleetManagerNode(Node):
                 self.dashboard = None
                 self.get_logger().warning(f"Dashboard unavailable: {error}")
 
+    def _dispatch_readiness(self):
+        """Read only this participant's bounded dispatch endpoint discovery."""
+        return {
+            robot.robot_id: {
+                "cost_service_ready": self.costs[robot.robot_id].service_is_ready(),
+                "mission_action_ready": self.actions[robot.robot_id].server_is_ready(),
+            }
+            for robot in self.adapter.config.robots
+        }
+
     def _dashboard_event(self, message):
         try:
             if self.dashboard is not None:
@@ -242,11 +258,28 @@ class FleetManagerNode(Node):
         except Exception as error:
             self.get_logger().warning(f"Dashboard observation failed: {error}")
 
+    def _take_message(self, subscription, message_type):
+        if not self.context.ok():
+            return None
+        try:
+            with subscription.handle:
+                return subscription.handle.take_message(message_type, False)
+        except RuntimeError as error:
+            # SIGINT can interrupt the generated message conversion after the
+            # RMW take starts. Active-context and unrelated failures stay fatal.
+            if not self.context.ok() and str(error) == (
+                "Unable to convert call argument to Python object "
+                "(compile in debug mode for details)"
+            ):
+                return None
+            raise
+
     def _tick(self):
+        if not self.context.ok():
+            return
         for robot, subscription in zip(self.adapter.config.robots, self.contacts):
             for _ in range(20):
-                with subscription.handle:
-                    sample = subscription.handle.take_message(Bool, False)
+                sample = self._take_message(subscription, Bool)
                 if sample is None:
                     break
                 self.adapter.observe_contact(
@@ -256,18 +289,19 @@ class FleetManagerNode(Node):
                 )
         for robot, subscription in zip(self.adapter.config.robots, self.states):
             for _ in range(20):
-                with subscription.handle:
-                    sample = subscription.handle.take_message(RobotState, False)
+                sample = self._take_message(subscription, RobotState)
                 if sample is None:
                     break
                 self._observe(robot.robot_id, sample[0], sample[1])
+        if not self.context.ok():
+            return
         try:
             self.adapter.tick()
         except sqlite3.Error as error:
             self.get_logger().error(str(error))
         try:
             if self.dashboard is not None:
-                self.dashboard.capture(self.adapter)
+                self.dashboard.capture(self.adapter, self._dispatch_readiness())
         except Exception as error:
             self.get_logger().warning(f"Dashboard observation failed: {error}")
 
@@ -381,14 +415,28 @@ class FleetManagerNode(Node):
         if terminal:
             self._waiters.pop(record.request.mission_id, None)
 
+    def _cost_diagnostic(self, event, robot_id, mission_id, **fields):
+        # Diagnostics must not change action/service behavior or error handling.
+        try:
+            self.adapter.diagnose_cost(event, robot_id, mission_id, **fields)
+        except Exception:
+            pass
+
     def estimate(self, robot_id, request, callback):
         client = self.costs[robot_id]
-        if (
-            not client.service_is_ready()
-            or not self.actions[robot_id].server_is_ready()
-        ):
+        service_ready = client.service_is_ready()
+        action_ready = self.actions[robot_id].server_is_ready()
+        self._cost_diagnostic(
+            "fleet_cost_dispatch",
+            robot_id,
+            request.mission_id,
+            cost_service_ready=service_ready,
+            mission_action_ready=action_ready,
+        )
+        if not service_ready or not action_ready:
             callback(None)
             return
+        started = time.monotonic()
         future = client.call_async(
             EstimateMissionCost.Request(
                 mission_id=request.mission_id,
@@ -399,6 +447,7 @@ class FleetManagerNode(Node):
         )
 
         def estimated(future):
+            error = ""
             try:
                 response = future.result()
                 estimate = CostEstimate(
@@ -407,8 +456,21 @@ class FleetManagerNode(Node):
                     response.predicted_final_battery,
                     response.reason,
                 )
-            except Exception:
+            except Exception as exception:
                 estimate = None
+                error = str(exception)
+            self._cost_diagnostic(
+                "fleet_cost_result",
+                robot_id,
+                request.mission_id,
+                feasible=None if estimate is None else estimate.feasible,
+                path_cost=None if estimate is None else estimate.path_cost,
+                predicted_final_battery=None
+                if estimate is None
+                else estimate.predicted_final_battery,
+                reason=error if estimate is None else estimate.reason,
+                elapsed_sec=time.monotonic() - started,
+            )
             callback(estimate)
 
         future.add_done_callback(estimated)
@@ -484,7 +546,17 @@ class FleetManagerNode(Node):
 
     def send_dock_goal(self, robot_id, charge, feedback, result, accepted):
         client = self.docks[robot_id]
-        if not client.server_is_ready():
+        ready = client.server_is_ready()
+        reported = getattr(self, "_dock_dispatch_diagnostics", None)
+        if reported is None:
+            reported = self._dock_dispatch_diagnostics = {}
+        signature = (charge.generation, ready)
+        if reported.get(robot_id) != signature:
+            reported[robot_id] = signature
+            self.adapter.diagnose_dock(
+                "fleet_dock_dispatch", charge, server_ready=ready
+            )
+        if not ready:
             accepted(None, "dock action unavailable")
             return
         robot = next(
@@ -511,6 +583,14 @@ class FleetManagerNode(Node):
             try:
                 outcome = future.result()
                 reply = outcome.result
+                self.adapter.diagnose_dock(
+                    "fleet_dock_action_status",
+                    charge,
+                    status=outcome.status,
+                    success=reply.success,
+                    error_code=reply.error_code,
+                    message=reply.message,
+                )
                 result(
                     RobotReply(
                         reply.success and outcome.status == GoalStatus.STATUS_SUCCEEDED,

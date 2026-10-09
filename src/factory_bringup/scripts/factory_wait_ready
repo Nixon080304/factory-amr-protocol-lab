@@ -18,7 +18,8 @@ def main():
     deadline = time.monotonic() + 60
     clients = []
     try:
-        for name in (
+        namespaces = node.declare_parameter("robot_namespaces", [""]).value
+        names = (
             "map_server",
             "amcl",
             "controller_server",
@@ -28,8 +29,12 @@ def main():
             "bt_navigator",
             "waypoint_follower",
             "velocity_smoother",
-        ):
-            client = node.create_client(GetState, f"/{name}/get_state")
+        )
+        endpoints = [
+            f"{namespace}/{name}" for namespace in namespaces for name in names
+        ]
+        for name in endpoints:
+            client = node.create_client(GetState, f"{name}/get_state")
             clients.append(client)
             active = False
             while time.monotonic() < deadline and not active:

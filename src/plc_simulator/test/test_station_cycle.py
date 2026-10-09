@@ -855,7 +855,7 @@ def test_review3_minimum_frame_does_not_consume_next_frame_first_byte(
         wire.handler.data_received(second[1:])
         try:
             await wire.wait(2)
-        except TimeoutError:
+        except asyncio.TimeoutError:
             pass
         assert [int.from_bytes(frame[:2], "big") for frame in wire.frames] == [1, 2]
         assert [frame[7] for frame in wire.frames] == [7, 1]

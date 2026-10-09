@@ -1,0 +1,7 @@
+name: contention
+proof: gazebo_nav2
+timeout_sec: 300
+missions:
+  - {mission_id: M-001, robot_id: amr_01, pickup: assembly, dropoff: inspection, part: motor}
+  - {mission_id: fleet-pinned-02, robot_id: amr_02, pickup: assembly, dropoff: inspection, part: motor}
+assertions: [v1_payload_compatibility, exact_lease_identity, capacity_one_authority, capacity_one_world_occupancy]

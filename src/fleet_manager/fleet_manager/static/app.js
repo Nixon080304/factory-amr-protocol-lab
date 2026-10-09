@@ -23,7 +23,7 @@ export class SnapshotOrder {
         && optionalString(resource.kind) && optionalString(resource.owner)
         && stringList(resource.waiters) && stringList(resource.unresolved_claimants)
         && optionalCount(resource.omitted_waiters) && optionalCount(resource.omitted_claims)
-        && (resource.former_leases == null || Array.isArray(resource.former_leases) && resource.former_leases.length <= 100 && resource.former_leases.every(claim => claim && ['robot_id', 'mission_id', 'resource_id', 'lease_id'].every(key => boundedString(claim[key])))))
+        && (resource.former_leases == null || Array.isArray(resource.former_leases) && resource.former_leases.length <= 100 && resource.former_leases.every(claim => claim && !Object.hasOwn(claim, 'lease_id') && ['robot_id', 'mission_id', 'resource_id'].every(key => boundedString(claim[key])) && boundedString(claim.lease_fingerprint, 12) && /^[0-9a-f]{12}$/.test(claim.lease_fingerprint))))
       || !value.missions.every(mission => mission && boundedString(mission.mission_id)
         && ['state', 'assigned_robot_id', 'pickup_station', 'dropoff_station', 'part', 'payload_ownership'].every(key => optionalString(mission[key])))
       || !value.dock_queue.every(charge => charge && ['robot_id', 'dock_id', 'state'].every(key => boundedString(charge[key])))
@@ -98,7 +98,7 @@ function render(value) {
     state.append(element('span', `Waiters: ${(resource.waiters ?? []).join(', ') || 'none'}`));
     if (resource.unresolved_claimants?.length) state.append(element('span', `Unresolved claims: ${resource.unresolved_claimants.join(', ')}`, 'uncertain'));
     if (resource.omitted_waiters || resource.omitted_claims) state.append(element('span', `Omitted: ${resource.omitted_waiters ?? 0} waiter(s), ${resource.omitted_claims ?? 0} former claim(s) · identities may be missing`, 'uncertain'));
-    for (const claim of resource.former_leases ?? []) state.append(element('span', `${claim.robot_id} / ${claim.mission_id} / ${claim.lease_id}`, 'meta'));
+    for (const claim of resource.former_leases ?? []) state.append(element('span', `${claim.robot_id} / ${claim.mission_id} / lease ${claim.lease_fingerprint}`, 'meta'));
     if (resource.reconciliation_required) state.append(element('span', ' · Reconciliation required', 'uncertain'));
     row.append(name, state); resources.append(row);
   }

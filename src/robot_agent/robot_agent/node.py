@@ -2,7 +2,10 @@
 """Steady health telemetry and bounded asynchronous robot-local cost service."""
 
 from dataclasses import dataclass, field
+import json
 import math
+from pathlib import Path
+import re
 import time
 
 from factory_interfaces.msg import ProtocolEvent, RobotState
@@ -23,7 +26,9 @@ import rclpy
 from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
 from rclpy.clock import Clock, ClockType
 from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
+from rclpy.impl.implementation_singleton import rclpy_implementation
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.qos import (
     DurabilityPolicy,
     QoSProfile,
@@ -32,8 +37,9 @@ from rclpy.qos import (
 )
 from sensor_msgs.msg import BatteryState
 from std_msgs.msg import Bool, String
+from std_srvs.srv import Empty
 
-from robot_agent.adapter import AgentAdapter
+from robot_agent.adapter import AgentAdapter, finite_pose
 from robot_agent.energy_model import EnergyConfig
 from robot_agent.nav2_paths import Nav2Paths
 from robot_agent.nav2_paths import pose_message
@@ -68,6 +74,29 @@ def valid_pose(pose):
         all(math.isfinite(v) for v in (p.x, p.y, p.z, q.x, q.y, q.z, q.w))
         and abs(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w - 1) <= 0.01
     )
+
+
+def optional_exit_pose(node):
+    """Declare an immutable DOUBLE_ARRAY with an empty V1 default on Humble."""
+    name = "dock.exit_pose"
+    parameter = node.declare_parameter(name, Parameter.Type.DOUBLE_ARRAY)
+    value = parameter.value
+    if value is None:
+        # Humble infers [] as BYTE_ARRAY, so initialize the typed empty default
+        # explicitly before making the descriptor immutable.
+        result = node.set_parameters([Parameter(name, Parameter.Type.DOUBLE_ARRAY, [])])
+        if not result[0].successful:
+            raise ValueError("dock exit pose default could not be initialized")
+        value = []
+    node.set_descriptor(
+        name,
+        ParameterDescriptor(read_only=True, type=Parameter.Type.DOUBLE_ARRAY.value),
+    )
+    if len(value) == 0:
+        return None
+    if not finite_pose(value):
+        raise ValueError("dock exit pose requires zero or three finite values")
+    return tuple(value)
 
 
 class AgentRuntime:
@@ -106,7 +135,11 @@ class AgentRuntime:
                 PoseWithCovarianceStamped,
                 "amcl_pose",
                 self.localization,
-                qos_profile_sensor_data,
+                QoSProfile(
+                    depth=1,
+                    reliability=ReliabilityPolicy.RELIABLE,
+                    durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                ),
             ),
             node.create_subscription(
                 String,
@@ -212,11 +245,90 @@ class AgentRuntime:
 class DockTransport:
     """Preserve late goal acceptance and lease replies so cleanup can resolve them."""
 
-    def __init__(self, node, navigation, resources):
+    def __init__(
+        self,
+        node,
+        navigation,
+        resources,
+        *,
+        behavior_tree="",
+        diagnostic=None,
+        root_nav2=False,
+    ):
+        if not isinstance(behavior_tree, str) or (
+            behavior_tree
+            and (
+                not Path(behavior_tree).is_absolute()
+                or not Path(behavior_tree).is_file()
+            )
+        ):
+            raise ValueError(
+                "dock behavior tree must be empty or an existing absolute file path"
+            )
         self.node, self.navigation, self.resources = node, navigation, resources
+        self.behavior_tree = behavior_tree
+        self.diagnostic = diagnostic
+        self.localization_client = node.create_client(
+            Empty,
+            "/request_nomotion_update" if root_nav2 else "request_nomotion_update",
+        )
 
-    def navigate(self, pose, frame, callback):
-        if not self.navigation.server_is_ready():
+    def localization_epoch(self):
+        return stamp_seconds(self.node.get_clock().now().to_msg())
+
+    def _diagnose(self, event, **fields):
+        if self.diagnostic is not None:
+            try:
+                self.diagnostic(event, **fields)
+            except Exception:
+                pass
+
+    def request_localization(self, callback):
+        """Request robot-local AMCL evidence without waiting in a ROS callback."""
+        client = self.localization_client
+        ready = client.service_is_ready()
+        self._diagnose("dock_localization_ready", service_ready=ready)
+        if not ready:
+            callback(False)
+            return None
+        future = client.call_async(Empty.Request())
+        active = True
+
+        def responded(done):
+            nonlocal active
+            if not active:
+                return
+            active = False
+            try:
+                success = isinstance(done.result(), Empty.Response)
+            except Exception:
+                success = False
+            callback(success)
+
+        def cancel():
+            nonlocal active
+            if active:
+                active = False
+                remove = getattr(client, "remove_pending_request", None)
+                if remove is not None:
+                    remove(future)
+
+        future.add_done_callback(responded)
+        return cancel
+
+    def navigate(self, pose, frame, callback, *, precise=False):
+        behavior_tree = self.behavior_tree if precise else ""
+        if behavior_tree and not Path(behavior_tree).is_file():
+            callback(False, "dock behavior tree unavailable")
+            return lambda: None
+        ready = self.navigation.server_is_ready()
+        self._diagnose(
+            "dock_navigation_ready",
+            server_ready=ready,
+            precise=precise,
+            behavior_tree_configured=bool(behavior_tree),
+        )
+        if not ready:
             callback(False, "navigation unavailable")
             return lambda: None
         handle, cancelled, finished, stopped = None, False, False, False
@@ -276,7 +388,8 @@ class DockTransport:
 
         future = self.navigation.send_goal_async(
             NavigateToPose.Goal(
-                pose=pose_message(pose, frame, self.node.get_clock().now().to_msg())
+                pose=pose_message(pose, frame, self.node.get_clock().now().to_msg()),
+                behavior_tree=behavior_tree,
             )
         )
         future.add_done_callback(accepted)
@@ -333,6 +446,7 @@ class DockRuntime:
         server_factory=ActionServer,
         robot_radius=0.15,
         arrival_tolerance=0.15,
+        exit_pose=None,
     ):
         self.node = node
         self.controller = DockingController(
@@ -344,8 +458,13 @@ class DockRuntime:
             clock=agent.clock,
             robot_radius=robot_radius,
             tolerance=arrival_tolerance,
+            exit_pose=exit_pose,
+            diagnostic=self._diagnostic,
         )
         self._reserved, self._handle, self._results = False, None, {}
+        self._last_goal_diagnostic = None
+        if isinstance(transport, DockTransport):
+            transport.diagnostic = self.controller.diagnose
         self.server = server_factory(
             node,
             DockRobot,
@@ -365,15 +484,63 @@ class DockRuntime:
             0.02, self.controller.tick, clock=Clock(clock_type=ClockType.STEADY_TIME)
         )
 
+    def _diagnostic(self, row):
+        try:
+            key = self.controller.key
+
+            def clean(value):
+                if isinstance(value, str):
+                    for token in () if key is None else (key.lease_id, key.mission_id):
+                        if token:
+                            value = value.replace(token, "[redacted]")
+                    return value[:256]
+                if isinstance(value, float) and not math.isfinite(value):
+                    return None
+                if isinstance(value, (tuple, list)):
+                    return [clean(item) for item in value[:3]]
+                return value
+
+            row = {name: clean(value) for name, value in row.items()}
+            if "message" in row:
+                row["message"] = re.sub(
+                    r"[A-Za-z0-9_-]{16,}", "[redacted]", row["message"]
+                )
+            self.node.get_logger().info(
+                json.dumps(row, sort_keys=True, allow_nan=False)
+            )
+        except Exception:
+            pass
+
+    def _goal_decision(self, accepted, reason):
+        evidence = self.controller.evidence()
+        signature = (
+            accepted,
+            reason,
+            evidence["mode"],
+            evidence["payload_state"],
+            evidence["health_detail"],
+            self.controller._generation,
+        )
+        if signature != self._last_goal_diagnostic:
+            self._last_goal_diagnostic = signature
+            self.controller.diagnose(
+                "dock_goal",
+                decision="ACCEPT" if accepted else "REJECT",
+                reason=reason,
+                reserved=self._reserved,
+                **evidence,
+            )
+        return GoalResponse.ACCEPT if accepted else GoalResponse.REJECT
+
     def goal(self, goal):
-        if (
-            self._reserved
-            or not self.controller.can_start()
-            or goal.dock_id != self.controller.dock_id
-        ):
-            return GoalResponse.REJECT
+        if self._reserved:
+            return self._goal_decision(False, "reserved")
+        if not self.controller.can_start():
+            return self._goal_decision(False, "robot_unavailable")
+        if goal.dock_id != self.controller.dock_id:
+            return self._goal_decision(False, "dock_identity")
         if not math.isfinite(goal.target_percent) or not 0 < goal.target_percent <= 100:
-            return GoalResponse.REJECT
+            return self._goal_decision(False, "target_percent")
         for message, expected in (
             (goal.staging_pose, self.controller.staging),
             (goal.charging_pose, self.controller.charging),
@@ -382,7 +549,7 @@ class DockRuntime:
                 message.header.frame_id != self.controller.agent.frame_prefix + "map"
                 or not valid_pose(message.pose)
             ):
-                return GoalResponse.REJECT
+                return self._goal_decision(False, "pose_frame_or_geometry")
             p, q = message.pose.position, message.pose.orientation
             yaw = math.atan2(
                 2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z)
@@ -393,9 +560,9 @@ class DockRuntime:
                 or abs(p.z) > 1e-6
                 or abs(math.remainder(yaw - expected[2], 2 * math.pi)) > 1e-6
             ):
-                return GoalResponse.REJECT
+                return self._goal_decision(False, "pose_config_mismatch")
         self._reserved = True
-        return GoalResponse.ACCEPT
+        return self._goal_decision(True, "validated")
 
     def accepted(self, handle):
         self._handle = handle
@@ -412,9 +579,26 @@ class DockRuntime:
 
         def result(value):
             if self._handle is handle:
+                self.controller.diagnose(
+                    "dock_result",
+                    success=value.success,
+                    error_code=value.error_code,
+                    message=value.message,
+                    **self.controller.evidence(),
+                )
                 self._results[id(handle)] = value
                 self._handle, self._reserved = None, False
-                handle.execute()
+                try:
+                    handle.execute()
+                except rclpy_implementation.RCLError as error:
+                    # A signal-invalidated action publisher cannot schedule a
+                    # terminal result. Keep every active or unrelated error.
+                    if self.node.context.ok() or str(error) != (
+                        "Failed get goal status array: feedback publisher is invalid, "
+                        "at ./src/rcl_action/action_server.c:919"
+                    ):
+                        raise
+                    self._results.pop(id(handle), None)
 
         if not self.controller.start(handle.request.target_percent, feedback, result):
             result(DockResult(False, "ROBOT_UNAVAILABLE", "Robot cannot start docking"))
@@ -496,6 +680,10 @@ class RobotAgentNode(Node):
         self.dock_charging = self.declare_parameter(
             "dock.charging_pose", [4.0, -2.0, 0.0], identity
         ).value
+        self.dock_exit = optional_exit_pose(self)
+        self.dock_behavior_tree = self.declare_parameter(
+            "dock.behavior_tree", "", identity
+        ).value
         config = AgentConfig(
             robot_id,
             prefix,
@@ -512,13 +700,19 @@ class RobotAgentNode(Node):
             ).value,
             self.declare_parameter("cache_max_entries", 16, identity).value,
         )
-        self.path_client = ActionClient(self, ComputePathToPose, "compute_path_to_pose")
+        self.path_client = ActionClient(
+            self,
+            ComputePathToPose,
+            "/compute_path_to_pose" if legacy else "compute_path_to_pose",
+        )
         self.runtime = AgentRuntime(
             self,
             config,
             Nav2Paths(self.path_client, lambda: self.get_clock().now().to_msg()),
         )
-        self.navigation_client = ActionClient(self, NavigateToPose, "navigate_to_pose")
+        self.navigation_client = ActionClient(
+            self, NavigateToPose, "/navigate_to_pose" if legacy else "navigate_to_pose"
+        )
         self.resource_clients = {
             operation: self.create_client(service, "/factory/resources/" + operation)
             for operation, service in (
@@ -531,12 +725,19 @@ class RobotAgentNode(Node):
         self.docking = DockRuntime(
             self,
             self.runtime.adapter,
-            DockTransport(self, self.navigation_client, self.resource_clients),
+            DockTransport(
+                self,
+                self.navigation_client,
+                self.resource_clients,
+                behavior_tree=self.dock_behavior_tree,
+                root_nav2=legacy,
+            ),
             self.dock_id,
             self.dock_staging,
             self.dock_charging,
             robot_radius=self.dock_radius,
             arrival_tolerance=self.dock_tolerance,
+            exit_pose=self.dock_exit,
         )
 
     def destroy_node(self):
@@ -561,6 +762,14 @@ def main(args=None):
         executor.spin()
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
+    except RuntimeError as error:
+        # SIGINT can interrupt generated message conversion inside native take.
+        # Keep active-context and unrelated robot agent errors visible.
+        if rclpy.ok() or str(error) != (
+            "Unable to convert call argument to Python object "
+            "(compile in debug mode for details)"
+        ):
+            raise
     finally:
         executor.shutdown()
         if node is not None:

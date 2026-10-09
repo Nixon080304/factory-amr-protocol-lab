@@ -140,6 +140,13 @@ def test_station_without_configured_geometry_stays_quarantined(config):
 def test_station_clearance_requires_valid_configured_region(tmp_path):
     data = yaml.safe_load((ROOT / "src/factory_bringup/config/fleet.yaml").read_text())
     data["resource_bounds"] = {"assembly": [-3.5, 0.5, -2.5, 1.5]}
+    # This focused geometry fixture deliberately omits inspection bounds. Its
+    # waiting/parking layout must not reference that absent physical region.
+    data.pop("station_staging")
+    data.pop("station_approach")
+    data.pop("station_exit_poses")
+    # This fixture tests an isolated station region, not a terminal-to-dock path.
+    data["docks"]["dock_01"].pop("departure_stations")
     path = tmp_path / "fleet.yaml"
     path.write_text(yaml.safe_dump(data))
     config = load_fleet_config(path)

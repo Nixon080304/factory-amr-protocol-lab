@@ -42,6 +42,49 @@ def robot(robot_id="r1", **changes):
 ESTIMATES = {"r1": CostEstimate(True, 1, 40), "r2": CostEstimate(True, 2, 40)}
 
 
+@pytest.mark.parametrize(
+    "unsafe",
+    [
+        {"health": "OFFLINE"},
+        {"mode": "EXECUTING"},
+        {"payload_state": "UNKNOWN"},
+        {"mission_id": "m1"},
+        {"pose": None},
+    ],
+)
+def test_reassignment_requires_fresh_stopped_empty_owner_even_without_lease(
+    fleet, unsafe
+):
+    _, core, journal, registry, *_ = fleet
+    assigned(fleet)
+    registry.observe(robot("r1", health="OFFLINE"), 102)
+    core.handle_robot_offline("r1", 102)
+    registry.observe(robot("r2"), 102.1)
+    registry.observe(robot("r1", **unsafe), 102.1)
+    assert core.assign("m1", {"r2": ESTIMATES["r2"]}, 102.1).robot_id is None
+    assert journal.get("m1").state == "REASSIGNING"
+    registry.observe(robot("r1"), 102.2)
+    assert core.assign("m1", {"r2": ESTIMATES["r2"]}, 102.2).robot_id == "r2"
+
+
+def test_reassignment_refuses_exact_quarantine_until_verified_clearance(fleet):
+    _, core, journal, registry, resources, _ = fleet
+    assigned(fleet)
+    held = resources.acquire(LeaseRequest("r1", "m1", "assembly"), 101).lease
+    registry.observe(robot("r1", health="OFFLINE"), 102)
+    core.handle_robot_offline("r1", 102)
+    registry.observe(robot("r1"), 102.1)
+    registry.observe(robot("r2"), 102.1)
+    assert core.assign("m1", {"r2": ESTIMATES["r2"]}, 102.1).robot_id is None
+    assert journal.get("m1").state == "REASSIGNING"
+    from fleet_manager.resources import LeaseKey
+
+    assert resources.clear_reconciliation(
+        LeaseKey(held.robot_id, held.mission_id, held.resource_id, held.lease_id), 102.2
+    )
+    assert core.assign("m1", {"r2": ESTIMATES["r2"]}, 102.2).robot_id == "r2"
+
+
 def test_charging_queue_reserves_idle_low_battery_robots_before_missions(fleet):
     _, core, _, registry, *_ = fleet
     policy = EnergyPolicyConfig(20, 30, 80, "dock")
@@ -412,7 +455,7 @@ def test_offline_robot_reassigns_only_before_pickup_and_quarantines_resources(
     if ownership == "NOT_PICKED_UP":
         assert state.state == "REASSIGNING"
         assert state.assigned_robot_id is None
-        assert core.assign("m1", ESTIMATES, 102).robot_id == "r2"
+        assert core.assign("m1", ESTIMATES, 102).robot_id is None
     else:
         assert state.state == "RECOVERY_REQUIRED"
         assert core.assign("m1", ESTIMATES, 102).robot_id is None
@@ -420,6 +463,16 @@ def test_offline_robot_reassigns_only_before_pickup_and_quarantines_resources(
     assert resource.lease is None
     assert resource.former_lease == held
     assert resource.reconciliation_required
+    if ownership == "NOT_PICKED_UP":
+        registry.observe(robot("r1"), 102.1)
+        assert core.assign("m1", {"r2": ESTIMATES["r2"]}, 102.1).robot_id is None
+        from fleet_manager.resources import LeaseKey
+
+        assert resources.clear_reconciliation(
+            LeaseKey(held.robot_id, held.mission_id, held.resource_id, held.lease_id),
+            102.2,
+        )
+        assert core.assign("m1", {"r2": ESTIMATES["r2"]}, 102.2).robot_id == "r2"
     events = journal.events("m1")
     assert core.handle_robot_offline("r1", 102) == ()
     assert journal.events("m1") == events
@@ -433,9 +486,12 @@ def test_old_assignment_feedback_and_results_cannot_mutate_new_goal(
     old, _ = assigned(fleet)
     registry.observe(robot("r1", health="OFFLINE"), 102)
     core.handle_robot_offline("r1", 102)
-    if reuse_same_robot:
-        registry.observe(robot("r1"), 102.1)
-    new = core.assign("m1", ESTIMATES, 102.1)
+    registry.observe(robot("r1"), 102.1)
+    new = core.assign(
+        "m1", ESTIMATES if reuse_same_robot else {"r2": ESTIMATES["r2"]}, 102.1
+    )
+    assert new.robot_id == ("r1" if reuse_same_robot else "r2")
+    assert new.assignment_id is not None
     assert new.assignment_id != old.assignment_id
     record = journal.get("m1")
     events = journal.events("m1")

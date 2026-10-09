@@ -70,7 +70,23 @@ def coordinator_parameters(config: FleetConfig, robot: RobotConfig) -> dict:
         "frame_prefix": robot.frame_prefix,
         "resource_leases_enabled": True,
         "route_names": list(config.routes),
+        "stations.clearance_distance": max(
+            (
+                2 * (dock.robot_radius + dock.arrival_tolerance)
+                for dock in config.docks.values()
+            ),
+            default=1.20,
+        ),
     }
+    for station, bounds in config.resource_bounds.items():
+        result[f"stations.{station}.bounds"] = list(bounds)
+    for station, pose in config.station_staging.items():
+        result[f"stations.{station}.staging_pose"] = [pose.x, pose.y, pose.yaw]
+    for station, pose in config.station_approach.items():
+        result[f"stations.{station}.pose"] = [pose.x, pose.y, pose.yaw]
+    for station, poses in config.station_exit_poses.items():
+        pose = poses[robot.robot_id]
+        result[f"stations.{station}.exit_pose"] = [pose.x, pose.y, pose.yaw]
     traffic = {r.resource_id for r in config.resources if r.kind == "traffic_zone"}
     for name, resources in config.routes.items():
         segments = config.route_segments.get(name, ())
@@ -107,6 +123,10 @@ def agent_parameters(config, robot, stations):
         "battery_start_percent": robot.battery_start_percent,
         "station_names": list(stations),
         "dock_id": config.energy.dock_id,
+        "dock.behavior_tree": str(
+            Path(get_package_share_directory("factory_bringup"))
+            / "behavior_trees/dock_to_pose.xml"
+        ),
     }
     for name, values in stations.items():
         result[f"stations.{name}.pose"] = [float(values[k]) for k in ("x", "y", "yaw")]
@@ -116,6 +136,9 @@ def agent_parameters(config, robot, stations):
     for name in ("staging_pose", "charging_pose"):
         pose = getattr(dock, name)
         result[f"dock.{name}"] = [pose.x, pose.y, pose.yaw]
+    if dock.exit_poses:
+        pose = dock.exit_poses[robot.robot_id]
+        result["dock.exit_pose"] = [pose.x, pose.y, pose.yaw]
     for name in (
         "reserve_percent",
         "idle_percent_per_sec",
@@ -180,6 +203,17 @@ def nav2_parameters(spec: RobotLaunchSpec, source_file) -> RewrittenYaml:
         "behavior_server.ros__parameters.global_frame": frames["odom"],
         "map_server.ros__parameters.frame_id": frames["map"],
     }
+    trees = Path(get_package_share_directory("factory_bringup")) / "behavior_trees"
+    source = yaml.safe_load(Path(source_file).read_text())
+    navigator = source.get("bt_navigator", {}).get("ros__parameters", {})
+    for parameter, filename in (
+        ("default_nav_to_pose_bt_xml", "navigate_to_pose.xml"),
+        ("default_nav_through_poses_bt_xml", "navigate_through_poses.xml"),
+    ):
+        if not navigator.get(parameter):
+            rewrites[f"bt_navigator.ros__parameters.{parameter}"] = str(
+                trees / filename
+            )
     for name, frame in (("local_costmap", "odom"), ("global_costmap", "map")):
         path = f"{name}.{name}.ros__parameters"
         rewrites[f"{path}.global_frame"] = frames[frame]
@@ -258,7 +292,10 @@ def navigation_launch_actions(spec, *, params_file, map_file, rviz):
                     {
                         "use_sim_time": True,
                         "autostart": True,
-                        "node_names": list(spec.navigation_nodes),
+                        # Bond IDs are each server's basename, even under a namespace.
+                        "node_names": [
+                            name.rsplit("/", 1)[-1] for name in spec.navigation_nodes
+                        ],
                     }
                 ],
                 output="screen",
@@ -291,9 +328,19 @@ def fleet_launch_actions(
     actions = simulator_actions(
         world or str(simulation / "worlds/factory_floor.world"), gui
     )
-    stations = yaml.safe_load((bringup / "config/stations.yaml").read_text())[
-        "stations"
-    ]
+    station_document = yaml.safe_load((bringup / "config/stations.yaml").read_text())
+    if station_document.get("frame_id") != "map":
+        raise ValueError("stations.yaml: fleet approaches require the map frame")
+    stations = station_document["stations"]
+    for name, pose in config.station_approach.items():
+        if name not in stations or [stations[name][k] for k in ("x", "y", "yaw")] != [
+            pose.x,
+            pose.y,
+            pose.yaw,
+        ]:
+            raise ValueError(
+                f"stations.yaml: {name} diverges from authoritative station_approach"
+            )
     for spec in robot_launch_specs(config):
         actions.extend(
             robot_actions(
@@ -334,13 +381,13 @@ def fleet_launch_actions(
                 output="screen",
                 parameters=[
                     {
-                        **coordinator_parameters(config, robot),
                         **{
                             f"stations.{name}.pose": [
                                 float(values[k]) for k in ("x", "y", "yaw")
                             ]
                             for name, values in stations.items()
                         },
+                        **coordinator_parameters(config, robot),
                     }
                 ],
             )

@@ -21,8 +21,18 @@ def api():
 class Wire:
     def __init__(self):
         self.moves, self.requests, self.cancelled = [], [], []
+        self.refreshes = []
 
-    def navigate(self, pose, frame, callback):
+    def request_localization(self, callback):
+        self.refreshes.append(callback)
+        callback(True)
+        return lambda: None
+
+    def localization_epoch(self):
+        # This transport has no ROS clock; test poses carry increasing stamps.
+        return 0.0
+
+    def navigate(self, pose, frame, callback, *, precise=False):
         index = len(self.moves)
         self.moves.append((pose, frame, callback))
         return lambda: self.cancelled.append(index)
@@ -34,13 +44,19 @@ class Wire:
         self.requests[-1][2](SimpleNamespace(**values))
 
 
-def rig():
+def rig(**controller_options):
     agent, _, wall = agent_rig()
     agent.energy.battery_percent = 20
     ready(agent)
     wire, results, feedback = Wire(), [], []
     controller = api().DockingController(
-        agent, wire, "charger", (2, -3, 0), (3, -3, 0), clock=lambda: wall[0]
+        agent,
+        wire,
+        "charger",
+        (2, -3, 0),
+        (3, -3, 0),
+        clock=lambda: wall[0],
+        **controller_options,
     )
     return agent, wall, wire, results, feedback, controller
 
@@ -149,7 +165,9 @@ def test_throwing_navigation_cancel_always_finalizes_conservatively(event):
         raise RuntimeError("action client destroyed")
 
     original = wire.navigate
-    wire.navigate = lambda *args: (original(*args), broken_cancel)[1]
+    wire.navigate = lambda *args, **kwargs: (original(*args, **kwargs), broken_cancel)[
+        1
+    ]
     start(r)
     if event == "shutdown":
         controller.shutdown()
@@ -244,8 +262,8 @@ def arrive(rig_, index, pose):
     agent, wall, wire, *_, controller = rig_
     stamp = agent._pose_stamp + 1
     agent.odometry(stamp, 0, 0, agent.frame_prefix + "odom")
-    agent.localization(stamp, *pose, agent.frame_prefix + "map")
     wire.moves[index][2](True, "")
+    agent.localization(stamp, *pose, agent.frame_prefix + "map")
     controller.tick()
 
 
@@ -258,6 +276,127 @@ def enter(rig_):
     stage(rig_)
     rig_[2].reply(granted=True, lease_id="lease-1", lease_ttl_sec=10.0)
     arrive(rig_, 1, (3, -3, 0))
+
+
+def test_configured_exit_replaces_captured_ready_return_before_lease_release():
+    import math
+
+    exit_pose = (5.2, -3.4, math.pi)
+    r = rig(exit_pose=exit_pose)
+    agent, _, wire, results, _, controller = r
+    enter(r)
+    controller.contact(True)
+    agent.energy.battery_percent = 80
+    controller.tick()
+    assert controller.state == "EXITING" and wire.moves[2][0] == exit_pose
+    # Success and a pre-result pose still do not authorize the next leg.
+    agent.localization(4, *exit_pose, agent.frame_prefix + "map")
+    wire.moves[2][2](True, "")
+    controller.tick()
+    assert len(wire.moves) == 3 and not results
+    assert not any(operation == "release" for operation, *_ in wire.requests)
+    arrive(r, 2, exit_pose)
+    assert controller.state == "RELEASING" and len(wire.moves) == 3
+    assert wire.requests[-1][0] == "release"
+    wire.reply(released=True)
+    wire.moves[2][2](True, "late duplicate")
+    assert len(wire.moves) == 3
+    assert results[0].success and agent.mode == "AVAILABLE"
+    assert controller.start(80, lambda _: None, results.append)
+    wire.moves[2][2](True, "old session completion")
+    assert controller.state == "STAGING" and len(wire.moves) == 4
+    assert len(results) == 1
+
+
+@pytest.mark.parametrize("exit_pose", [(2, -3, 0), (3, -3, 0), (1.4, -3, 0)])
+def test_configured_exit_arrival_region_must_clear_both_dock_footprints(exit_pose):
+    agent, _, wire, results, feedback, controller = rig(exit_pose=exit_pose)
+    assert not controller.start(80, feedback.append, results.append)
+    assert not wire.moves and not wire.requests and not results
+    assert agent.mode == "RECOVERY_REQUIRED"
+
+
+@pytest.mark.parametrize(
+    "when", ["charging", "exit", "exit_refresh", "entry", "staging"]
+)
+def test_cancel_preserves_configured_exit_target(when):
+    import math
+
+    exit_pose = (5.2, -3.4, math.pi)
+    r = rig(exit_pose=exit_pose)
+    agent, _, wire, results, _, controller = r
+    if when == "staging":
+        stage(r)
+        wire.reply(granted=False, lease_id="", lease_ttl_sec=0.0)
+        controller.cancel()
+        wire.reply(lease_id="", reconciliation_required=False)
+        exit_index = 1
+    elif when == "entry":
+        stage(r)
+        wire.reply(granted=True, lease_id="held", lease_ttl_sec=10.0)
+        controller.cancel()
+        assert len(wire.moves) == 2 and wire.cancelled == [1]
+        wire.moves[1][2](False, "cancelled")
+        exit_index = 2
+    else:
+        enter(r)
+        controller.contact(True)
+        if when in ("exit", "exit_refresh"):
+            agent.energy.battery_percent = 80
+            controller.tick()
+        if when == "exit_refresh":
+            wire.moves[2][2](True, "")
+        controller.cancel()
+        exit_index = 2
+    assert controller.state == ("CLEARING" if when == "staging" else "EXITING")
+    assert wire.moves[exit_index][0] == exit_pose
+    assert len(wire.moves) == exit_index + 1
+    assert not results and not any(
+        operation == "release" for operation, *_ in wire.requests
+    )
+    arrive(r, exit_index, exit_pose)
+    if when != "staging":
+        wire.reply(released=True)
+    assert len(results) == 1 and results[0].error_code == "CANCELLED"
+    assert agent.mode == "AVAILABLE"
+
+
+@pytest.mark.parametrize(
+    "failure", ["navigation", "navigation_timeout", "refresh_timeout", "lease"]
+)
+def test_configured_exit_failure_retains_recovery_without_extra_goal_or_release(
+    failure,
+):
+    import math
+
+    r = rig(exit_pose=(5.2, -3.4, math.pi))
+    agent, wall, wire, results, _, controller = r
+    enter(r)
+    controller.cancel()
+    if failure == "navigation":
+        wire.moves[2][2](False, "blocked")
+    elif failure == "refresh_timeout":
+        wire.moves[2][2](True, "")
+        wall[0] += 1.0
+    elif failure == "lease":
+        wall[0] = controller.lease_until
+    else:
+        wall[0] = controller._nav_deadline
+        controller.lease_until = wall[0] + 10.0
+    agent.odometry(agent._odom_stamp + 1, 0, 0, agent.frame_prefix + "odom")
+    controller.tick()
+    assert len(wire.moves) == 3 and len(results) == 1
+    assert not results[0].success and agent.mode == "RECOVERY_REQUIRED"
+    assert not any(operation == "release" for operation, *_ in wire.requests)
+
+
+def test_unconfigured_v1_exit_keeps_single_direct_return_leg():
+    r = rig()
+    enter(r)
+    _, _, wire, _, _, controller = r
+    controller.cancel()
+    assert controller.state == "EXITING"
+    assert [move[0] for move in wire.moves] == [(2, -3, 0), (3, -3, 0), (0, -3, 0)]
 
 
 def test_stage_without_lease_then_wait_before_entering():

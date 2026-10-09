@@ -1,9 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "mission_coordinator/navigation_adapter.hpp"
 #include "mission_coordinator/robot_context.hpp"
+#include <iomanip>
+#include <sstream>
 
 namespace mission_coordinator {
-NavigationAdapter::NavigationAdapter(rclcpp::Node *node) {
+namespace {
+std::string goal_uuid(const rclcpp_action::GoalUUID &id) {
+  std::ostringstream value;
+  for (const auto byte : id)
+    value << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(byte);
+  return value.str();
+}
+} // namespace
+NavigationAdapter::NavigationAdapter(rclcpp::Node *node, Diagnostic diagnostic)
+    : diagnostic_(std::move(diagnostic)) {
   client_ = rclcpp_action::create_client<Nav>(node, RobotContext::navigation_action);
   local_ = node->create_client<Clear>(RobotContext::local_costmap);
   global_ = node->create_client<Clear>(RobotContext::global_costmap);
@@ -20,6 +31,16 @@ void NavigationAdapter::navigate(const geometry_msgs::msg::PoseStamped &pose,
   request.pose = pose;
   rclcpp_action::Client<Nav>::SendGoalOptions options;
   options.goal_response_callback = [this, generation, done](auto goal) {
+    if (diagnostic_) {
+      try {
+        diagnostic_("navigation_action_accepted",
+                    "{\"generation\":" + std::to_string(generation) +
+                        ",\"current_generation\":" + std::to_string(generation_) +
+                        ",\"uuid\":\"" + (goal ? goal_uuid(goal->get_goal_id()) : "") +
+                        "\",\"accepted\":" + (goal ? "true" : "false") + "}");
+      } catch (const std::exception &) {
+      }
+    }
     if (generation != generation_) {
       if (goal) {
         client_->async_cancel_goal(goal);
@@ -32,6 +53,22 @@ void NavigationAdapter::navigate(const geometry_msgs::msg::PoseStamped &pose,
     }
   };
   options.result_callback = [this, generation, done](const auto &result) {
+    if (diagnostic_) {
+      try {
+        diagnostic_("navigation_action_result",
+                    "{\"generation\":" + std::to_string(generation) +
+                        ",\"current_generation\":" + std::to_string(generation_) +
+                        ",\"uuid\":\"" + goal_uuid(result.goal_id) +
+                        "\",\"code\":" + std::to_string(static_cast<int>(result.code)) +
+                        ",\"matched\":" +
+                        (generation == generation_ && goal_ &&
+                                 result.goal_id == goal_->get_goal_id()
+                             ? "true"
+                             : "false") +
+                        "}");
+      } catch (const std::exception &) {
+      }
+    }
     if (generation != generation_ || !goal_ || result.goal_id != goal_->get_goal_id()) {
       return;
     }

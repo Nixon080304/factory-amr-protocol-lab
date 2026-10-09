@@ -12,7 +12,6 @@ import math
 import os
 from pathlib import Path
 import re
-import random
 import signal
 import socket
 import subprocess
@@ -23,6 +22,8 @@ from protocol_observer.report import compare_scenario, scenario_matrix_markdown
 
 DOMAIN_LEASE_ROOT = Path('/tmp')
 root = Path(sys.argv[1])
+sys.path.insert(0, str(root / 'tests/system'))
+from fleet_isolation import domain_choices, lease_metadata_available
 expected = json.loads((root / 'tests/scenarios/expected_outcomes.yaml').read_text())
 if len(sys.argv) != 3 or sys.argv[2] not in expected:
     print('Usage: scripts/run_scenario.sh <' + '|'.join(expected) + '>', file=sys.stderr)
@@ -38,13 +39,17 @@ try:
 except ValueError:
     print('Use a positive finite timeout and a safe FACTORY_RUN_ID', file=sys.stderr)
     sys.exit(2)
+install_setup = Path(os.environ.get('FACTORY_INSTALL_SETUP', root / 'install/setup.bash'))
+if not install_setup.is_absolute() or not install_setup.is_file() or not os.access(install_setup, os.R_OK):
+    print('FACTORY_INSTALL_SETUP requires an absolute readable setup file', file=sys.stderr)
+    sys.exit(2)
 output = Path(os.environ.get('FACTORY_REPORT_ROOT', root / 'reports')).resolve() / run_id / scenario
 output.mkdir(parents=True, exist_ok=False)
 override = os.environ.get('FACTORY_SCENARIO_COMMAND')
 command = [override, scenario, str(output)] if override else ['bash', '-c',
     'set -e; source .venv/bin/activate; source /opt/ros/humble/setup.bash; '
-    'source install/setup.bash; exec python3 tests/scenarios/run_case.py "$@"',
-    'factory-scenario', scenario, str(output)]
+    'source "$1"; shift; exec python3 tests/scenarios/run_case.py "$@"',
+    'factory-scenario', str(install_setup), scenario, str(output)]
 interrupted = 0
 def interrupt(signum, frame):
     global interrupted
@@ -108,23 +113,15 @@ def allocate_domain():
         domain = json.loads(path.read_text()).get('domain_id')
         if domain is not None:
             used.add(domain)
-    domains = [domain for domain in range(100, 221) if domain not in used]
-    random.shuffle(domains)
+    domains = [domain for domain in domain_choices() if domain not in used]
     for domain in domains:
-        candidate = open(DOMAIN_LEASE_ROOT / f'factory-amr-scenario-domain-{domain}.lock', 'a+')
+        candidate = open(DOMAIN_LEASE_ROOT / f'factory-fleet-domain-{domain}.lock', 'a+')
         try:
             fcntl.flock(candidate, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             candidate.close()
             continue
-        candidate.seek(0)
-        content = candidate.read()
-        try:
-            metadata = json.loads(content) if content else {}
-        except ValueError:
-            candidate.close()
-            continue
-        if not isinstance(metadata, dict) or metadata.get('quarantined'):
+        if not lease_metadata_available(candidate, domain):
             candidate.close()
             continue
         lease = candidate

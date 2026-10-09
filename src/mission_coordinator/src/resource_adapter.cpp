@@ -14,10 +14,10 @@ struct ResourceAdapter::State : std::enable_shared_from_this<ResourceAdapter::St
     LeaseIdentity key;
     Notice callback;
     ResourceState status{ResourceState::Waiting};
-    bool occupied{false}, pending{false};
+    bool occupied{false}, pending{false}, acquire_abandoned{false};
     unsigned attempts{0};
     uint64_t sequence{0};
-    double expires{0}, renew_at{0}, next{0}, sent{0};
+    double expires{0}, renew_at{0}, next{0}, sent{0}, wait_deadline{0};
     ResourceTransport::Cancel cancel;
     std::function<void(bool)> released;
     ResourceOperation operation{ResourceOperation::Acquire};
@@ -25,6 +25,7 @@ struct ResourceAdapter::State : std::enable_shared_from_this<ResourceAdapter::St
   std::shared_ptr<ResourceTransport> transport;
   std::string robot;
   std::function<double()> clock;
+  double wait_timeout{120};
   std::map<std::pair<std::string, std::string>, std::shared_ptr<Entry>> entries;
   using Index = std::pair<std::string, std::string>;
   std::map<Index, unsigned> acquiring;
@@ -228,8 +229,28 @@ struct ResourceAdapter::State : std::enable_shared_from_this<ResourceAdapter::St
                 released(reply.ok && !unresolved);
               return;
             }
+            if (operation == ResourceOperation::Acquire &&
+                current >= entry->wait_deadline) {
+              if (reply.ok && !reply.lease_id.empty()) {
+                // A grant at the deadline cannot authorize entry. Compensate
+                // only this exact never-entered token, then resolve the queue.
+                auto key = entry->key;
+                key.lease_id = reply.lease_id;
+                self->cleanup(key, ResourceOperation::Release);
+              }
+              self->wait_expired(entry);
+              return;
+            }
             if (operation == ResourceOperation::Acquire && !reply.ok) {
-              self->retry(entry, reply.reason);
+              if (reply.authoritative_wait && reply.lease_id.empty() &&
+                  reply.ttl == 0) {
+                // A healthy response resets consecutive transport failures.
+                // Keep the original queue identity and paced status requests.
+                entry->attempts = 0;
+                entry->next = current + 0.25;
+                self->notify(entry, ResourceState::Waiting, reply.reason);
+              } else
+                self->retry(entry, reply.reason);
               return;
             }
             if (!reply.ok || !std::isfinite(reply.ttl) || reply.ttl <= 0 ||
@@ -265,6 +286,7 @@ struct ResourceAdapter::State : std::enable_shared_from_this<ResourceAdapter::St
   }
   void retry(const std::shared_ptr<Entry> &entry, const std::string &reason) {
     if (++entry->attempts >= 120) {
+      entry->acquire_abandoned = true;
       cleanup(entry->key, ResourceOperation::CancelWait);
       invalidate(entry, "resource attempts exhausted: " + reason);
     } else {
@@ -272,16 +294,24 @@ struct ResourceAdapter::State : std::enable_shared_from_this<ResourceAdapter::St
       notify(entry, ResourceState::Waiting, reason);
     }
   }
+  void wait_expired(const std::shared_ptr<Entry> &entry) {
+    entry->acquire_abandoned = true;
+    cleanup(entry->key, ResourceOperation::CancelWait);
+    invalidate(entry, "RESOURCE_WAIT_TIMEOUT");
+  }
 };
 ResourceAdapter::ResourceAdapter(std::shared_ptr<ResourceTransport> transport,
-                                 std::string robot_id, std::function<double()> clock)
+                                 std::string robot_id, std::function<double()> clock,
+                                 double wait_timeout)
     : state_(std::make_shared<State>()) {
-  if (!transport || robot_id.empty() || !clock)
-    throw std::invalid_argument(
-        "resource adapter requires transport, identity and clock");
+  if (!transport || robot_id.empty() || !clock || !std::isfinite(wait_timeout) ||
+      wait_timeout <= 0)
+    throw std::invalid_argument("resource adapter requires transport, identity, clock "
+                                "and positive wait timeout");
   state_->transport = std::move(transport);
   state_->robot = std::move(robot_id);
   state_->clock = std::move(clock);
+  state_->wait_timeout = wait_timeout;
 }
 void ResourceAdapter::acquire(const std::string &resource, const std::string &mission,
                               Notice callback) {
@@ -307,6 +337,7 @@ void ResourceAdapter::acquire(const std::string &resource, const std::string &mi
   auto entry = std::make_shared<State::Entry>();
   entry->key = {state_->robot, mission, resource, ""};
   entry->callback = std::move(callback);
+  entry->wait_deadline = state_->clock() + state_->wait_timeout;
   state_->entries[index] = entry;
   state_->notify(entry, ResourceState::Waiting, "acquiring");
   if (entry->status == ResourceState::Waiting)
@@ -375,6 +406,12 @@ bool ResourceAdapter::release_all(const std::string &mission) {
       state_->notify(entry, ResourceState::Cancelled, "mission cancelled");
       state_->cleanup(entry->key, ResourceOperation::CancelWait);
       safe = false;
+    } else if (entry->status == ResourceState::Lost && entry->acquire_abandoned &&
+               !entry->occupied && state_->resolutions.count(index) != 0 &&
+               state_->resolutions.at(index).safe && state_->clean(index)) {
+      // A timed-out/failed never-entered request is safe only after central
+      // cleanup and every older acquisition are authoritatively resolved.
+      continue;
     } else if (entry->occupied || entry->status == ResourceState::Lost) {
       safe = false;
     } else if (entry->operation == ResourceOperation::Release && entry->pending) {
@@ -433,6 +470,12 @@ void ResourceAdapter::tick() {
     entries.push_back(pair.second);
   for (const auto &entry : entries) {
     const double current = state_->clock();
+    if (entry->status == ResourceState::Waiting &&
+        entry->operation == ResourceOperation::Acquire &&
+        current >= entry->wait_deadline) {
+      state_->wait_expired(entry);
+      continue;
+    }
     if (entry->status == ResourceState::Granted &&
         (current >= entry->expires ||
          !state_->transport->available(ResourceOperation::Renew))) {

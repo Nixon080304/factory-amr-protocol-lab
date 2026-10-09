@@ -13,6 +13,7 @@
 #include <factory_interfaces/msg/fault_command.hpp>
 #include <chrono>
 #include <std_msgs/msg/string.hpp>
+#include <std_srvs/srv/empty.hpp>
 #include "mission_coordinator/navigation_adapter.hpp"
 #include "mission_coordinator/mission_state_machine.hpp"
 #include "mission_coordinator/robot_context.hpp"
@@ -25,6 +26,7 @@ class MissionCoordinatorNode : public rclcpp::Node {
 public:
   explicit MissionCoordinatorNode(
       const rclcpp::NodeOptions &options = rclcpp::NodeOptions());
+  ~MissionCoordinatorNode() override;
 
 protected:
   using Transfer = factory_interfaces::srv::TransferPart;
@@ -39,16 +41,22 @@ private:
   void navigate();
   void navigate_target(const std::vector<double> &coordinates);
   void navigation_arrived();
-  void wait_for_resource(const std::string &resource, std::function<void()> effect);
+  void wait_for_resource(const std::string &resource, std::function<void()> effect,
+                         const std::string &departure_source = "");
+  bool traffic_pose_clear(const TrafficBoundary &boundary) const;
   void transfer_effect();
   void verify_station();
   void detection(const factory_interfaces::msg::StationDetection &message);
   void queue_detection(const factory_interfaces::msg::StationDetection &message);
   void consume_detections();
   bool localized() const;
+  bool pose_current() const;
+  void request_pose_refresh();
+  void drop_pose_refresh();
   void transfer();
   void tick();
   void finish(const std::string &error);
+  bool owns_goal(uint64_t generation);
   void fault_command(const factory_interfaces::msg::FaultCommand &message);
   bool reject_navigation();
   void fault_event(const std::string &name,
@@ -74,10 +82,28 @@ private:
   bool finishing_{false};
   std::string pending_finish_error_;
   std::string held_resource_;
+  std::string departure_station_;
+  bool waiting_traffic_pose_{false}, clearing_traffic_{false};
+  bool waiting_navigation_pose_{false};
+  std::vector<double> pending_navigation_target_;
+  std::map<std::string, TrafficBoundary> station_bounds_;
+  std::map<std::string, std::vector<double>> station_staging_;
+  std::map<std::string, std::vector<double>> station_exit_;
+  double station_clearance_distance_{1.20};
+  bool station_staged_{false}, station_exiting_{false}, station_terminal_exit_{false};
   std::vector<double> navigation_target_;
   rclcpp_action::Server<Mission>::SharedPtr server_;
   std::shared_ptr<Handle> goal_;
   rclcpp::Client<Transfer>::SharedPtr transfer_client_;
+  rclcpp::Client<std_srvs::srv::Empty>::SharedPtr refresh_client_;
+  bool refresh_active_{false}, refresh_ready_{false};
+  bool refresh_buffered_pose_{false};
+  unsigned refresh_attempts_{0};
+  int64_t refresh_request_id_{-1};
+  uint64_t refresh_sequence_{0};
+  double refresh_timeout_{1.0}, refresh_sent_{0}, refresh_ack_receipt_{-1},
+      refresh_epoch_{0}, refresh_source_stamp_{-1}, refresh_last_attempt_{0};
+  double pose_receipt_{-1}, last_current_pose_stamp_{-1}, mission_pose_floor_{-1};
   rclcpp::Publisher<factory_interfaces::msg::ProtocolEvent>::SharedPtr events_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr states_;
   rclcpp::Subscription<factory_interfaces::msg::StationDetection>::SharedPtr

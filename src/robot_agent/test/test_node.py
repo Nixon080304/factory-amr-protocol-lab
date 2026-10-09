@@ -27,6 +27,163 @@ def api():
         pytest.fail("robot agent ROS boundary is missing")
 
 
+@pytest.mark.parametrize(
+    "shutdown, message, handled",
+    [
+        (
+            True,
+            "Unable to convert call argument to Python object (compile in debug mode for details)",
+            True,
+        ),
+        (
+            False,
+            "Unable to convert call argument to Python object (compile in debug mode for details)",
+            False,
+        ),
+        (True, "unrelated robot agent failure", False),
+    ],
+)
+def test_main_preserves_errors_except_exact_shutdown_message_conversion(
+    monkeypatch, shutdown, message, handled
+):
+    module = api()
+    live, cleanup = [True], []
+
+    def spin():
+        live[0] = not shutdown
+        raise RuntimeError(message)
+
+    node = SimpleNamespace(destroy_node=lambda: cleanup.append("node"))
+    executor = SimpleNamespace(
+        add_node=lambda n: None,
+        spin=spin,
+        shutdown=lambda: cleanup.append("executor"),
+    )
+    monkeypatch.setattr(module, "RobotAgentNode", lambda: node)
+    monkeypatch.setattr(module, "SingleThreadedExecutor", lambda: executor)
+    monkeypatch.setattr(module.rclpy, "init", lambda **kwargs: None)
+    monkeypatch.setattr(module.rclpy, "ok", lambda: live[0])
+    monkeypatch.setattr(module.rclpy, "try_shutdown", lambda: cleanup.append("context"))
+    if handled:
+        module.main()
+    else:
+        with pytest.raises(RuntimeError, match=message.split(" (")[0]):
+            module.main()
+    assert cleanup == ["executor", "node", "context"]
+
+
+def test_real_dock_shutdown_after_context_shutdown_does_not_publish_dead_goal():
+    import time
+
+    from factory_interfaces.action import DockRobot
+    from geometry_msgs.msg import PoseStamped
+    from rclpy.action import ActionClient
+    from rclpy.context import Context
+    from rclpy.executors import SingleThreadedExecutor
+    from rclpy.node import Node
+    from test_docking import rig
+
+    context = Context()
+    context.init()
+    host = Node("dock_shutdown", namespace="/cart_1", context=context)
+    executor = SingleThreadedExecutor(context=context)
+    client, docking, server_destroyed = None, None, False
+    try:
+        agent, _, wire, *_ = rig()
+        docking = api().DockRuntime(
+            host, agent, wire, "charger", (2, -3, 0), (3, -3, 0)
+        )
+        client = ActionClient(host, DockRobot, "factory/dock_robot")
+        executor.add_node(host)
+
+        def pose(x):
+            message = PoseStamped()
+            message.header.frame_id = "floor/cart_1/map"
+            message.pose.position.x, message.pose.position.y = float(x), -3.0
+            message.pose.orientation.w = 1.0
+            return message
+
+        assert client.wait_for_server(timeout_sec=2.0)
+        reply = client.send_goal_async(
+            DockRobot.Goal(
+                dock_id="charger",
+                staging_pose=pose(2),
+                charging_pose=pose(3),
+                target_percent=80.0,
+            )
+        )
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and (
+            not reply.done() or docking._handle is None
+        ):
+            executor.spin_once(timeout_sec=0.01)
+        assert reply.done() and reply.result().accepted and docking.controller.active
+        context.try_shutdown()
+        docking.shutdown()
+        server_destroyed = True
+        assert not docking.controller.active and agent.mode == "RECOVERY_REQUIRED"
+    finally:
+        if docking is not None and not server_destroyed:
+            docking.server.destroy()
+        if client is not None:
+            client.destroy()
+        executor.shutdown()
+        host.destroy_node()
+        context.try_shutdown()
+
+
+@pytest.mark.parametrize(
+    "shutdown, message, handled",
+    [
+        (
+            True,
+            "Failed get goal status array: feedback publisher is invalid, at ./src/rcl_action/action_server.c:919",
+            True,
+        ),
+        (
+            False,
+            "Failed get goal status array: feedback publisher is invalid, at ./src/rcl_action/action_server.c:919",
+            False,
+        ),
+        (True, "unrelated action server failure", False),
+    ],
+)
+def test_dock_shutdown_preserves_errors_except_exact_inactive_goal_status(
+    shutdown, message, handled
+):
+    from rclpy.impl.implementation_singleton import rclpy_implementation
+    from test_docking import rig
+
+    host = Host("/cart_1")
+    host.context = SimpleNamespace(ok=lambda: not shutdown)
+    agent, _, wire, *_ = rig()
+    docking = api().DockRuntime(
+        host,
+        agent,
+        wire,
+        "charger",
+        (2, -3, 0),
+        (3, -3, 0),
+        server_factory=lambda *args, **kwargs: SimpleNamespace(destroy=lambda: None),
+    )
+
+    def execute():
+        raise rclpy_implementation.RCLError(message)
+
+    handle = SimpleNamespace(
+        request=SimpleNamespace(target_percent=80),
+        publish_feedback=lambda _: None,
+        execute=execute,
+    )
+    docking.accepted(handle)
+    if handled:
+        docking.shutdown()
+    else:
+        with pytest.raises(rclpy_implementation.RCLError, match=message.split(":")[0]):
+            docking.shutdown()
+    assert agent.mode == "RECOVERY_REQUIRED" and not docking.controller.active
+
+
 class Publisher:
     def __init__(self):
         self.messages = []
@@ -40,6 +197,7 @@ class Host:
         self.namespace = namespace
         self.publishers, self.subscriptions, self.services, self.timers = {}, {}, {}, []
         self.sim_sec = 42
+        self.subscription_qos = {}
 
     def resolve(self, name):
         return name if name.startswith("/") else self.namespace + "/" + name
@@ -51,6 +209,7 @@ class Host:
 
     def create_subscription(self, message_type, name, callback, qos):
         self.subscriptions[self.resolve(name)] = callback
+        self.subscription_qos[self.resolve(name)] = qos
         return object()
 
     def create_service(self, message_type, name, callback, **kwargs):
@@ -77,6 +236,53 @@ def runtime(namespace="/cart_1"):
     )
     agent = api().AgentRuntime(host, config, paths, clock=lambda: wall[0])
     return host, agent, paths, wall
+
+
+def test_initial_idle_amcl_pose_uses_retained_reliable_observation():
+    from rclpy.qos import DurabilityPolicy, ReliabilityPolicy
+
+    host, _, _, _ = runtime()
+    qos = host.subscription_qos[host.resolve("amcl_pose")]
+    assert qos.durability == DurabilityPolicy.TRANSIENT_LOCAL
+    assert qos.reliability == ReliabilityPolicy.RELIABLE
+    assert qos.depth == 1
+
+
+@pytest.mark.parametrize(
+    "value, want, invalid",
+    [
+        (None, None, False),
+        ([3.5, -3.4, 3.141592653589793], (3.5, -3.4, 3.141592653589793), False),
+        ([3.5, -3.4], None, True),
+        ([3.5, float("nan"), 0.0], None, True),
+    ],
+)
+def test_optional_exit_parameter_is_typed_empty_or_finite_pose(value, want, invalid):
+    from rclpy.context import Context
+    from rclpy.node import Node
+    from rclpy.parameter import Parameter
+
+    context = Context()
+    context.init()
+    host = None
+    try:
+        overrides = [] if value is None else [Parameter("dock.exit_pose", value=value)]
+        host = Node(
+            "exit_configuration", context=context, parameter_overrides=overrides
+        )
+        if invalid:
+            with pytest.raises(ValueError, match="exit"):
+                api().optional_exit_pose(host)
+        else:
+            assert api().optional_exit_pose(host) == want
+            parameter = host.get_parameter("dock.exit_pose")
+            assert parameter.type_ is Parameter.Type.DOUBLE_ARRAY
+            assert parameter.value == ([] if value is None else value)
+            assert host.describe_parameter("dock.exit_pose").read_only
+    finally:
+        if host is not None:
+            host.destroy_node()
+        context.try_shutdown()
 
 
 def sensors(host):
@@ -256,11 +462,13 @@ def test_dock_runtime_registers_action_and_requires_real_contact_before_charge(
         canceled=lambda: status.append("cancelled"),
     )
     callbacks["handle_accepted_callback"](handle)
-    runtime_.adapter.localization(2, 2, 0, 0, "floor/cart_1/map")
     wire.moves[0][2](True, "")
+    runtime_.adapter.localization(2, 2, 0, 0, "floor/cart_1/map")
+    docking.controller.tick()
     wire.reply(granted=True, lease_id="real-lease", lease_ttl_sec=10.0)
-    runtime_.adapter.localization(3, 3, 0, 0, "floor/cart_1/map")
     wire.moves[1][2](True, "")
+    runtime_.adapter.localization(3, 3, 0, 0, "floor/cart_1/map")
+    docking.controller.tick()
     runtime_.heartbeat()
     assert runtime_.adapter.mode == "DOCKING"
     assert (
@@ -281,8 +489,9 @@ def test_dock_runtime_registers_action_and_requires_real_contact_before_charge(
     )
     wall[0] += 0.1
     docking.controller.tick()
-    runtime_.adapter.localization(4, 0, 0, 0, "floor/cart_1/map")
     wire.moves[2][2](True, "")
+    runtime_.adapter.localization(4, 0, 0, 0, "floor/cart_1/map")
+    docking.controller.tick()
     wire.reply(released=True)
     assert finished == [True]
     reply = registrations[0][2](handle)
@@ -362,8 +571,9 @@ def test_dock_navigation_result_exception_is_unknown_motion(phase, cancel_reques
     def terminal_at(pose):
         stamp = agent._pose_stamp + 1
         agent.odometry(stamp, 0, 0, agent.frame_prefix + "odom")
-        agent.localization(stamp, *pose, agent.frame_prefix + "map")
         pending[-1].set_result(SimpleNamespace(status=4))
+        agent.localization(stamp, *pose, agent.frame_prefix + "map")
+        controller.tick()
 
     if phase != "STAGING":
         terminal_at(controller.staging)
@@ -481,9 +691,17 @@ def test_actual_demo_parameters_construct_namespaced_agent_with_unprefixed_frame
         module.Node,
         "declare_parameter",
         lambda self, name, default, *args: SimpleNamespace(
-            value=parameters.get(name, default)
+            value=parameters.get(
+                name, None if default is module.Parameter.Type.DOUBLE_ARRAY else default
+            )
         ),
     )
+    monkeypatch.setattr(
+        module.Node,
+        "set_parameters",
+        lambda self, values: [SimpleNamespace(successful=True)],
+    )
+    monkeypatch.setattr(module.Node, "set_descriptor", lambda self, *args: None)
     monkeypatch.setattr(module, "ActionClient", lambda *args: object())
     monkeypatch.setattr(
         module,
@@ -504,6 +722,96 @@ def test_actual_demo_parameters_construct_namespaced_agent_with_unprefixed_frame
     parameters.pop("legacy_unprefixed_frames", None)
     with pytest.raises(ValueError, match="namespaced robots require frame_prefix"):
         module.RobotAgentNode(namespace=node.namespace)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_real_legacy_nav2_clients_use_root_without_cross_namespace_discovery(legacy):
+    import time
+    import rclpy
+    from rclpy.action import ActionServer
+    from rclpy.context import Context
+    from rclpy.executors import SingleThreadedExecutor
+    from rclpy.parameter import Parameter
+    from nav2_msgs.action import ComputePathToPose, NavigateToPose
+    from std_srvs.srv import Empty
+
+    context = Context()
+    rclpy.init(context=context, domain_id=78)
+    executor = SingleThreadedExecutor(context=context)
+    agent, peer = None, None
+    servers, requests = [], []
+    try:
+        peer = rclpy.create_node("root_v1_nav2", context=context)
+
+        def execute(handle, action):
+            requests.append(action.__name__)
+            handle.succeed()
+            return action.Result()
+
+        for action, name in (
+            (ComputePathToPose, "/compute_path_to_pose"),
+            (NavigateToPose, "/navigate_to_pose"),
+        ):
+            servers.append(
+                ActionServer(
+                    peer,
+                    action,
+                    name,
+                    lambda handle, action=action: execute(handle, action),
+                )
+            )
+        peer.create_service(
+            Empty, "/request_nomotion_update", lambda request, response: response
+        )
+        agent = api().RobotAgentNode(
+            namespace="/cart",
+            context=context,
+            parameter_overrides=[
+                Parameter("robot_id", value="cart"),
+                Parameter("frame_prefix", value="" if legacy else "cart/"),
+                Parameter("legacy_unprefixed_frames", value=legacy),
+            ],
+        )
+        executor.add_node(agent)
+        executor.add_node(peer)
+        until = time.monotonic() + 2
+        while time.monotonic() < until:
+            executor.spin_once(timeout_sec=0.02)
+        assert agent.path_client.server_is_ready() is legacy
+        assert agent.navigation_client.server_is_ready() is legacy
+        localization = agent.docking.controller.transport.localization_client
+        assert localization.service_is_ready() is legacy
+        if legacy:
+            for client, action in (
+                (agent.path_client, ComputePathToPose),
+                (agent.navigation_client, NavigateToPose),
+            ):
+                future = client.send_goal_async(action.Goal())
+                until = time.monotonic() + 2
+                while not future.done() and time.monotonic() < until:
+                    executor.spin_once(timeout_sec=0.02)
+                assert future.done() and future.result().accepted
+                result = future.result().get_result_async()
+                while not result.done() and time.monotonic() < until:
+                    executor.spin_once(timeout_sec=0.02)
+                assert result.done() and result.result().status == 4
+            assert requests == ["ComputePathToPose", "NavigateToPose"]
+            refresh = localization.call_async(Empty.Request())
+            until = time.monotonic() + 2
+            while not refresh.done() and time.monotonic() < until:
+                executor.spin_once(timeout_sec=0.02)
+            assert refresh.done() and refresh.result() is not None
+        else:
+            assert requests == []
+    finally:
+        for server in servers:
+            server.destroy()
+        executor.shutdown()
+        if agent is not None:
+            agent.destroy_node()
+        if peer is not None:
+            peer.destroy_node()
+        context.shutdown()
 
 
 @pytest.mark.parametrize(
@@ -591,7 +899,11 @@ def test_real_ros_agent_cost_with_robot_local_nav2_action(scenario):
             0.04, run_planner, clock=Clock(clock_type=ClockType.STEADY_TIME)
         )
         odom_pub = peer.create_publisher(Odometry, "odom", 10)
-        pose_pub = peer.create_publisher(PoseWithCovarianceStamped, "amcl_pose", 10)
+        pose_pub = peer.create_publisher(
+            PoseWithCovarianceStamped,
+            "amcl_pose",
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+        )
         payload_pub = peer.create_publisher(
             String,
             "/factory/payload_state",
