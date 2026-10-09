@@ -366,6 +366,47 @@ remains pending at this publication handoff; the earlier startup stall's cause
 remains unproven. No ROS/dashboard product change, retry, dependency pin,
 deadline extension, two-robot all-scenario or new media result is claimed.
 
+### Hosted dashboard fixture freshness follow-up
+
+Hosted run [37915406679](https://github.com/Nixon080304/factory-amr-protocol-lab/actions/runs/37915406679)
+on `5d72a3470d6020ec40b05ed36e3aaddee56f51e9` passes all twelve builds,
+its exact 1,640-record package gate with zero errors, failures or skips, and
+separate stages of 338 pure, 63 contract/schema and 30 bounded cases. All nine
+browser ownership contracts pass. Executed Chrome/154.0.8037.97 starts in six
+seconds, but the complete dashboard test then fails `Timed out: dashboard live`;
+the later real protocol stage is not executed. This remains a failed hosted gate.
+
+The confirmed defect is fixture timing: its initial actual capture precedes
+browser startup and becomes older than the correct three-second production
+freshness cutoff. Correction `341341e` acknowledges one actual fixture capture
+after browser initialization and immediately before navigation. The normal CI
+browser test deliberately ages its original actual timestamp beyond 3.2 seconds
+and verifies the recapture replaces it. Correction `6b7e5a5` also waits within
+the existing bounded helper for the observer's first actual numeric timestamp;
+server readiness alone does not guarantee publication. A controlled real HTTP
+response of `updated_at: null` fails the immediate-read version and passes the
+corrected complete browser test. No timestamp is fabricated.
+
+Complete local browser checks on `6b7e5a5` pass with installed Node 20.16.0 /
+Chrome 151.0.7922.169 and owned exact Node 22.23.3 / Chrome 154.0.8037.97.
+Their original capture ages are 3.577 and 3.595 seconds; renewed ages are 0.101
+and 0.142 seconds. The actual six-second Chrome startup control also passes
+the complete check, with original age 9.555 seconds and renewed age 0.105
+seconds. All original desktop/mobile, frozen-source stale, reconnect and
+security assertions remain. Owned process groups clear. Final focused checks
+pass nine ownership contracts and 77 documentation/runner contracts, with
+formatting, Ruff, shell/JavaScript syntax and whitespace checks clean.
+
+Receipts remain in
+`artifacts/final-fix-20261009.rWzGz8/hosted-compatibility`, including the failed
+aged-capture and initial-publication controls. The complete local CI receipt
+on `1949c37` above is not relabeled as containing these fixture-only changes.
+Independent review and a new hosted gate remain pending at this handoff. No
+production code, freshness cutoff, CDP deadline, transport, launch arguments,
+browser selection or periodic refresh changes. The earlier first-target stall's
+cause remains unproven; this correction does not claim to repair it. No new
+ROS/Gazebo all-scenario or media receipt is claimed.
+
 ## Current local verification — historical Version 1 (3 October 2026)
 
 This section retains the original Version 1 receipt and its historical use of
