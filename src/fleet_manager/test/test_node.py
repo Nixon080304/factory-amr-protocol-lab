@@ -90,6 +90,85 @@ def request(mission_id="m1", pin=None):
     return MissionRequest(mission_id, "assembly", "inspection", "motor", pin)
 
 
+def test_durable_query_checks_identity_without_writes_or_execution(rig):
+    from fleet_manager.node import FleetManagerNode
+    from factory_interfaces.srv import GetFleetMission
+
+    _, adapter, journal, robots, _ = rig
+    adapter.submit(request())
+    host = object.__new__(FleetManagerNode)
+    host.journal = journal
+    changes = journal._connection.total_changes
+    lookup = GetFleetMission.Request(
+        mission_id="m1",
+        pickup_station="assembly",
+        dropoff_station="inspection",
+        part="motor",
+    )
+    reply = host._query_mission(lookup, GetFleetMission.Response())
+    assert reply.found and reply.matches and reply.state == "QUEUED"
+    lookup.part = "gear"
+    conflict = host._query_mission(lookup, GetFleetMission.Response())
+    assert conflict.found and not conflict.matches and conflict.state == ""
+    lookup.mission_id = "missing"
+    absent = host._query_mission(lookup, GetFleetMission.Response())
+    assert not absent.found and not absent.matches
+    assert journal._connection.total_changes == changes and robots.goals == []
+
+
+@pytest.mark.parametrize("ownership", ["PICKED_UP", "UNKNOWN"])
+def test_restart_recovers_historical_failed_custody_despite_fresh_idle(rig, ownership):
+    api, adapter, journal, robots, now = rig
+    from fleet_manager.journal import MissionState
+
+    adapter.submit(request())
+    decision = adapter.core.assign("m1", {"amr_01": CostEstimate(True, 1, 80)}, 100)
+    journal.transition(
+        "m1",
+        MissionState.ASSIGNED,
+        MissionState.FAILED,
+        {
+            "payload_ownership": ownership,
+            "result": {
+                "success": False,
+                "final_state": "FAILED",
+                "error_code": "RESOURCE_WAIT_TIMEOUT",
+            },
+        },
+        100,
+    )
+    events = journal.events("m1")
+    path = journal._connection.execute("PRAGMA database_list").fetchone()[2]
+    journal.close()
+    reopened = MissionJournal(path)
+    try:
+        recovered = reopened.load_recovery()
+        assert len(recovered) == 1
+        assert recovered[0].assigned_robot_id == decision.robot_id
+        replacement = api.FleetAdapter(
+            adapter.config, reopened, robots, clock=lambda: now[0]
+        )
+        for robot in adapter.config.robots:
+            replacement.observe(
+                RobotSnapshot(robot.robot_id, "AVAILABLE", robot.spawn, 80, "EMPTY")
+            )
+        replacement.tick()
+        record = reopened.get("m1")
+        assert record.state == "RECOVERY_REQUIRED"
+        assert record.payload_ownership == ownership
+        assert reopened.events("m1")[: len(events)] == events
+        replacement.core.submit(request("next", "amr_01"), 100)
+        assert (
+            replacement.core.assign(
+                "next", {"amr_01": CostEstimate(True, 1, 80)}, 100
+            ).robot_id
+            is None
+        )
+        assert reopened.recovery_physical_claims("m1")
+    finally:
+        reopened.close()
+
+
 def test_real_ros_legacy_fleet_constructor_has_one_matching_robot(tmp_path):
     import rclpy
     from rclpy.context import Context
@@ -431,6 +510,84 @@ def test_shared_staging_admits_next_robot_only_after_head_confirms_exit(rig):
     adapter.observe(RobotSnapshot("amr_01", "AVAILABLE", Pose2D(0, -3, 0), 80, "EMPTY"))
     adapter.tick()
     assert [goal.robot_id for goal in goals] == ["amr_01", "amr_02"]
+
+
+def test_definitely_unsent_dock_discovery_retries_and_admits_second_robot(rig):
+    from types import SimpleNamespace
+    from fleet_manager.node import FleetManagerNode
+
+    api, adapter, _, robots, now = rig
+    dock_node = object.__new__(FleetManagerNode)
+    dock_node.adapter = adapter
+    dock_node.docks = {"amr_01": SimpleNamespace(server_is_ready=lambda: False)}
+    attempts, goals = [], []
+    ready = [False]
+
+    def start(robot_id, charge, feedback, result, accepted):
+        attempts.append((robot_id, now[0]))
+        if not ready[0]:
+            dock_node.send_dock_goal(robot_id, charge, feedback, result, accepted)
+            return
+        goal = SimpleNamespace(robot_id=robot_id, feedback=feedback, result=result)
+        goals.append(goal)
+        accepted(goal, "")
+
+    robots.send_dock_goal = start
+    for robot_id in ("amr_01", "amr_02"):
+        adapter.observe(
+            RobotSnapshot(robot_id, "AVAILABLE", Pose2D(0, -3, 0), 20, "EMPTY")
+        )
+    adapter.tick()
+    adapter.tick()
+    assert [charge.state for charge in adapter.core.charging_snapshot()] == [
+        "CHARGE_QUEUED",
+        "CHARGE_QUEUED",
+    ]
+    for _ in range(100):
+        adapter.tick()
+    assert len(attempts) == 1
+    ready[0] = True
+    now[0] += 1
+    adapter.tick()
+    adapter.tick()
+    assert [goal.robot_id for goal in goals] == ["amr_01"]
+    goals[0].feedback(api.RobotFeedback("CHARGING"))
+    adapter.tick()
+    assert len(goals) == 1
+    goals[0].result(api.RobotReply(True))
+    adapter.observe(RobotSnapshot("amr_01", "AVAILABLE", Pose2D(0, -3, 0), 80, "EMPTY"))
+    adapter.tick()
+    assert [goal.robot_id for goal in goals] == ["amr_01", "amr_02"]
+
+
+@pytest.mark.parametrize(
+    "failure", ["uncertain_send", "lost_result", "entered_failure"]
+)
+def test_uncertain_dock_execution_never_automatically_hands_off(rig, failure):
+    api, adapter, _, robots, now = rig
+    goals = []
+
+    def start(robot_id, charge, feedback, result, accepted):
+        goals.append(robot_id)
+        if failure == "uncertain_send":
+            raise RuntimeError("send outcome unknown")
+        accepted(object(), "")
+        if failure == "entered_failure":
+            feedback(api.RobotFeedback("CHARGING"))
+            result(api.RobotReply(False, "CONTACT_LOST"))
+
+    robots.send_dock_goal = start
+    for robot_id in ("amr_01", "amr_02"):
+        adapter.observe(
+            RobotSnapshot(robot_id, "AVAILABLE", Pose2D(0, -3, 0), 20, "EMPTY")
+        )
+    adapter.tick()
+    adapter.tick()
+    now[0] += 1
+    for _ in range(10):
+        adapter.tick()
+    assert goals == ["amr_01"]
+    assert adapter.core.charging_snapshot()[1].state == "CHARGE_QUEUED"
 
 
 def test_delayed_charging_heartbeat_after_confirmed_exit_does_not_block_handoff(rig):
@@ -1460,6 +1617,8 @@ def test_wire_robot_state_reports_operational_health_without_waiting_for_timeout
         "offline",
         "mqtt",
         "resources",
+        "loaded_timeout",
+        "unknown_timeout",
     ],
 )
 def test_real_ros_two_robot_fleet_action(scenario, tmp_path):
@@ -1629,6 +1788,12 @@ def test_real_ros_two_robot_fleet_action(scenario, tmp_path):
         if scenario in ("cancel", "offline"):
             second.finish = False
             second.stage = "NAVIGATING_TO_PICKUP"
+        if scenario in ("loaded_timeout", "unknown_timeout"):
+            second.failed = True
+            second.failure_code = "RESOURCE_WAIT_TIMEOUT"
+            second.stage = (
+                "LOADING" if scenario == "unknown_timeout" else "NAVIGATING_TO_DROPOFF"
+            )
         goal = ExecuteFleetMission.Goal(
             mission_id="ros",
             pickup_station="assembly",
@@ -1643,6 +1808,31 @@ def test_real_ros_two_robot_fleet_action(scenario, tmp_path):
         handle = sent.result()
         assert handle.accepted
         result = handle.get_result_async()
+        if scenario in ("loaded_timeout", "unknown_timeout"):
+            wait(result.done)
+            reply = result.result().result
+            assert not reply.success and reply.final_state == "RECOVERY_REQUIRED"
+            assert reply.error_code == "RESOURCE_WAIT_TIMEOUT"
+            record = fleet.journal.get("ros")
+            assert record.assigned_robot_id == "amr_02"
+            assert record.payload_ownership == (
+                "UNKNOWN" if scenario == "unknown_timeout" else "PICKED_UP"
+            )
+            wait(
+                lambda: (
+                    fleet.adapter.registry.get("amr_02", time.monotonic()).mode
+                    == "AVAILABLE"
+                )
+            )
+            fleet.adapter.core.submit(request("next", "amr_02"), time.monotonic())
+            assert (
+                fleet.adapter.core.assign(
+                    "next", {"amr_02": CostEstimate(True, 1, 80)}, time.monotonic()
+                ).robot_id
+                is None
+            )
+            assert len(second.goals) == 1 and not first.goals
+            return
         if scenario == "cancel":
             wait(lambda: bool(second.goals))
             cancelled = handle.cancel_goal_async()

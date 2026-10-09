@@ -34,6 +34,8 @@ def without_dds():
     node.registry, node.validator = MissionRegistry(), MissionValidator()
     node.reconnect = ReconnectQueue()
     node.sequence, node.pending, node.awaiting_acceptance = {}, {}, {}
+    node._associations, node._refreshes, node._refresh_pending = {}, {}, {}
+    node._refresh_at = {}
     node.assigned_robots, node.missions, node.robot_states = {}, {}, {}
     node.robot_ids = {"amr_01", "amr_02"}
     node.telemetry_reconnect = {}
@@ -54,7 +56,130 @@ def without_dds():
         return Future()
 
     node.action = SimpleNamespace(send_goal_async=send, server_is_ready=lambda: True)
+    node.mission_query = SimpleNamespace(service_is_ready=lambda: False)
     return node, broker, goals
+
+
+def test_duplicate_refreshes_durable_manager_state_and_fences_old_callbacks(
+    without_dds,
+):
+    from types import SimpleNamespace
+    from rclpy.task import Future
+
+    node, broker, goals = without_dds
+    raw = b'{"mission_id":"restart","pickup":"assembly","dropoff":"inspection","part":"motor"}'
+    node._request(raw)
+    node._drain()
+    node.awaiting_acceptance.clear()
+    node.publish_status("restart", "QUEUED")
+    calls, response = [], Future()
+
+    def query(request):
+        calls.append(request)
+        return response
+
+    node.mission_query = SimpleNamespace(
+        service_is_ready=lambda: True,
+        call_async=query,
+        remove_pending_request=lambda future: None,
+    )
+    node._request(raw)
+    node._drain()
+    assert len(calls) == 1
+    assert len(goals) == 1
+    response.set_result(
+        SimpleNamespace(
+            found=True,
+            matches=True,
+            state="RECOVERY_REQUIRED",
+            assigned_robot_id="amr_02",
+            success=False,
+            error_code="RESOURCE_WAIT_TIMEOUT",
+            message="Recovery required",
+        )
+    )
+    node._drain()
+    assert statuses(broker)[-1]["state"] == "RECOVERY_REQUIRED"
+    old_result = Future()
+    old_result.set_result(
+        SimpleNamespace(
+            result=ExecuteFleetMission.Result(success=True, final_state="COMPLETED")
+        )
+    )
+    node.completions.put(("result", node.missions["restart"], old_result, 1))
+    old_acceptance = Future()
+    old_acceptance.set_result(
+        SimpleNamespace(
+            accepted=True,
+            get_result_async=lambda: pytest.fail("obsolete acceptance observed"),
+        )
+    )
+    node.completions.put(("accepted", node.missions["restart"], old_acceptance, 1))
+    node._drain()
+    assert statuses(broker)[-1]["state"] == "RECOVERY_REQUIRED"
+    assert statuses(broker)[-1]["error_code"] == "RESOURCE_WAIT_TIMEOUT"
+    goals[0][1](
+        SimpleNamespace(feedback=ExecuteFleetMission.Feedback(state="EXECUTING"))
+    )
+    node._drain()
+    assert statuses(broker)[-1]["state"] == "RECOVERY_REQUIRED"
+    for _ in range(100):
+        node._request(raw)
+        node._drain()
+    assert len(calls) == 1 and len(goals) == 1
+    node._request(raw.replace(b'"motor"', b'"gear"'))
+    assert statuses(broker)[-1]["error_code"] == "MISSION_ID_CONFLICT"
+    assert len(calls) == 1 and len(goals) == 1
+
+
+def test_durable_query_deadline_fences_late_reply_and_paces_retry(
+    without_dds, monkeypatch
+):
+    from types import SimpleNamespace
+    from rclpy.task import Future
+
+    node, broker, goals = without_dds
+    now = [100.0]
+    monkeypatch.setattr("mqtt_gateway.node.time.monotonic", lambda: now[0])
+    raw = b'{"mission_id":"restart","pickup":"assembly","dropoff":"inspection","part":"motor"}'
+    node._request(raw)
+    node._drain()
+    node.awaiting_acceptance.clear()
+    node.publish_status("restart", "QUEUED")
+    replies, removed = [], []
+
+    def query(request):
+        future = Future()
+        replies.append(future)
+        return future
+
+    node.mission_query = SimpleNamespace(
+        service_is_ready=lambda: True,
+        call_async=query,
+        remove_pending_request=removed.append,
+    )
+    node._request(raw)
+    node._drain()
+    for _ in range(100):
+        node._request(raw)
+        node._drain()
+    assert len(replies) == 1
+    now[0] = 101.1
+    replies[0].set_result(
+        SimpleNamespace(
+            found=True,
+            matches=True,
+            state="COMPLETED",
+            assigned_robot_id="amr_01",
+            success=True,
+            error_code="",
+            message="stale reply",
+        )
+    )
+    node._drain()
+    assert statuses(broker)[-1]["state"] == "QUEUED"
+    assert len(replies) == 2 and removed == [replies[0]]
+    assert len(goals) == 1
 
 
 def test_without_dds_automatic_request_uses_empty_fleet_pin(without_dds):
@@ -885,11 +1010,11 @@ def test_destroyed_result_client_finishes_acceptance_exactly_once(rig):
                 held_completions.append(node.completions.get_nowait())
             except queue.Empty:
                 break
-        return any(kind == "accepted" for kind, _, _ in held_completions)
+        return any(kind == "accepted" for kind, _, _, _ in held_completions)
 
     wait(acceptance_queued)
     acceptance = next(
-        future for kind, _, future in held_completions if kind == "accepted"
+        future for kind, _, future, _ in held_completions if kind == "accepted"
     )
     assert acceptance.result().accepted
     for completion in held_completions:

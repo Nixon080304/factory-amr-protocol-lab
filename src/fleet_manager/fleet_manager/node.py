@@ -22,6 +22,7 @@ from factory_interfaces.srv import (
     AcquireResource,
     CancelResourceWait,
     EstimateMissionCost,
+    GetFleetMission,
     ReleaseResource,
     RenewResource,
 )
@@ -204,6 +205,12 @@ class FleetManagerNode(Node):
             handle_accepted_callback=self._accepted,
             callback_group=self.protocol_group,
         )
+        self.mission_query = self.create_service(
+            GetFleetMission,
+            "/factory/get_fleet_mission",
+            self._query_mission,
+            callback_group=self.protocol_group,
+        )
         self.timer = self.create_timer(
             0.05,
             self._tick,
@@ -349,6 +356,29 @@ class FleetManagerNode(Node):
             self.get_logger().warning(str(error))
             return GoalResponse.REJECT
         return GoalResponse.ACCEPT
+
+    def _query_mission(self, request, response):
+        """Read durable state without registering work or restoring authority."""
+        try:
+            record = self.journal.get(request.mission_id)
+        except KeyError:
+            return response
+        response.found = True
+        response.matches = record.request == _request(request)
+        if not response.matches:
+            return response
+        response.state = record.state.value
+        response.assigned_robot_id = record.assigned_robot_id or ""
+        response.success = record.state == MissionState.COMPLETED
+        result = record.result or {}
+        recovery = record.state == MissionState.RECOVERY_REQUIRED
+        response.error_code = str(
+            result.get("error_code", "RECOVERY_REQUIRED" if recovery else "")
+        )
+        response.message = str(
+            result.get("message", "Recovery required" if recovery else "")
+        )
+        return response
 
     def _accepted(self, handle):
         self._waiters.setdefault(handle.request.mission_id, []).append(handle)
@@ -545,6 +575,8 @@ class FleetManagerNode(Node):
         handle.cancel_goal_async().add_done_callback(cancelled)
 
     def send_dock_goal(self, robot_id, charge, feedback, result, accepted):
+        from fleet_manager.adapter import DockRequestUnsent
+
         client = self.docks[robot_id]
         ready = client.server_is_ready()
         reported = getattr(self, "_dock_dispatch_diagnostics", None)
@@ -557,8 +589,7 @@ class FleetManagerNode(Node):
                 "fleet_dock_dispatch", charge, server_ready=ready
             )
         if not ready:
-            accepted(None, "dock action unavailable")
-            return
+            raise DockRequestUnsent("dock action unavailable")
         robot = next(
             robot for robot in self.adapter.config.robots if robot.robot_id == robot_id
         )

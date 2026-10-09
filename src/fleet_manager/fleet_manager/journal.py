@@ -444,11 +444,21 @@ class MissionJournal:
 
     def load_active(self) -> tuple[MissionRecord, ...]:
         rows = self._connection.execute(
-            "SELECT * FROM missions WHERE state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED') "
+            "SELECT * FROM missions m WHERE " + self._unresolved_sql() + " "
             "ORDER BY (SELECT MIN(sequence) FROM mission_events "
-            "WHERE mission_events.mission_id = missions.mission_id), created_at, mission_id"
+            "WHERE mission_events.mission_id = m.mission_id), created_at, mission_id"
         ).fetchall()
         return tuple(_record(row) for row in rows)
+
+    @staticmethod
+    def _unresolved_sql():
+        # Old writers could close failed work without resolving its custody.
+        # Confirmed delivery and definite pre-pickup failure remain terminal.
+        return (
+            "(m.state NOT IN ('COMPLETED','FAILED','CANCELLED') OR "
+            "(m.state='FAILED' AND (m.payload_ownership IN ('PICKED_UP','UNKNOWN') "
+            "OR EXISTS (SELECT 1 FROM payload_evidence e WHERE e.mission_id=m.mission_id))))"
+        )
 
     def load_recovery(self) -> tuple[MissionRecord, ...]:
         """Merge durable correlated carrying evidence, never replay pose authority.
@@ -494,7 +504,7 @@ class MissionJournal:
             row[0]
             for row in self._connection.execute(
                 "SELECT c.robot_id FROM payload_carrier_claims c JOIN missions m USING(mission_id) "
-                "WHERE c.mission_id = ? AND m.state NOT IN ('COMPLETED','FAILED','CANCELLED') "
+                "WHERE c.mission_id = ? AND " + self._unresolved_sql() + " "
                 "ORDER BY c.robot_id",
                 (mission_id,),
             )
@@ -535,7 +545,7 @@ class MissionJournal:
             for row in self._connection.execute(
                 "SELECT c.robot_id,c.evidence_id FROM recovery_physical_claims c "
                 "JOIN missions m USING(mission_id) WHERE c.mission_id=? "
-                "AND m.state NOT IN ('COMPLETED','FAILED','CANCELLED') ORDER BY c.robot_id,c.role",
+                "AND " + self._unresolved_sql() + " ORDER BY c.robot_id,c.role",
                 (mission_id,),
             )
         )
@@ -748,16 +758,19 @@ class MissionJournal:
                     and record.payload_ownership == decision.payload_ownership
                 ):
                     continue
+                detail = {
+                    "reason": decision.reason,
+                    "assigned_robot_id": decision.robot_id,
+                    "payload_ownership": decision.payload_ownership,
+                }
+                if record.state == MissionState.FAILED and record.result is not None:
+                    detail["result"] = dict(
+                        record.result, final_state=decision.state.value
+                    )
                 self._change(
                     record,
                     decision.state,
-                    _json(
-                        {
-                            "reason": decision.reason,
-                            "assigned_robot_id": decision.robot_id,
-                            "payload_ownership": decision.payload_ownership,
-                        }
-                    ),
+                    _json(detail),
                     now,
                     decision.robot_id,
                 )

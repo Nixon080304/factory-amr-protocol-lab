@@ -20,6 +20,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ProtocolEvent.msg"
   "srv/TransferPart.srv"
   "srv/EstimateMissionCost.srv"
+  "srv/GetFleetMission.srv"
   "srv/AcquireResource.srv"
   "srv/RenewResource.srv"
   "srv/ReleaseResource.srv"

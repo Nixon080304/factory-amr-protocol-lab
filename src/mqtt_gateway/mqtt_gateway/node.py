@@ -20,6 +20,7 @@ from rclpy.parameter import Parameter
 from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from factory_interfaces.action import ExecuteFleetMission
 from factory_interfaces.msg import ProtocolEvent, RobotState
+from factory_interfaces.srv import GetFleetMission
 from fleet_manager.adapter import robot_endpoints
 from fleet_manager.config import load_fleet_config
 from .client import MqttClient, FAULT_REQUEST_TOPIC, FLEET_AVAILABILITY_TOPIC
@@ -59,6 +60,11 @@ class MqttGatewayNode(Node):
             "/factory/execute_fleet_mission",
             callback_group=self.protocol_group,
         )
+        self.mission_query = self.create_client(
+            GetFleetMission,
+            "/factory/get_fleet_mission",
+            callback_group=self.protocol_group,
+        )
         self.events = self.create_publisher(
             ProtocolEvent,
             "/factory/protocol_events",
@@ -91,6 +97,8 @@ class MqttGatewayNode(Node):
         self.sequence = {}
         self.pending = {}
         self.awaiting_acceptance = {}
+        self._associations, self._refreshes, self._refresh_pending = {}, {}, {}
+        self._refresh_at = {}
         self.client = mqtt_client or MqttClient(host, port)
         self._fault_disconnected = False
         self._disconnect_fault = None
@@ -265,9 +273,15 @@ class MqttGatewayNode(Node):
         # Consume their results here so composition with multiple threads is safe.
         for _ in range(100):
             try:
-                kind, mission, future = self.completions.get_nowait()
+                kind, mission, future, generation = self.completions.get_nowait()
             except queue.Empty:
                 break
+            if kind == "query":
+                self._query_result(mission, future)
+                continue
+            mission_id = mission if kind == "feedback" else mission.mission_id
+            if self._associations.get(mission_id) != generation:
+                continue
             if kind == "feedback":
                 self._feedback(mission, future)
             elif kind == "accepted":
@@ -316,6 +330,7 @@ class MqttGatewayNode(Node):
             if self.action.server_is_ready():
                 del self.pending[mission_id]
                 self._dispatch(mission)
+        self._refresh_durable()
 
     def _request(self, raw, *, generated=False):
         if generated:
@@ -378,6 +393,18 @@ class MqttGatewayNode(Node):
             state = self.registry.state_for(mission_id)
             if state:
                 self._send_status(state)
+            terminal = (
+                state
+                and state["state"]
+                in ("COMPLETED", "FAILED", "CANCELLED", "RECOVERY_REQUIRED")
+                and state.get("error_code") != "MISSION_TRANSPORT_ERROR"
+            )
+            if (
+                not terminal
+                and mission_id not in self.awaiting_acceptance
+                and mission_id not in self.pending
+            ):
+                self._refreshes[mission_id] = mission
             self._event(mission_id, "mqtt_duplicate", "SUCCEEDED", "Duplicate mission")
             if not generated:
                 self._inject_request_faults(mission)
@@ -477,6 +504,87 @@ class MqttGatewayNode(Node):
         # callback reaches connected only after the ROS timer consumes it.
         return lambda: self.connected
 
+    def _refresh_durable(self):
+        """Bounded read-only observation replaces a lost action association."""
+        now = time.monotonic()
+        for mission_id, mission in tuple(self._refreshes.items()):
+            pending = self._refresh_pending.get(mission_id)
+            if pending is not None:
+                future, deadline = pending
+                if now >= deadline:
+                    self.mission_query.remove_pending_request(future)
+                    self._refresh_pending.pop(mission_id, None)
+                else:
+                    continue
+            if now < self._refresh_at.get(mission_id, 0.0):
+                continue
+            self._refresh_at[mission_id] = now + 1.0
+            if not self.mission_query.service_is_ready():
+                continue
+            try:
+                future = self.mission_query.call_async(
+                    GetFleetMission.Request(
+                        mission_id=mission_id,
+                        requested_robot_id=mission.robot_id or "",
+                        pickup_station=mission.pickup,
+                        dropoff_station=mission.dropoff,
+                        part=mission.part,
+                    )
+                )
+                self._refresh_pending[mission_id] = (future, now + 1.0)
+                future.add_done_callback(
+                    lambda result, mission=mission: self.completions.put(
+                        ("query", mission, result, None)
+                    )
+                )
+            except Exception as error:
+                self.get_logger().error(
+                    f"Mission {mission_id}: durable query failed: {error}"
+                )
+
+    def _query_result(self, mission, future):
+        mission_id = mission.mission_id
+        pending = self._refresh_pending.get(mission_id)
+        if (
+            pending is None
+            or pending[0] is not future
+            or time.monotonic() >= pending[1]
+        ):
+            return
+        self._refresh_pending.pop(mission_id, None)
+        try:
+            reply = future.result()
+            if not reply.found:
+                return  # Absence cannot authorize a second physical execution.
+            if not reply.matches:
+                self._refreshes.pop(mission_id, None)
+                self.publish_status(
+                    mission_id,
+                    "FAILED",
+                    error_code="MISSION_ID_CONFLICT",
+                    remember=False,
+                )
+                return
+            self._associations[mission_id] = self._associations.get(mission_id, 0) + 1
+            self.awaiting_acceptance.pop(mission_id, None)
+            if reply.assigned_robot_id:
+                self.assigned_robots[mission_id] = reply.assigned_robot_id
+            else:
+                self.assigned_robots.pop(mission_id, None)
+            self.publish_status(
+                mission_id,
+                reply.state,
+                mission.dropoff if reply.success else "",
+                reply.message,
+                reply.error_code or None,
+            )
+            if reply.state in ("COMPLETED", "FAILED", "CANCELLED", "RECOVERY_REQUIRED"):
+                self._refreshes.pop(mission_id, None)
+        except Exception as error:
+            self.get_logger().error(
+                f"Mission {mission_id}: durable query result failed: {error}"
+            )
+
     def _dispatch(self, mission):
         request = ExecuteFleetMission.Goal(
             mission_id=mission.mission_id,
@@ -485,16 +593,20 @@ class MqttGatewayNode(Node):
             dropoff_station=mission.dropoff,
             part=mission.part,
         )
+        generation = self._associations.get(mission.mission_id, 0) + 1
+        self._associations[mission.mission_id] = generation
         try:
             self.awaiting_acceptance[mission.mission_id] = deque(maxlen=100)
             future = self.action.send_goal_async(
                 request,
                 feedback_callback=lambda feedback: self.completions.put(
-                    ("feedback", mission.mission_id, feedback.feedback)
+                    ("feedback", mission.mission_id, feedback.feedback, generation)
                 ),
             )
             future.add_done_callback(
-                lambda result: self.completions.put(("accepted", mission, result))
+                lambda result: self.completions.put(
+                    ("accepted", mission, result, generation)
+                )
             )
         except Exception as error:
             self._acceptance_failed(mission.mission_id, error)
@@ -579,8 +691,11 @@ class MqttGatewayNode(Node):
         for feedback in self.awaiting_acceptance.pop(mission.mission_id, ()):
             self._feedback(mission.mission_id, feedback)
         try:
+            generation = self._associations[mission.mission_id]
             handle.get_result_async().add_done_callback(
-                lambda result: self.completions.put(("result", mission, result))
+                lambda result: self.completions.put(
+                    ("result", mission, result, generation)
+                )
             )
         except Exception as error:
             self._result_failed(mission.mission_id, error)

@@ -522,7 +522,9 @@ def test_feedback_cannot_downgrade_confirmed_or_uncertain_payload(fleet):
     )
 
 
-@pytest.mark.parametrize("success,want", [(True, "COMPLETED"), (False, "FAILED")])
+@pytest.mark.parametrize(
+    "success,want", [(True, "COMPLETED"), (False, "RECOVERY_REQUIRED")]
+)
 def test_robot_result_is_terminal_and_duplicate_operations_replay(fleet, success, want):
     api, core, journal, *_ = fleet
     decision, _ = assigned(fleet)
@@ -545,8 +547,62 @@ def test_robot_result_is_terminal_and_duplicate_operations_replay(fleet, success
     assert core.cancel("m1", 102) == outcome
     assert core.submit(request(), 102) == outcome
     assert core.handle_robot_offline("r1", 102) == ()
-    assert journal.load_active() == ()
+    assert journal.load_active() == (() if success else (outcome,))
     assert journal.events("m1") == events
+
+
+@pytest.mark.parametrize("ownership", ["PICKED_UP", "UNKNOWN"])
+def test_ordinary_inspection_timeout_keeps_unresolved_carrier_reserved(
+    fleet, ownership
+):
+    api, core, journal, registry, *_ = fleet
+    decision, _ = assigned(fleet)
+    core.record_robot_feedback("m1", feedback(api, decision, ownership), 101.1)
+    outcome = core.record_robot_result(
+        "m1",
+        result(
+            api,
+            decision,
+            False,
+            error_code="RESOURCE_WAIT_TIMEOUT",
+            recovery_required=False,
+        ),
+        101.2,
+    )
+    assert outcome.state == "RECOVERY_REQUIRED"
+    assert outcome.payload_ownership == ownership
+    assert outcome.assigned_robot_id == "r1"
+    assert journal.load_recovery() == (outcome,)
+    registry.observe(robot("r1"), 101.3)
+    core.submit(request("next", requested_robot_id="r1"), 101.3)
+    assert core.assign("next", ESTIMATES, 101.3).robot_id is None
+
+
+def test_core_reconcile_preserves_failed_result_and_observed_custody(fleet):
+    api, core, journal, *_ = fleet
+    assigned(fleet)
+    journal.record_observation(
+        robot("r1", payload_state="LOADED", mission_id="m1"), 101.1
+    )
+    journal.transition(
+        "m1",
+        MissionState.ASSIGNED,
+        MissionState.FAILED,
+        {
+            "result": {
+                "success": False,
+                "final_state": "FAILED",
+                "error_code": "RESOURCE_WAIT_TIMEOUT",
+            }
+        },
+        101.2,
+    )
+    core.reconcile(api.ReconciliationSnapshot((robot("r1"), robot("r2"))), 101.3)
+    record = journal.get("m1")
+    assert record.state == "RECOVERY_REQUIRED"
+    assert record.payload_ownership == "PICKED_UP"
+    assert record.result["final_state"] == "RECOVERY_REQUIRED"
+    assert record.result["error_code"] == "RESOURCE_WAIT_TIMEOUT"
 
 
 def test_offline_pre_pickup_failure_uses_specific_reassignment_rule(fleet):

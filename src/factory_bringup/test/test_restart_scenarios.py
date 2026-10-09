@@ -57,7 +57,7 @@ MATRIX = [
         "RECOVERY_REQUIRED",
     ),
     ("COMPLETED", "DELIVERED", None, "AVAILABLE", (-3, -3), "COMPLETED"),
-    ("FAILED", "UNKNOWN", None, "AVAILABLE", (-3, -3), "FAILED"),
+    ("FAILED", "UNKNOWN", None, "AVAILABLE", (-3, -3), "RECOVERY_REQUIRED"),
     ("CANCELLED", "NOT_PICKED_UP", None, "AVAILABLE", (-3, -3), "CANCELLED"),
     (
         "RECOVERY_REQUIRED",

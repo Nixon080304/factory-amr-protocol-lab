@@ -67,6 +67,7 @@ def create_ros_robot(context, robot_id, namespace, cost=1.0, *, cost_available=T
     node.cost_requests = []
     node.finish = True
     node.failed = False
+    node.failure_code = "ROBOT_OFFLINE"
     node.stage = "NAVIGATING_TO_DROPOFF"
     node.active = {}
     publisher = node.create_publisher(RobotState, "factory/robot_state", 10)
@@ -127,7 +128,7 @@ def create_ros_robot(context, robot_id, namespace, cost=1.0, *, cost_available=T
             final_state="COMPLETED" if success else "FAILED",
             error_code=""
             if success
-            else "ROBOT_OFFLINE"
+            else node.failure_code
             if node.failed
             else "CANCELLED",
         )

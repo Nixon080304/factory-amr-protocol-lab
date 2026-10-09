@@ -83,7 +83,7 @@ def safe(robot_id="amr_01", **changes):
             "RECOVERY_REQUIRED",
         ),
         ("COMPLETED", "DELIVERED", "AVAILABLE", "EMPTY", None, "COMPLETED"),
-        ("FAILED", "UNKNOWN", "AVAILABLE", "EMPTY", None, "FAILED"),
+        ("FAILED", "UNKNOWN", "AVAILABLE", "EMPTY", None, "RECOVERY_REQUIRED"),
         ("CANCELLED", "NOT_PICKED_UP", "AVAILABLE", "EMPTY", None, "CANCELLED"),
     ],
 )

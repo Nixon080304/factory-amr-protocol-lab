@@ -1,0 +1,14 @@
+# Read-only lookup. Compare the complete canonical identity before returning state.
+string mission_id
+string requested_robot_id
+string pickup_station
+string dropoff_station
+string part
+---
+bool found
+bool matches
+string state
+string assigned_robot_id
+bool success
+string error_code
+string message

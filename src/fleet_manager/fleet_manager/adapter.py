@@ -34,6 +34,10 @@ from fleet_manager.resources import Lease, LeaseKey, LeaseRequest, ResourceManag
 PATH_PENDING_GRACE_SEC = 3.0
 
 
+class DockRequestUnsent(RuntimeError):
+    """Transport proves that no dock request crossed the action boundary."""
+
+
 def _storage_boundary(method):
     """Fence a failed journal mutation without changing its error semantics."""
 
@@ -178,6 +182,7 @@ class FleetAdapter:
         self._path_pending_since = {}
         self._flights = {}
         self._dock_flights = {}
+        self._dock_retry_at = {}
         self._dock_seen = set()
         self._dock_restart_unsafe = set()
         self._dock_completed = set()
@@ -660,6 +665,7 @@ class FleetAdapter:
                 charge.robot_id not in self._dock_flights
                 and charge.state == "CHARGE_QUEUED"
                 and predecessor is None
+                and now >= self._dock_retry_at.get(charge.robot_id, 0.0)
             ):
                 # Serialize the whole cycle, including verified exit and release.
                 # Reserving all queued robots still fences mission assignment.
@@ -815,6 +821,19 @@ class FleetAdapter:
                 ),
                 lambda reply: self._enqueue(self._dock_result, charge, flight, reply),
                 accepted,
+            )
+        except DockRequestUnsent as error:
+            # Only this proof permits rediscovery. An arbitrary send exception
+            # may follow transmission and must retain the recovery reservation.
+            flight.retired = True
+            self._dock_flights.pop(charge.robot_id, None)
+            self._dock_retry_at[charge.robot_id] = self.clock() + 1.0
+            self.diagnose_dock(
+                "fleet_dock_acceptance",
+                charge,
+                accepted=False,
+                message=str(error),
+                mapped_state="CHARGE_QUEUED",
             )
         except Exception as error:
             accepted(None, str(error))

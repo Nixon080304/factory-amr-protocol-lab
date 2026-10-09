@@ -116,6 +116,14 @@ class RecoveryPlanner:
                 record.payload_ownership,
             )
             reason = "existing terminal state"
+            if state == MissionState.FAILED and ownership in (
+                PayloadOwnership.PICKED_UP,
+                PayloadOwnership.UNKNOWN,
+            ):
+                state, reason = (
+                    MissionState.RECOVERY_REQUIRED,
+                    "failed mission retains unresolved custody",
+                )
             if state not in closed:
                 robot = robots.get(robot_id)
                 claims = [

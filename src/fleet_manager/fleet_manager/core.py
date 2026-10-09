@@ -419,6 +419,8 @@ class FleetCore:
         target = (
             MissionState.RECOVERY_REQUIRED
             if result.recovery_required
+            or not success
+            and ownership in (PayloadOwnership.PICKED_UP, PayloadOwnership.UNKNOWN)
             else MissionState.COMPLETED
             if success
             else MissionState.FAILED
@@ -546,8 +548,26 @@ class FleetCore:
             for robot_id in robots
             if sum(robot.robot_id == robot_id for robot in observations.robots) > 1
         }
-        for record in self._journal.load_active():
+        for record in self._journal.load_recovery():
             mission_id = record.request.mission_id
+            if record.state == MissionState.FAILED:
+                detail = {
+                    "reason": "failed mission retains unresolved custody",
+                    "payload_ownership": record.payload_ownership,
+                    "assigned_robot_id": record.assigned_robot_id,
+                }
+                if record.result is not None:
+                    detail["result"] = dict(
+                        record.result, final_state="RECOVERY_REQUIRED"
+                    )
+                self._journal.transition(
+                    mission_id,
+                    record.state,
+                    MissionState.RECOVERY_REQUIRED,
+                    detail,
+                    now,
+                )
+                continue
             scheduling = record.state in _SCHEDULABLE or record.state in (
                 MissionState.RECEIVED,
                 MissionState.ASSIGNING,
