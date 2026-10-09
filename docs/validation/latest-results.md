@@ -293,10 +293,22 @@ not a hosted or upgraded-native-DDS execution.
 Receipts are retained under
 `artifacts/final-fix-20261009.rWzGz8/hosted-compatibility`. Previous 424-case full
 and 945-case covering receipts are not relabeled as containing these changes.
-A fresh complete repository command and the required new hosted gate are pending
-at this handoff. The hosted log's nonfatal `printed_strlen` status-extension
-diagnostic is retained; no unrelated toolchain upgrade or middleware change is
-made. No new physical fleet or media run is claimed for this compatibility work.
+The controller's fresh complete supported repository command passes **433 cases
+in 545.47 seconds**, exit zero, with unique `controller-full-proof` and
+`controller-full.log` in that directory. Runtime, test, script and workflow
+hashes match before and after the run at the frozen `1da0313` boundary; generated
+interfaces use the explicitly selected existing fresh install, not a newly
+claimed build. Independent scoped review approves the compatibility corrections
+with no new Critical/Important issue. Controller checks separately pass 14
+released-Python bookkeeping cases, 19 exact extracted-resource launch cases and
+54 provisioning/reset contracts; those counts overlap and are not added.
+
+The required new hosted gate remains pending publication. The earlier hosted
+log's nonfatal `printed_strlen` status-extension diagnostic is retained; no
+unrelated toolchain upgrade or middleware change is made. No new two-robot
+physical fleet or media run is claimed for this compatibility work. The full
+repository command includes its existing real Version 1 system cases; earlier
+native startup and teardown failures remain disclosed, not relabeled as repaired.
 
 ## Current local verification — historical Version 1 (3 October 2026)
 
