@@ -107,7 +107,7 @@ def test_durable_query_checks_identity_without_writes_or_execution(rig):
         part="motor",
     )
     reply = host._query_mission(lookup, GetFleetMission.Response())
-    assert reply.found and reply.matches and reply.state == "QUEUED"
+    assert reply.found and reply.matches and reply.ready and reply.state == "QUEUED"
     lookup.part = "gear"
     conflict = host._query_mission(lookup, GetFleetMission.Response())
     assert conflict.found and not conflict.matches and conflict.state == ""
@@ -121,8 +121,9 @@ def test_durable_query_checks_identity_without_writes_or_execution(rig):
     "ownership,evidence",
     [("PICKED_UP", False), ("UNKNOWN", False), ("NOT_PICKED_UP", True)],
 )
+@pytest.mark.parametrize("storage_failed", [False, True])
 def test_durable_query_waits_for_historical_custody_reconciliation(
-    rig, ownership, evidence
+    rig, ownership, evidence, storage_failed
 ):
     from fleet_manager.node import FleetManagerNode
     from fleet_manager.journal import MissionState
@@ -162,10 +163,25 @@ def test_durable_query_waits_for_historical_custody_reconciliation(
         part="motor",
     )
     changes = journal._connection.total_changes
+    if storage_failed:
+        import sqlite3
+
+        journal._connection.execute("PRAGMA query_only=ON")
+        now[0] += 10
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            replacement.tick()
+        assert replacement.state == "STORAGE_FAILED"
     reply = host._query_mission(lookup, GetFleetMission.Response())
     assert reply.found and reply.matches and reply.state == "FAILED"
     assert not getattr(reply, "ready", True)
     assert journal._connection.total_changes == changes
+    assert robots.goals == []
+    if storage_failed:
+        journal._connection.execute("PRAGMA query_only=OFF")
+        replacement = api.FleetAdapter(
+            adapter.config, journal, robots, clock=lambda: now[0]
+        )
+        host.adapter = replacement
     for robot in adapter.config.robots:
         replacement.observe(
             RobotSnapshot(robot.robot_id, "AVAILABLE", robot.spawn, 80, "EMPTY")
@@ -177,13 +193,22 @@ def test_durable_query_waits_for_historical_custody_reconciliation(
     assert journal.get("m1").payload_ownership == (
         "PICKED_UP" if evidence else ownership
     )
+    replacement.core.submit(request("next", "amr_01"), now[0])
+    assert (
+        replacement.core.assign(
+            "next", {"amr_01": CostEstimate(True, 1, 80)}, now[0]
+        ).robot_id
+        is None
+    )
+    assert robots.goals == []
 
 
 @pytest.mark.parametrize(
     "state,ownership", [("COMPLETED", "DELIVERED"), ("FAILED", "NOT_PICKED_UP")]
 )
+@pytest.mark.parametrize("storage_failed", [False, True])
 def test_durable_query_replays_proven_terminal_work_during_reconciliation(
-    rig, state, ownership
+    rig, state, ownership, storage_failed
 ):
     from fleet_manager.node import FleetManagerNode
     from factory_interfaces.srv import GetFleetMission
@@ -203,6 +228,15 @@ def test_durable_query_replays_proven_terminal_work_during_reconciliation(
     host.adapter = api.FleetAdapter(
         adapter.config, journal, robots, clock=lambda: now[0]
     )
+    if storage_failed:
+        import sqlite3
+
+        adapter.core.submit(request("unresolved"), 100)
+        journal._connection.execute("PRAGMA query_only=ON")
+        now[0] += 10
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            host.adapter.tick()
+        assert host.adapter.state == "STORAGE_FAILED"
     reply = host._query_mission(
         GetFleetMission.Request(
             mission_id="m1",

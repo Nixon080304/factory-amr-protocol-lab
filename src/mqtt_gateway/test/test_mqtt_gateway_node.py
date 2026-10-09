@@ -246,6 +246,131 @@ def test_unreconciled_durable_failure_does_not_stop_gateway_observation(
     assert node._refreshes == {} and len(goals) == 1
 
 
+@pytest.mark.parametrize(
+    "ownership,evidence",
+    [("PICKED_UP", False), ("UNKNOWN", False), ("NOT_PICKED_UP", True)],
+)
+def test_storage_failed_startup_preserves_gateway_recovery_observation(
+    without_dds, monkeypatch, ownership, evidence
+):
+    from contextlib import closing
+    from pathlib import Path
+    import sqlite3
+    from types import SimpleNamespace
+    from rclpy.task import Future
+    from factory_interfaces.srv import GetFleetMission
+    from fleet_manager.adapter import FleetAdapter
+    from fleet_manager.config import load_fleet_config
+    from fleet_manager.journal import MissionJournal, MissionState
+    from fleet_manager.models import CostEstimate, MissionRequest, RobotSnapshot
+    from fleet_manager.node import FleetManagerNode
+
+    node, broker, goals = without_dds
+    now = [100.0]
+    monkeypatch.setattr("mqtt_gateway.node.time.monotonic", lambda: now[0])
+    config = load_fleet_config(
+        Path(__file__).resolve().parents[2] / "factory_bringup/config/fleet.yaml"
+    )
+    with closing(MissionJournal(":memory:")) as journal:
+        transport = SimpleNamespace(publish=lambda *args: None)
+        adapter = FleetAdapter(config, journal, transport, clock=lambda: now[0])
+        for robot in config.robots:
+            adapter.observe(
+                RobotSnapshot(robot.robot_id, "AVAILABLE", robot.spawn, 80, "EMPTY")
+            )
+        adapter.core.submit(
+            MissionRequest("restart", "assembly", "inspection", "motor"), 100
+        )
+        adapter.core.assign("restart", {"amr_01": CostEstimate(True, 1, 80)}, 100)
+        if evidence:
+            journal.record_observation(
+                RobotSnapshot(
+                    "amr_01",
+                    "EXECUTING",
+                    config.robots[0].spawn,
+                    80,
+                    "LOADED",
+                    "restart",
+                ),
+                100,
+            )
+        journal.transition(
+            "restart",
+            MissionState.ASSIGNED,
+            MissionState.FAILED,
+            {
+                "payload_ownership": ownership,
+                "result": {
+                    "success": False,
+                    "final_state": "FAILED",
+                    "error_code": "RESOURCE_WAIT_TIMEOUT",
+                },
+            },
+            100,
+        )
+        host = object.__new__(FleetManagerNode)
+        host.journal = journal
+        host.adapter = FleetAdapter(config, journal, transport, clock=lambda: now[0])
+        journal._connection.execute("PRAGMA query_only=ON")
+        now[0] += 10
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            host.adapter.tick()
+        assert host.adapter.state == "STORAGE_FAILED"
+        queries = []
+
+        def query(request):
+            queries.append(request)
+            reply = Future()
+            reply.set_result(host._query_mission(request, GetFleetMission.Response()))
+            return reply
+
+        node.mission_query = SimpleNamespace(
+            service_is_ready=lambda: True,
+            call_async=query,
+            remove_pending_request=lambda future: None,
+        )
+        raw = b'{"mission_id":"restart","pickup":"assembly","dropoff":"inspection","part":"motor"}'
+        node._request(raw)
+        node._drain()
+        node.awaiting_acceptance.clear()
+        node.publish_status("restart", "QUEUED")
+        changes = journal._connection.total_changes
+        node._request(raw)
+        node._drain()
+        node._drain()
+        assert statuses(broker)[-1]["state"] == "QUEUED"
+        assert "restart" in node._refreshes and len(goals) == 1
+        assert journal._connection.total_changes == changes
+        assert journal.get("restart").payload_ownership.value == ownership
+        journal._connection.execute("PRAGMA query_only=OFF")
+        host.adapter = FleetAdapter(config, journal, transport, clock=lambda: now[0])
+        for robot in config.robots:
+            host.adapter.observe(
+                RobotSnapshot(robot.robot_id, "AVAILABLE", robot.spawn, 80, "EMPTY")
+            )
+        assert host.adapter.state == "RUNNING"
+        assert journal.get("restart").state == MissionState.RECOVERY_REQUIRED
+        host.adapter.core.submit(
+            MissionRequest("next", "assembly", "inspection", "motor", "amr_01"), now[0]
+        )
+        assert (
+            host.adapter.core.assign(
+                "next", {"amr_01": CostEstimate(True, 1, 80)}, now[0]
+            ).robot_id
+            is None
+        )
+        now[0] += 1.1
+        node._drain()
+        node._drain()
+        assert statuses(broker)[-1]["state"] == "RECOVERY_REQUIRED"
+        assert statuses(broker)[-1]["error_code"] == "RESOURCE_WAIT_TIMEOUT"
+        assert node._refreshes == {} and len(goals) == 1 and len(queries) == 2
+        for _ in range(3):
+            node._request(raw)
+            node._drain()
+        assert len(goals) == 1
+
+
 def test_without_dds_automatic_request_uses_empty_fleet_pin(without_dds):
     node, _, goals = without_dds
     node._request(
