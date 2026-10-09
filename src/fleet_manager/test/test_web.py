@@ -379,6 +379,28 @@ def test_observer_captures_all_robots_resources_and_persistent_history_without_w
         journal.close()
 
 
+def test_observer_serializes_non_default_authoritative_charging_target(tmp_path):
+    from dataclasses import replace
+
+    path, journal, adapter = rig(tmp_path)
+    adapter.registry.observe(
+        RobotSnapshot("amr_01", "AVAILABLE", Pose2D(4, -2, 0), 26, "EMPTY"), 100
+    )
+    policy = replace(adapter.config.energy, charge_until_percent=67)
+    adapter.core.queue_charging(policy, 100)
+    server = api().FleetDashboard(port=0, journal_path=path, heartbeat=0.1)
+    server.capture(adapter)
+    server.start()
+    try:
+        wait_for(lambda: bool(json.loads(request(server)[1])["dock_queue"]))
+        value = json.loads(request(server)[1])
+        assert value["dock_queue"][0]["target_percent"] == 67
+        assert value["dock_queue"][0]["robot_id"] == "amr_01"
+    finally:
+        server.stop()
+        journal.close()
+
+
 def test_capture_does_not_expire_resources_or_wait_on_reader_or_resource_lock(tmp_path):
     path, journal, adapter = rig(tmp_path)
     adapter.clock = lambda: 500

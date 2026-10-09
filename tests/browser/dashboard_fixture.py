@@ -29,7 +29,13 @@ def main():
             Path(__file__).resolve().parents[2]
             / "src/factory_bringup/config/fleet.yaml"
         )
+        config = replace(config, energy=replace(config.energy, charge_until_percent=67))
         adapter = FleetAdapter(config, journal, None, clock=lambda: 100)
+        adapter.registry.observe(
+            RobotSnapshot("amr_01", "AVAILABLE", Pose2D(4, -2, 0), 26, "EMPTY"), 100
+        )
+        charge = adapter.core.queue_charging(config.energy, 100)[0]
+        adapter.core.charging_feedback(charge.robot_id, charge.generation, "CHARGING")
         adapter.registry.observe(
             RobotSnapshot("amr_01", "CHARGING", Pose2D(4, -2, 0), 26, "EMPTY"), 100
         )
@@ -84,6 +90,11 @@ def main():
                     server.capture(adapter)
                 elif command["command"] == "stop":
                     server.stop()
+                elif command["command"] == "unknown_target":
+                    adapter.core.charging_result(
+                        charge.robot_id, charge.generation, True
+                    )
+                    server.capture(adapter)
                 elif command["command"] == "restart":
                     server = FleetDashboard(port=port, journal_path=path, heartbeat=0.2)
                     adapter.registry.observe(

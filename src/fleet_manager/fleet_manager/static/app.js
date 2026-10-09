@@ -108,7 +108,9 @@ function render(value) {
     const owner = value.robots.find(robot => robot.robot_id === dock.owner);
     dockPanel.append(element('h3', dock.resource_id), element('p', `Owner: ${dock.owner ?? 'none'}`));
     if (owner) {
-      dockPanel.append(element('p', `${owner.battery_percent == null ? 'Unknown' : Math.round(owner.battery_percent) + '%'} / 80% target`, 'charge-value'));
+      const charge = value.dock_queue.find(charge => charge.dock_id === dock.resource_id && charge.robot_id === dock.owner);
+      const target = typeof charge?.target_percent === 'number' && Number.isFinite(charge.target_percent) ? `${charge.target_percent}% target` : 'Unknown target';
+      dockPanel.append(element('p', `${owner.battery_percent == null ? 'Unknown' : Math.round(owner.battery_percent) + '%'} / ${target}`, 'charge-value'));
       dockPanel.append(element('p', `${owner.mode} · ${dock.reconciliation_required ? 'reconciliation required' : 'observed lease owner'}`));
     }
     const charges = value.dock_queue.filter(charge => charge.dock_id === dock.resource_id);

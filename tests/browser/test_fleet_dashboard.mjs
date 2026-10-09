@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { mkdir, writeFile, readFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, writeFile, readFile } from 'node:fs/promises';
 import { chrome, waitFor } from './chrome_cdp.mjs';
 
 const fixture = spawn('.venv/bin/python3', ['tests/browser/dashboard_fixture.py'], { stdio: ['pipe', 'pipe', 'pipe'] });
@@ -16,7 +16,8 @@ const consoleErrors = [];
 const networkErrors = [];
 const requests = [];
 let expectedOutage = false;
-const evidence = '.superpowers/sdd/2026-10-05-scalable-multi-robot-fleet/task-15-browser';
+await mkdir('artifacts/dashboard', { recursive: true });
+const evidence = await mkdtemp('artifacts/dashboard/browser-');
 
 async function command(command) {
   fixture.stdin.write(JSON.stringify({ command }) + '\n');
@@ -83,6 +84,10 @@ try {
   assert.match(text, /dock_01/);
   assert.match(text, /CHARGING/);
   assert.match(text, /delivery-042/);
+  assert.match(await browser.evaluate("document.querySelector('#dock .charge-value').textContent"), /26% \/ 67% target/);
+  assert.equal(await browser.evaluate("fetch('/api/snapshot').then(response => response.json()).then(value => value.dock_queue[0].target_percent)"), 67);
+  await command('unknown_target');
+  await waitFor(() => browser.evaluate("document.querySelector('#dock .charge-value').textContent.includes('Unknown target')"), 'missing authoritative charging target');
   assert.equal(await browser.evaluate("document.querySelectorAll('[data-robot-id]').length"), 2);
   assert.equal(await browser.evaluate("document.querySelector('[data-resource-id=\"dock_01\"]').textContent.includes('amr_01')"), true);
   assert.equal(requests.findIndex(value => value.endsWith('/api/snapshot')) < requests.findIndex(value => value.endsWith('/api/events')), true);
