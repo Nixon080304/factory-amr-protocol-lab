@@ -15,7 +15,7 @@ jobs:
       # Apply same narrow hosted-runner exception to setup and verification.
       FACTORY_AMR_ROSDEP_SKIP_KEYS: nav2_bringup
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # CI-only provisioning; local users run setup_dev.sh once.
       - uses: ros-tooling/setup-ros@v0.7
         with:
