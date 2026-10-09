@@ -76,3 +76,14 @@ def test_hosted_ci_declares_only_nav2_bringup_skip():
         if step.get("name") == "Set up project dependencies"
     )
     assert "FACTORY_AMR_ROSDEP_SKIP_KEYS" not in setup_step.get("env", {})
+    resources = next(
+        step
+        for step in quality_job["steps"]
+        if step.get("name") == "Provision official Nav2 launch resources"
+    )
+    assert resources["run"] == "bash scripts/provision_hosted_nav2_resources.sh"
+    assert quality_job["steps"].index(resources) < next(
+        index
+        for index, step in enumerate(quality_job["steps"])
+        if step.get("name") == "Run matching local gates"
+    )

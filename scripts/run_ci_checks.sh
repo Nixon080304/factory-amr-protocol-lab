@@ -12,6 +12,10 @@ unset AMENT_PREFIX_PATH CMAKE_PREFIX_PATH COLCON_PREFIX_PATH PYTHONPATH LD_LIBRA
 source /opt/ros/humble/setup.bash
 source .venv/bin/activate
 set -u
+if [[ ${FACTORY_AMR_NAV2_RESOURCE_PREFIX+x} ]]; then
+    bash scripts/provision_hosted_nav2_resources.sh --validate "$FACTORY_AMR_NAV2_RESOURCE_PREFIX"
+    export AMENT_PREFIX_PATH="$FACTORY_AMR_NAV2_RESOURCE_PREFIX:$AMENT_PREFIX_PATH"
+fi
 python3 -c 'from importlib.metadata import version; from pathlib import Path; import shutil; from packaging.version import Version; assert version("colcon-core") == "0.20.1"; assert version("jsonschema") == "4.26.0"; assert version("paho-mqtt") == "2.1.0"; assert version("pymodbus") == "3.15.0"; assert Version(version("setuptools")) < Version("80"); assert Path(shutil.which("colcon")).absolute() == Path(".venv/bin/colcon").absolute()'
 
 run_stage() {

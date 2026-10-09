@@ -33,6 +33,11 @@ def runner(tmp_path):
     (tmp_path / "scripts").mkdir()
     if script.is_file():
         shutil.copy2(script, tmp_path / "scripts/run_ci_checks.sh")
+    provisioning = ROOT / "scripts/provision_hosted_nav2_resources.sh"
+    if provisioning.is_file():
+        shutil.copy2(
+            provisioning, tmp_path / "scripts/provision_hosted_nav2_resources.sh"
+        )
     tools = tmp_path / ".venv/bin"
     tools.mkdir(parents=True)
     (tools / "activate").write_text(f'export PATH="{tools}:$PATH"\n')
@@ -74,7 +79,7 @@ if name == 'colcon' and 'build' in sys.argv and '--install-base' in sys.argv:
         executable.write_text(fake)
         executable.chmod(0o755)
 
-    def run(fail_index=-1, code=37):
+    def run(fail_index=-1, code=37, nav2_prefix=None):
         environment = {
             **os.environ,
             "CI_FAKE_LOG": str(log),
@@ -93,6 +98,9 @@ if name == 'colcon' and 'build' in sys.argv and '--install-base' in sys.argv:
                 )
             },
         }
+        environment.pop("FACTORY_AMR_NAV2_RESOURCE_PREFIX", None)
+        if nav2_prefix is not None:
+            environment["FACTORY_AMR_NAV2_RESOURCE_PREFIX"] = str(nav2_prefix)
         result = subprocess.run(
             ["bash", str(tmp_path / "scripts/run_ci_checks.sh")],
             cwd=tmp_path,
@@ -109,6 +117,54 @@ if name == 'colcon' and 'build' in sys.argv and '--install-base' in sys.argv:
         return result, calls
 
     return run
+
+
+@pytest.fixture
+def nav2_prefix(tmp_path):
+    from ament_index_python.packages import get_package_share_directory
+
+    installed = Path(get_package_share_directory("nav2_bringup"))
+    prefix = tmp_path / "nav2-resources"
+    shutil.copytree(installed, prefix / "share/nav2_bringup")
+    marker = Path("share/ament_index/resource_index/packages/nav2_bringup")
+    (prefix / marker).parent.mkdir(parents=True)
+    shutil.copy2(installed.parent.parent / marker, prefix / marker)
+    return prefix
+
+
+def test_gate_keeps_explicit_nav2_resources_after_underlay_reset(runner, nav2_prefix):
+    result, calls = runner(nav2_prefix=nav2_prefix)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert all(
+        str(nav2_prefix) in call["overlays"]["AMENT_PREFIX_PATH"].split(":")
+        for call in calls
+    )
+    assert all(
+        str(nav2_prefix) not in call["overlays"]["LD_LIBRARY_PATH"] for call in calls
+    )
+
+
+@pytest.mark.parametrize(
+    "kind", ["relative", "missing", "launch", "unrelated", "binary"]
+)
+def test_gate_rejects_invalid_nav2_resource_prefix_before_gates(
+    runner, nav2_prefix, kind
+):
+    value = nav2_prefix
+    if kind == "relative":
+        value = Path("nav2-resources")
+    elif kind == "missing":
+        value = nav2_prefix / "missing"
+    elif kind == "launch":
+        (nav2_prefix / "share/nav2_bringup/launch/localization_launch.py").unlink()
+    elif kind == "unrelated":
+        (nav2_prefix / "share/ament_index/resource_index/packages/other").write_text("")
+    else:
+        (nav2_prefix / "lib").mkdir()
+    result, calls = runner(nav2_prefix=value)
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "Invalid Nav2 resource prefix" in result.stderr
+    assert calls == []
 
 
 @pytest.mark.parametrize("index", range(len(STAGES)))
