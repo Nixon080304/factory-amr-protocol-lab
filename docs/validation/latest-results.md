@@ -303,12 +303,47 @@ with no new Critical/Important issue. Controller checks separately pass 14
 released-Python bookkeeping cases, 19 exact extracted-resource launch cases and
 54 provisioning/reset contracts; those counts overlap and are not added.
 
-The required new hosted gate remains pending publication. The earlier hosted
+At the compatibility handoff, the required new hosted gate remained pending
+publication. The earlier hosted
 log's nonfatal `printed_strlen` status-extension diagnostic is retained; no
 unrelated toolchain upgrade or middleware change is made. No new two-robot
 physical fleet or media run is claimed for this compatibility work. The full
 repository command includes its existing real Version 1 system cases; earlier
 native startup and teardown failures remain disclosed, not relabeled as repaired.
+
+### Hosted browser startup ownership follow-up
+
+Subsequent hosted run `37909025197` builds all twelve packages and passes its
+exact fresh 1,640-record package result gate with zero errors, failures or skips.
+Its separate pure, contract/schema and bounded stages pass 335, 63 and 30 cases.
+The real browser stage then times out on the first `Target.createTarget` request,
+before dashboard navigation; the later real protocol stage is not executed.
+That is a failed hosted gate, not an aggregate success. The stalled startup's
+cause remains unproven. Local unchanged browser controls with both installed
+Node 20/Chrome 151 and exact official Node 22/Chrome 154 pass.
+
+Test-helper correction `1949c37` closes the confirmed startup-failure ownership
+gap and records bounded startup diagnostics. It isolates only its owned process
+group, clears pending timers, removes its fresh profile, preserves the original
+error through cleanup failure, and handles spawn/pipe errors. The 10,000 ms CDP
+deadline, selected browser, transport and all dashboard assertions remain.
+Actual browser version is measured after successful initialization without a
+new readiness wait; unsuccessful startup reports an unmeasured version.
+
+Nine real subprocess contracts pass on Node 20 and Node 22 with zero skips.
+They verify parent/descendant/profile cleanup, unrelated-process survival,
+actual timeout, bounded escalation and explicit cleanup-failure evidence. The
+controlled protocol peer is not a rendering substitute. Both complete actual
+desktop/mobile dashboard commands separately pass with executed Chrome
+151.0.7922.169 and 154.0.8037.97. CI/setup contracts pass 57 cases. New contracts
+run in normal CI before the unchanged real browser stage. RED and GREEN receipts
+remain under `artifacts/final-fix-20261009.rWzGz8/hosted-compatibility`.
+
+The preceding 433-case full receipt and failed hosted 1,640-record receipt are
+not relabeled as containing this test-only correction. A fresh complete public
+CI command, scoped independent approval and new hosted execution are pending
+at this handoff. No ROS/dashboard product change, retry, dependency pin,
+deadline extension, two-robot all-scenario or new media result is claimed.
 
 ## Current local verification — historical Version 1 (3 October 2026)
 
