@@ -446,6 +446,74 @@ def test_failed_broker_removal_rejects_success_and_preserves_cleanup_receipt(
     assert rows[-1]["output"] == "removal refused"
 
 
+@pytest.mark.parametrize("failure", ["logs_timeout", "log_write", "remove_timeout"])
+def test_broker_diagnostic_failure_still_removes_exact_owner_and_keeps_receipts(
+    tmp_path, monkeypatch, failure
+):
+    module = driver()
+    owned = module.Owned(tmp_path, time.monotonic() + 20)
+    owned.container = "d" * 64
+    plc = owned.start("plc", [sys.executable, "-c", "pass"], os.environ)
+    plc.wait(timeout=5)
+    commands = []
+
+    def docker(command, **kwargs):
+        commands.append(command)
+        if (failure == "logs_timeout" and command[1] == "logs") or (
+            failure == "remove_timeout" and command[1] == "rm"
+        ):
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+        return subprocess.CompletedProcess(command, 0, "removed", "")
+
+    monkeypatch.setattr(module.subprocess, "run", docker)
+    if failure == "log_write":
+        (tmp_path / "broker-runtime.log").mkdir()
+    primary = RuntimeError("primary scenario failure")
+    try:
+        raise primary
+    except RuntimeError:
+        with pytest.raises(RuntimeError, match="primary scenario failure") as caught:
+            owned.close()
+    assert caught.value is primary and caught.value.__cause__ is not None
+    assert commands[-1] == ["docker", "rm", "-f", "d" * 64]
+    rows = json.loads((tmp_path / "cleanup.json").read_text())
+    assert rows[0]["name"] == "plc" and rows[0]["group_clear"] is True
+    removal = next(row for row in rows if "container" in row)
+    assert removal["container"] == "d" * 64
+    assert removal["exit_code"] == (None if failure == "remove_timeout" else 0)
+    assert any(row.get("error") for row in rows)
+
+
+def test_child_diagnostic_failure_does_not_skip_other_owned_cleanup(
+    tmp_path, monkeypatch
+):
+    module = driver()
+    owned = module.Owned(tmp_path, time.monotonic() + 20)
+    plc = owned.start("plc", [sys.executable, "-c", "pass"], os.environ)
+    launch = owned.start("launch", [sys.executable, "-c", "pass"], os.environ)
+    for process in (plc, launch):
+        process.wait(timeout=5)
+    monkeypatch.setattr(
+        module,
+        "launch_child_receipt",
+        lambda *args: (_ for _ in ()).throw(OSError("log unavailable")),
+    )
+    owned.container = "e" * 64
+    commands = []
+
+    def docker(command, **kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(module.subprocess, "run", docker)
+    with pytest.raises(RuntimeError, match="owned cleanup failed"):
+        owned.close()
+    assert commands[-1] == ["docker", "rm", "-f", "e" * 64]
+    rows = json.loads((tmp_path / "cleanup.json").read_text())
+    assert any(row.get("name") == "plc" and row["group_clear"] for row in rows)
+    assert any(row.get("name") == "launch" and row.get("error") for row in rows)
+
+
 def test_unexpected_plc_exit_rejects_success_after_cleaning_other_resources(
     tmp_path, monkeypatch
 ):

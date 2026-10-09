@@ -224,6 +224,9 @@ def validate_cleanup(rows, *, successful_run=True):
     """Reject incomplete or failed owned-resource evidence before public PASS."""
     failures = []
     for row in rows:
+        if row.get("error"):
+            failures.append(row)
+            continue
         if "name" in row:
             if row.get("group_clear") is not True:
                 failures.append(row)
@@ -374,81 +377,122 @@ class Owned:
                 raise primary_error from cleanup_error
             raise
         finally:
-            write_json(self.output / "cleanup.json", self.cleanup)
-            for sig, handler in previous.items():
-                signal.signal(sig, handler)
+            cleanup_error = sys.exc_info()[1]
+            try:
+                write_json(self.output / "cleanup.json", self.cleanup)
+            except BaseException as receipt_error:
+                if primary_error is not None:
+                    raise primary_error from receipt_error
+                if cleanup_error is not None:
+                    raise cleanup_error from receipt_error
+                raise
+            finally:
+                for sig, handler in previous.items():
+                    signal.signal(sig, handler)
 
     def _close(self):
         for name, process, handle in reversed(self.children):
-            escalated = False
-            group_alive = self.group_alive(process.pid)
-            if group_alive:
-                for sig, bound in (
-                    (signal.SIGINT, 12),
-                    (signal.SIGTERM, 5),
-                    (signal.SIGKILL, 2),
-                ):
-                    try:
-                        if (
-                            name == "launch"
-                            and sig == signal.SIGINT
-                            and process.poll() is None
-                        ):
-                            # ros2 launch propagates its first interrupt itself.
-                            # Group-wide SIGINT here would interrupt every child
-                            # twice during its ROS cleanup. Escalation still owns
-                            # the exact group, including orphaned descendants.
-                            process.send_signal(sig)
-                        else:
-                            os.killpg(process.pid, sig)
-                    except ProcessLookupError:
-                        break
-                    end = time.monotonic() + bound
-                    while self.group_alive(process.pid) and time.monotonic() < end:
-                        process.poll()
-                        time.sleep(0.05)
-                    if not self.group_alive(process.pid):
-                        process.wait(timeout=1)
-                        break
-                    escalated = True
-            handle.close()
-            receipt = dict(
-                name=name,
-                pid=process.pid,
-                process_group=process.pid,
-                exit_code=process.poll(),
-                escalated=escalated,
-                group_clear=not self.group_alive(process.pid),
-            )
-            if name == "launch":
-                receipt.update(
-                    launch_child_receipt(
-                        (self.output / "launch.log").read_text(), process.poll()
+            try:
+                self._close_child(name, process, handle)
+            except BaseException as error:
+                self.cleanup.append(
+                    dict(
+                        name=name,
+                        pid=process.pid,
+                        exit_code=process.poll(),
+                        group_clear=False,
+                        error=repr(error),
                     )
                 )
-            self.cleanup.append(receipt)
+            finally:
+                try:
+                    handle.close()
+                except BaseException as error:
+                    self.cleanup.append(
+                        dict(operation="close_child_log", name=name, error=repr(error))
+                    )
         self.resolve_broker()
         if self.container:
-            logs = subprocess.run(
-                ["docker", "logs", self.container],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            (self.output / "broker-runtime.log").write_text(logs.stdout + logs.stderr)
-            result = subprocess.run(
-                ["docker", "rm", "-f", self.container],
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
-            self.cleanup.append(
-                dict(
-                    container=self.container,
-                    exit_code=result.returncode,
-                    output=result.stdout + result.stderr,
+            try:
+                logs = subprocess.run(
+                    ["docker", "logs", self.container],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                if logs.returncode != 0:
+                    raise RuntimeError(
+                        f"docker logs exited {logs.returncode}: {logs.stderr}"
+                    )
+                (self.output / "broker-runtime.log").write_text(
+                    logs.stdout + logs.stderr
+                )
+            except BaseException as error:
+                self.cleanup.append(dict(operation="broker_logs", error=repr(error)))
+            receipt = dict(container=self.container, exit_code=None, output="")
+            try:
+                result = subprocess.run(
+                    ["docker", "rm", "-f", self.container],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                receipt.update(
+                    exit_code=result.returncode, output=result.stdout + result.stderr
+                )
+            except BaseException as error:
+                receipt["error"] = repr(error)
+            finally:
+                self.cleanup.append(receipt)
+
+    def _close_child(self, name, process, handle):
+        escalated = False
+        group_alive = self.group_alive(process.pid)
+        if group_alive:
+            for sig, bound in (
+                (signal.SIGINT, 12),
+                (signal.SIGTERM, 5),
+                (signal.SIGKILL, 2),
+            ):
+                try:
+                    if (
+                        name == "launch"
+                        and sig == signal.SIGINT
+                        and process.poll() is None
+                    ):
+                        # ros2 launch propagates its first interrupt itself.
+                        # Group-wide SIGINT here would interrupt every child
+                        # twice during its ROS cleanup. Escalation still owns
+                        # the exact group, including orphaned descendants.
+                        process.send_signal(sig)
+                    else:
+                        os.killpg(process.pid, sig)
+                except ProcessLookupError:
+                    break
+                end = time.monotonic() + bound
+                while self.group_alive(process.pid) and time.monotonic() < end:
+                    process.poll()
+                    time.sleep(0.05)
+                if not self.group_alive(process.pid):
+                    process.wait(timeout=1)
+                    break
+                escalated = True
+        handle.close()
+        receipt = dict(
+            name=name,
+            pid=process.pid,
+            process_group=process.pid,
+            exit_code=process.poll(),
+            escalated=escalated,
+            group_clear=not self.group_alive(process.pid),
+        )
+        if name == "launch":
+            receipt.update(
+                launch_child_receipt(
+                    (self.output / "launch.log").read_text(), process.poll()
                 )
             )
+        self.cleanup.append(receipt)
 
     def check(self):
         if time.monotonic() >= self.deadline:
