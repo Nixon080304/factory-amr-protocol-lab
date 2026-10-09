@@ -64,8 +64,11 @@ try {
   await waitFor(() => lines.some(line => line.ready) || fixture.exitCode !== null, 'production server startup');
   assert.equal(fixture.exitCode, null, fixtureErrors || 'dashboard fixture exited');
   const { url } = lines.find(line => line.ready);
-  const initialCapture = (await (await fetch(`${url}/api/snapshot`)).json()).updated_at;
-  assert.equal(typeof initialCapture, 'number');
+  let initialCapture;
+  await waitFor(async () => {
+    initialCapture = (await (await fetch(`${url}/api/snapshot`)).json()).updated_at;
+    return typeof initialCapture === 'number';
+  }, 'actual initial fixture capture');
   // Deliberately age the real initial capture beyond the three-second cutoff.
   // This is a freshness regression stimulus, not browser readiness or a retry.
   await waitFor(() => Date.now() / 1000 - initialCapture >= 3.2, 'intentional aged initial fixture capture');
