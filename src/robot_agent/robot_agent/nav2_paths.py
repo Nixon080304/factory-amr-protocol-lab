@@ -104,5 +104,9 @@ class Nav2Paths:
             if handle is not None and handle.accepted:
                 cancel = handle.cancel_goal_async()
                 cancel.cancel()
+                try:
+                    self.client.remove_future(cancel)
+                except ValueError:
+                    pass  # Older Humble already removed this cancelled future.
 
         return abandon

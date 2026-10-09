@@ -28,6 +28,7 @@ class Client:
         self.ready = ready
         self.goals = []
         self.future = Future()
+        self._futures = []
 
     def server_is_ready(self):
         return self.ready
@@ -35,6 +36,9 @@ class Client:
     def send_goal_async(self, goal):
         self.goals.append(goal)
         return self.future
+
+    def remove_future(self, future):
+        self._futures.remove(future)
 
 
 class Handle:
@@ -160,11 +164,11 @@ def test_abandon_cancels_pending_futures_and_ignores_late_reply(accepted):
     assert results == []
 
 
-@pytest.mark.parametrize("accepted", [False, True])
-def test_production_abandon_removes_actual_rclpy_pending_maps(accepted):
+@pytest.fixture
+def production_client():
     # Replacing only the native DDS handle preserves rclpy request bookkeeping.
+    import threading
     from rclpy.action import ActionClient
-    from rclpy.action.client import ClientGoalHandle
     from unique_identifier_msgs.msg import UUID
 
     class Wire:
@@ -178,6 +182,7 @@ def test_production_abandon_removes_actual_rclpy_pending_maps(accepted):
         send_cancel_request = send_goal_request
 
     client = ActionClient.__new__(ActionClient)
+    client._lock = threading.Lock()
     client._action_type = ComputePathToPose
     client._client_handle = Wire()
     client._pending_goal_requests = {}
@@ -189,6 +194,17 @@ def test_production_abandon_removes_actual_rclpy_pending_maps(accepted):
     client._futures = []
     client._generate_random_uuid = lambda: UUID(uuid=[1] * 16)
     client.server_is_ready = lambda: True
+    return client
+
+
+@pytest.mark.parametrize("accepted", [False, True])
+def test_production_abandon_removes_actual_rclpy_pending_maps(
+    accepted, production_client
+):
+    from rclpy.action.client import ClientGoalHandle
+    from unique_identifier_msgs.msg import UUID
+
+    client = production_client
     for _ in range(10):
         cancel = (
             api()
@@ -214,3 +230,33 @@ def test_production_abandon_removes_actual_rclpy_pending_maps(accepted):
         )
         assert not client._result_sequence_number_to_goal_id
         assert not client._futures
+
+
+def test_abandon_removes_only_its_cancel_future_not_unrelated_work(production_client):
+    from rclpy.action.client import ClientGoalHandle
+    from unique_identifier_msgs.msg import UUID
+
+    client = production_client
+    unrelated = Future()
+    client.add_future(unrelated)
+    abandon = (
+        api()
+        .Nav2Paths(client, Time)
+        .compute(
+            None,
+            (3, 4, 0),
+            "floor/cart/map",
+            lambda *_: pytest.fail("abandoned callback"),
+        )
+    )
+    handle = ClientGoalHandle(
+        client,
+        UUID(uuid=[1] * 16),
+        ComputePathToPose.Impl.SendGoalService.Response(accepted=True),
+    )
+    next(iter(client._pending_goal_requests.values())).set_result(handle)
+    for _ in range(3):
+        abandon()
+    assert client._futures == [unrelated]
+    assert not unrelated.done()
+    assert not client._pending_cancel_requests and not client._pending_result_requests
