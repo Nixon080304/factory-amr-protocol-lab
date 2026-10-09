@@ -117,7 +117,8 @@ existing primary startup error retains the cleanup error as its cause.
 The complete covering wrapper/cleanup/CI-contract/bounded suites pass 138 cases
 after that correction; final formatting and documentation are checked separately.
 The preserved CI hashes are not relabeled as containing this later edge.
-No package runtime, wrapper or CI script changes after the renewed gate.
+Within Task 16, no package runtime, wrapper or CI script changes followed the
+renewed gate. The later whole-branch fix wave below has its own source boundary.
 Earlier physical receipts already record zero PLC/broker cleanup statuses; all
 seven fleet/visible cleanup receipts pass the strengthened validator. They remain
 source-bound simulation evidence, not a rerun of these new failure gates.
@@ -156,7 +157,63 @@ runner contract. Package-local tests remain isolated under colcon; they
 are not merged into one incompatible pytest import namespace. These categories
 overlap and must not be added as distinct tests. Historical failing XML and
 diagnostic artifacts remain retained, not removed to make an aggregate green.
-Scoped independent rereview and a new hosted run remain outstanding gates.
+The Task 16 scoped independent rereview approved the install-selection and
+owned-cleanup corrections at `2507983`. The subsequent whole-branch review found
+four Important defects and a configurable dashboard-target issue. That approval
+does not cover the later fix wave below. A new hosted run remains outstanding.
+
+## Final whole-branch fix wave: 9 October 2026
+
+The fix wave retains unresolved payload custody and historical failed rows for
+recovery, safely retries definitely unsent dock requests, refreshes durable MQTT
+state after a manager-only restart, continues independent owned cleanup after
+diagnostic failure, and renders the authoritative charging target. Startup
+queries explicitly wait for custody reconciliation without rewriting snapshots.
+Public build/test discovery is restricted to `src`; copied packages and failed
+XML in retained artifacts are not deleted or hidden from exact-root result scans.
+
+Runtime, tests and public scripts are frozen at `7356db8`. The supported
+environment activates the checkout virtual environment, uses ROS Humble,
+`PYTHONNOUSERSITE=1`, `ROS_LOCALHOST_ONLY=1`, system OpenCV 4.5.4, and explicitly
+selects the rebuilt install. Retained source manifests match before and after
+both the complete repository gate and fresh non-Gazebo CI. Evidence is under
+`artifacts/final-fix-20261009.rWzGz8`; the fresh CI root is
+`artifacts/ci/20261009T050751Z-run.ucuvtu`. This measured documentation follows
+those source-bound gates; it does not change their runtime boundary.
+
+| Command or gate | Observed result |
+| --- | --- |
+| Corrected fleet-manager and MQTT covering packages | 937 passed in 45.08 seconds; two inherited Xacro warnings |
+| Complete canonical repository `python3 -m pytest -q tests` | 424 passed in 538.33 seconds; exit zero |
+| Actual Version 1 success and owned cleanup within that repository gate | Physical mission, transfer, payload, duplicate and restart-refusal assertions pass; all 25 launch children exit zero, wrapper exits 130, owned services/processes disappear |
+| Fresh non-Gazebo CI build and serial package tests | All 12 packages build in 55.3 seconds and test in 4 minutes 4 seconds |
+| Exact fresh CI `colcon test-result --verbose --test-result-base` scan | 1,631 records; zero errors, failures or skips |
+| CI pure / contracts and schemas / bounded fleet stages | 326 passed in 222.85 seconds / 63 passed / 30 passed in 22.86 seconds |
+| Real Chrome dashboard | Non-default 67% and unknown target, desktop/mobile layout, transitions and reconnect checks pass; screenshots retained at `artifacts/dashboard/browser-XXXXXXKASwv4` |
+| CI real protocol and DDS integration | 95 passed in 67.98 seconds; final public CI exits zero |
+
+The new real manager-restart proof keeps the broker and gateway alive while only
+the manager restarts. Queued and active missions each have one bounded fake-agent
+execution, with conflicting-ID rejection and old-callback fencing. These tests
+exercise real MQTT, DDS and journal recovery, not physical robot motion. The
+ordinary loaded/unknown failure cases also have real manager/DDS result proof.
+The earlier two-robot fleet PNG/GIF and physical fleet receipts retain their
+pre-fix source boundaries; they are not relabeled as this fix wave's media.
+
+Failed evidence remains visible. The earlier unsupported repository command has
+415 passes and four failures from user-site OpenCV contamination. A subsequent
+pre-correction command has 420 passes and three failures: two virtual-environment
+launcher checks and an actual native `robot_state_publisher` shutdown `-11`.
+The exact owned dump and FastDDS teardown backtrace are retained. The final
+canonical run records 25 zero child exits, but does not establish that the
+earlier native crash was fixed; no transport/profile change or exit-code
+suppression was made. An owned intermediate full run was interrupted for the
+source-discovery correction and remains an incomplete receipt.
+
+The controller's scoped independent rereview of this fix wave and a new hosted
+run remain pending. These local implementation receipts do not establish final
+review approval or release completion. Test categories overlap and are not
+added into a single distinct-test total.
 
 ## Current local verification — historical Version 1 (3 October 2026)
 
