@@ -210,10 +210,36 @@ earlier native crash was fixed; no transport/profile change or exit-code
 suppression was made. An owned intermediate full run was interrupted for the
 source-discovery correction and remains an incomplete receipt.
 
-The controller's scoped independent rereview of this fix wave and a new hosted
-run remain pending. These local implementation receipts do not establish final
-review approval or release completion. Test categories overlap and are not
-added into a single distinct-test total.
+The scoped rereview confirmed that the original five findings were addressed,
+but requested the exceptional startup guard described below. Final review
+approval and a new hosted run remain pending. These local implementation
+receipts do not establish release completion. Test categories overlap and are
+not added into a single distinct-test total.
+
+### Bounded startup-storage guard follow-up
+
+The rereview reproduced a failed startup write with a readable journal:
+`STORAGE_FAILED` incorrectly certified historical unresolved `FAILED` custody
+as ready, causing MQTT observation to stop. Commit `559438b` requires committed
+`RUNNING` reconciliation for unresolved rows instead of merely excluding
+`RECONCILING`. Queries remain read-only. Normal `RUNNING` responses are unchanged;
+completed delivery and proven pre-pickup failure remain immediately replayable,
+including under `STORAGE_FAILED`. Independent carrying evidence still prevents
+premature terminal replay.
+
+Focused regressions reproduce six failures before the guard and pass 15 cases
+afterward. Fleet-manager and MQTT packages pass 945 tests in 44.93 seconds,
+including real manager-only restart tests, readiness/storage cases, no extra
+goal, retained custody, and repaired/restarted recovery. Two inherited Xacro
+warnings remain. Ruff, shell syntax and whitespace checks pass. New receipts
+are under `artifacts/final-fix-20261009.rWzGz8/storage-guard`.
+
+The preceding 424-case repository and 1,631-record fresh CI receipts remain
+bound to `7356db8`; they are not relabeled as containing this guard. The
+controller's renewed complete repository command is running separately on the
+guard source and its result is pending. The targeted independent guard check
+and hosted verification also remain pending. No additional two-robot physical
+or media run was performed for this exceptional read-only boot guard.
 
 ## Current local verification — historical Version 1 (3 October 2026)
 
