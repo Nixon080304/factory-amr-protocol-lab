@@ -48,6 +48,7 @@ run_stage 'ROS build' colcon --log-base "$run_root/log" build --symlink-install 
 set +u
 source "$run_root/install/setup.bash"
 set -u
+export FACTORY_INSTALL_SETUP="$run_root/install/setup.bash"
 # Use only this invocation's generated results. Retain every historical run.
 printf 'Fresh non-Gazebo colcon results: %s\n' "$result_base"
 run_stage 'ROS tests' colcon --log-base "$run_root/log" test --return-code-on-test-failure \

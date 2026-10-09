@@ -93,22 +93,44 @@ assertions, and cleanup. Mission duration instead comes from the correlated
 
 ## Final Task 16 local gates: 9 October 2026
 
-The final `scripts/run_ci_checks.sh` exits zero from a frozen runtime, test
-and script tree. A retained SHA-256 manifest matches before and after the run.
-Its unique root is `artifacts/ci/20261009T033003Z-run.MJ3aZg`; subsequent stages
-source only that root's fresh install. The table is a measured receipt, not a
-claim about a future hosted workflow or independent review. This receipt prose
-is added after the run and checked separately; no runtime, test or script is
-changed after the frozen gate.
+The renewed `scripts/run_ci_checks.sh` exits zero from a frozen tree containing
+the independent review's install-selection and cleanup-gate corrections.
+A retained SHA-256 manifest matches before and after that run. Its unique root
+is `artifacts/ci/20261009T035656Z-run.ItSa7t`; CI exports its fresh setup path,
+and both nested fleet wrappers validate and source that exact file. These are
+measured receipts, not a hosted workflow or independent review approval.
+
+Review found that the earlier `artifacts/ci/20261009T033003Z-run.MJ3aZg` run's
+fleet wrappers reloaded the checkout install. Its package counts remain valid,
+but the earlier claim that every nested stage used only its fresh install was
+incorrect. The renewed gate above supersedes that nested-driver claim.
+A separate real public scale run from the explicit fresh install, with the
+older checkout install left present, passes in
+`artifacts/fleet/20261009T035513Z-acceptance-axjjo5uv`; its shell trace confirms
+only the selected setup is sourced. All ten agents complete in 1.342 seconds.
+Regressions cover a missing checkout install and a conflicting stale install.
+
+After the renewed CI, one narrow driver-only failed-startup correction requires
+exact owned-container not-found proof instead of treating an arbitrary Docker
+inspect error as absence. Uncertain cleanup remains a failed receipt, and an
+existing primary startup error retains the cleanup error as its cause.
+The complete covering wrapper/cleanup/CI-contract/bounded suites pass 138 cases
+after that correction; final formatting and documentation are checked separately.
+The preserved CI hashes are not relabeled as containing this later edge.
+No package runtime, wrapper or CI script changes after the renewed gate.
+Earlier physical receipts already record zero PLC/broker cleanup statuses; all
+seven fleet/visible cleanup receipts pass the strengthened validator. They remain
+source-bound simulation evidence, not a rerun of these new failure gates.
 
 | Command or gate | Observed result |
 | --- | --- |
-| Fresh CI build and serial package tests | All 12 packages build in 55.1 wall seconds and test in 4 minutes |
-| Explicit `colcon test-result --verbose --test-result-base artifacts/ci/20261009T033003Z-run.MJ3aZg/test-results` | 1,608 records; zero errors, failures or skips |
-| CI pure / contract and schema / bounded fleet stages | 297 passed in 220.50 seconds / 63 passed / 30 passed in 22.97 seconds |
+| Renewed fresh CI build and serial package tests | All 12 packages build in 58.3 wall seconds and test in 3 minutes 58 seconds |
+| Explicit `colcon test-result --verbose --test-result-base artifacts/ci/20261009T035656Z-run.ItSa7t/test-results` | 1,608 records; zero errors, failures or skips |
+| Renewed CI pure / contract and schema / bounded fleet stages | 315 passed in 223.66 seconds / 63 passed / 30 passed in 22.93 seconds |
 | Real Chrome dashboard | Desktop and 360 px mobile layout, live transitions, stale/reconnect handling, fresh snapshot and credential redaction pass without console or network exceptions |
-| Real protocol and DDS integration | 95 passed in 67.88 seconds, including the complete protocol-fault suite |
-| Complete repository `.venv/bin/python3 -m pytest -q tests` | 395 passed in 534.98 seconds; zero failures, errors or skips |
+| Real protocol and DDS integration | 95 passed in 69.84 seconds, including the complete protocol-fault suite |
+| Post-CI failed-startup driver correction and covering suites | 138 passed in 50.87 seconds; zero failures, errors or skips |
+| Earlier pre-review repository `.venv/bin/python3 -m pytest -q tests` | 395 passed in 534.98 seconds; source-bound before the runner corrections, not a final-tree repetition |
 | Current Version 1 `scripts/run_all_scenarios.sh` | 12/12 expected outcomes, 73/73 trace predicates and 12/12 verified owned cleanups; root `reports/20261009T112506-cb66baeb7b89` |
 | Complete affected simulation package | 50 passed, including real Gazebo topics and navigation; two inherited Xacro warnings |
 | Focused actual Version 1 success and cleanup | All physical, transfer, duplicate and restart assertions pass; 25/25 launch children exit zero, wrapper exits 130 and owned services/processes disappear |
@@ -123,20 +145,24 @@ fleet packages, real legacy-root/normal-namespace isolation, and the 23-case
 restart matrix. Current real Version 1 physical cases and the complete affected
 simulation package verify the later compatibility and shutdown changes.
 
-The repository suite and Version 1 matrix use the explicit fresh unrestricted
-install rather than the checkout's older `install/`. The subsequent CI-only
-change selects serial package scheduling and is verified by its real runner
-contract in final CI. Package-local tests remain isolated under colcon; they
+The earlier repository suite and Version 1 matrix receive the explicit fresh
+unrestricted setup. Version 1 runners honor it, but that repository suite's
+nested fleet wrappers had the override defect described above. The renewed CI
+and post-CI covering suites verify the corrected fleet wrappers against the
+declared fresh install. The earlier 395-case repository command, all-900 and
+media are not repeated solely for runner/failed-cleanup changes; their source
+boundaries remain explicit. Serial package scheduling is verified by the real
+runner contract. Package-local tests remain isolated under colcon; they
 are not merged into one incompatible pytest import namespace. These categories
 overlap and must not be added as distinct tests. Historical failing XML and
 diagnostic artifacts remain retained, not removed to make an aggregate green.
-Independent final review and a new hosted run remain separate, unobserved gates.
+Scoped independent rereview and a new hosted run remain outstanding gates.
 
 ## Current local verification — historical Version 1 (3 October 2026)
 
 This section retains the original Version 1 receipt and its historical use of
 "current". Its revisions, counts and timings are not the final fleet results.
-Use the 9 October Task 16 table above for the final exact-tree local gates.
+Use the source-bound 9 October Task 16 table above for the newer local gates.
 
 The verified development source is revision
 `6b4f300f64cbd22270f69722278df0d083904340`, checked on 3 October 2026 from a

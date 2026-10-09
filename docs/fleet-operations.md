@@ -75,8 +75,10 @@ or mismatched lock metadata is not overwritten or silently reclaimed.
 
 For source-bound verification against a fresh CI install, set
 `FACTORY_INSTALL_SETUP` to that run's absolute readable `install/setup.bash`
-before repository-level pytest, `scripts/run_scenario.sh` or
-`scripts/run_all_scenarios.sh`. The nested Version 1 `run_demo.sh` honors that
+before repository-level pytest, either fleet wrapper, `scripts/run_scenario.sh`
+or `scripts/run_all_scenarios.sh`. Both fleet wrappers source that exact file
+instead of the checkout's default install. CI exports its own fresh setup path
+for nested public drivers. The nested Version 1 `run_demo.sh` honors that
 same explicit setup and skips its default incremental rebuild only in this
 mode. With the variable unset, the Version 1 demo still builds and sources the
 checkout's `install/setup.bash`. Invalid setup paths fail before
@@ -100,6 +102,14 @@ Ctrl+C and SIGTERM enter bounded cleanup. Only recorded child process groups
 and the exact newly created broker container are stopped. Logs, journals and
 receipts remain for inspection. A timeout or missing proof returns nonzero;
 the final PASS line requires scenario receipts and clean launch-child exits.
+Every owned cleanup row is checked before PASS: process exit and group clearance,
+launch-child status, PLC exit and exact broker-removal status. A failed PLC exit
+or broker removal returns nonzero after retaining the complete cleanup receipt;
+it cannot inherit a successful default from a missing process-group field.
+Broker absence requires exact not-found evidence for the owned name. A Docker
+daemon, transport or other inspection failure leaves uncertain cleanup evidence,
+never a claimed absence. If startup already failed, its original error is
+preserved with the cleanup error as its cause after receipts are retained.
 Never use broad process-name kills to clean a fleet run.
 
 ## Failure semantics

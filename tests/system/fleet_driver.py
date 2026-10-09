@@ -220,6 +220,33 @@ def audit_leases(rows, *, clearances=(), samples=(), bounds=None, physical_radiu
     return grants
 
 
+def validate_cleanup(rows, *, successful_run=True):
+    """Reject incomplete or failed owned-resource evidence before public PASS."""
+    failures = []
+    for row in rows:
+        if "name" in row:
+            if row.get("group_clear") is not True:
+                failures.append(row)
+            elif (successful_run or row["name"] == "plc") and row.get("exit_code") != 0:
+                failures.append(row)
+            elif (
+                successful_run
+                and row["name"] == "launch"
+                and row.get("all_children_clean") is not True
+            ):
+                failures.append(row)
+        elif "container" in row:
+            if row.get("exit_code") != 0:
+                failures.append(row)
+        elif "container_name" in row:
+            if row.get("absent") is not True:
+                failures.append(row)
+        else:
+            failures.append(row)
+    if failures:
+        raise RuntimeError(f"owned cleanup failed: {failures}")
+
+
 class Owned:
     def __init__(self, output, deadline):
         self.output, self.deadline, self.children = output, deadline, []
@@ -276,7 +303,22 @@ class Owned:
             timeout=10,
         )
         if result.returncode != 0:
-            self.cleanup.append(dict(container_name=self.broker_name, absent=True))
+            absent = (
+                result.returncode == 1
+                and result.stdout.strip() in ("", "[]")
+                and result.stderr.strip()
+                == f"Error: No such object: {self.broker_name}"
+            )
+            self.cleanup.append(
+                dict(
+                    container_name=self.broker_name,
+                    absent=absent,
+                    inspect_exit_code=result.returncode,
+                    output=result.stdout + result.stderr,
+                )
+            )
+            if not absent:
+                raise RuntimeError("owned cleanup failed: broker absence is unproven")
             return
         objects = json.loads(result.stdout)
         if (
@@ -317,12 +359,20 @@ class Owned:
         return process
 
     def close(self):
+        primary_error = sys.exc_info()[1]
         previous = {
             sig: signal.signal(sig, signal.SIG_IGN)
             for sig in (signal.SIGINT, signal.SIGTERM)
         }
         try:
             self._close()
+            # A timed-out probe can be interrupted during cleanup. Its original
+            # timeout stays authoritative, but PLC/broker failures never pass.
+            validate_cleanup(self.cleanup, successful_run=False)
+        except BaseException as cleanup_error:
+            if primary_error is not None:
+                raise primary_error from cleanup_error
+            raise
         finally:
             write_json(self.output / "cleanup.json", self.cleanup)
             for sig, handler in previous.items():
@@ -985,14 +1035,12 @@ def gazebo_scenario(name, output, headless, deadline):
         plan_log.close()
         node.destroy_node()
         rclpy.try_shutdown()
-        owned.close()
-        domain.close()
+        try:
+            owned.close()
+        finally:
+            domain.close()
     assert receipt is not None
-    launched = next(r for r in owned.cleanup if r.get("name") == "launch")
-    assert launched["all_children_clean"], f"unclean launch teardown: {launched}"
-    assert all(r.get("group_clear", True) for r in owned.cleanup), (
-        "owned process group remains live"
-    )
+    validate_cleanup(owned.cleanup)
     return receipt
 
 
@@ -1060,9 +1108,7 @@ def main():
                     run.wait(timeout=max(0.1, owned.deadline - time.monotonic()))
                 finally:
                     owned.close()
-                assert all(r.get("group_clear") for r in owned.cleanup), (
-                    f"{scenario} owned process group remains live"
-                )
+                validate_cleanup(owned.cleanup)
                 assert run.returncode == 0, (
                     f"{scenario} proof failed; inspect {destination}"
                 )

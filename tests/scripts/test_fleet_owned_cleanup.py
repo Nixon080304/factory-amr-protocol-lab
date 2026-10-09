@@ -316,7 +316,7 @@ def test_successful_probe_without_required_receipt_returns_nonzero(
             return SimpleNamespace(wait=lambda **kwargs: None, returncode=0)
 
         def close(self):
-            self.cleanup = [dict(group_clear=True)]
+            self.cleanup = [dict(name="probe", group_clear=True, exit_code=0)]
 
     monkeypatch.setattr(module, "Owned", NoEvidence)
     monkeypatch.setattr(module.signal, "signal", lambda *args: None)
@@ -423,6 +423,153 @@ def driver():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_failed_broker_removal_rejects_success_and_preserves_cleanup_receipt(
+    tmp_path, monkeypatch
+):
+    module = driver()
+    owned = module.Owned(tmp_path, time.monotonic() + 20)
+    owned.container = "a" * 64
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command, 1 if command[1] == "rm" else 0, "", "removal refused"
+        ),
+    )
+    with pytest.raises(RuntimeError, match="owned cleanup failed"):
+        owned.close()
+    rows = json.loads((tmp_path / "cleanup.json").read_text())
+    assert rows[-1]["container"] == "a" * 64
+    assert rows[-1]["exit_code"] == 1
+    assert rows[-1]["output"] == "removal refused"
+
+
+def test_unexpected_plc_exit_rejects_success_after_cleaning_other_resources(
+    tmp_path, monkeypatch
+):
+    module = driver()
+    owned = module.Owned(tmp_path, time.monotonic() + 20)
+    plc = owned.start("plc", [sys.executable, "-c", "raise SystemExit(7)"], os.environ)
+    plc.wait(timeout=5)
+    owned.container = "b" * 64
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(command, 0, "", ""),
+    )
+    with pytest.raises(RuntimeError, match="owned cleanup failed"):
+        owned.close()
+    rows = json.loads((tmp_path / "cleanup.json").read_text())
+    assert rows[0]["name"] == "plc" and rows[0]["exit_code"] == 7
+    assert rows[0]["group_clear"] is True
+    assert rows[-1]["container"] == "b" * 64 and rows[-1]["exit_code"] == 0
+
+
+def test_successful_owned_plc_and_broker_cleanup_is_fully_recorded(
+    tmp_path, monkeypatch
+):
+    module = driver()
+    owned = module.Owned(tmp_path, time.monotonic() + 20)
+    plc = owned.start("plc", [sys.executable, "-c", "pass"], os.environ)
+    plc.wait(timeout=5)
+    owned.container = "c" * 64
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(command, 0, "", ""),
+    )
+    owned.close()
+    rows = json.loads((tmp_path / "cleanup.json").read_text())
+    assert rows[0]["name"] == "plc" and rows[0]["exit_code"] == 0
+    assert rows[0]["group_clear"] is True
+    assert rows[-1]["container"] == "c" * 64 and rows[-1]["exit_code"] == 0
+
+
+def test_broker_absence_requires_recorded_exact_not_found_proof(tmp_path, monkeypatch):
+    module = driver()
+    owned = module.Owned(tmp_path, time.monotonic() + 20)
+    owned.broker_name = "factory-fleet-owned-absence"
+    error = "Error: No such object: factory-fleet-owned-absence\n"
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command, 1, "[]\n", error
+        ),
+    )
+    owned.close()
+    assert json.loads((tmp_path / "cleanup.json").read_text()) == [
+        {
+            "container_name": "factory-fleet-owned-absence",
+            "absent": True,
+            "inspect_exit_code": 1,
+            "output": "[]\n" + error,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "code,error",
+    [
+        (1, "Cannot connect to the Docker daemon; transport unavailable\n"),
+        (1, "error during connect: connection reset\n"),
+        (1, "Error: No such object: unrelated-existing-container\n"),
+        (2, "Error: No such object: factory-fleet-owned-absence\n"),
+    ],
+)
+def test_inspect_errors_never_claim_owned_broker_absent(
+    tmp_path, monkeypatch, code, error
+):
+    module = driver()
+    owned = module.Owned(tmp_path, time.monotonic() + 20)
+    owned.broker_name = "factory-fleet-owned-absence"
+    commands = []
+
+    def docker(command, **kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, code, "[]\n", error)
+
+    monkeypatch.setattr(module.subprocess, "run", docker)
+    with pytest.raises(RuntimeError, match="owned cleanup failed"):
+        owned.close()
+    rows = json.loads((tmp_path / "cleanup.json").read_text())
+    assert rows[0]["absent"] is False
+    assert rows[0]["inspect_exit_code"] == code
+    assert rows[0]["output"] == "[]\n" + error
+    assert commands == [["docker", "inspect", "factory-fleet-owned-absence"]]
+
+
+def test_uncertain_broker_cleanup_retains_primary_startup_error_and_full_receipt(
+    tmp_path, monkeypatch
+):
+    module = driver()
+    owned = module.Owned(tmp_path, time.monotonic() + 20)
+    plc = owned.start("plc", [sys.executable, "-c", "pass"], os.environ)
+    plc.wait(timeout=5)
+
+    def docker(command, **kwargs):
+        if command[1] == "run":
+            raise subprocess.TimeoutExpired(command, 1)
+        assert command == ["docker", "inspect", owned.broker_name]
+        return subprocess.CompletedProcess(command, 1, "", "Docker daemon unavailable")
+
+    monkeypatch.setattr(module.subprocess, "run", docker)
+    with pytest.raises(subprocess.TimeoutExpired) as captured:
+        try:
+            owned.create_broker(1883)
+        finally:
+            owned.close()
+    assert captured.value.cmd[:3] == ["docker", "run", "-d"]
+    assert captured.value.timeout == 1
+    assert isinstance(captured.value.__cause__, RuntimeError)
+    rows = json.loads((tmp_path / "cleanup.json").read_text())
+    assert rows[0]["name"] == "plc" and rows[0]["exit_code"] == 0
+    assert rows[0]["group_clear"] is True
+    assert rows[1]["container_name"] == owned.broker_name
+    assert rows[1]["absent"] is False and rows[1]["inspect_exit_code"] == 1
+    assert rows[1]["output"] == "Docker daemon unavailable"
 
 
 def test_cleanup_reaps_owned_group_when_parent_already_exited(tmp_path):

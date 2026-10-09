@@ -56,6 +56,7 @@ log = Path(os.environ['CI_FAKE_LOG'])
 previous = log.read_text().splitlines() if log.exists() else []
 with log.open('a') as output:
     output.write(json.dumps(dict(command=name, args=sys.argv[1:],
+        install_setup=os.environ.get('FACTORY_INSTALL_SETUP'),
         localhost=os.environ.get('ROS_LOCALHOST_ONLY'),
         usersite=os.environ.get('PYTHONNOUSERSITE'),
         overlays={key: os.environ.get(key, '') for key in (
@@ -174,6 +175,14 @@ def test_gate_does_not_load_inherited_workspace_overlays(runner, tmp_path):
     assert all(
         inherited not in value for call in calls for value in call["overlays"].values()
     )
+
+
+def test_gate_exports_its_exact_fresh_install_to_nested_public_drivers(runner):
+    result, calls = runner()
+    assert result.returncode == 0, result.stdout + result.stderr
+    build = calls[4]["args"]
+    selected = str(Path(build[build.index("--install-base") + 1]) / "setup.bash")
+    assert all(call["install_setup"] == selected for call in calls[5:])
 
 
 def test_success_requires_every_stage_and_forces_ros_and_python_isolation(runner):
