@@ -266,6 +266,38 @@ No additional two-robot physical or media run was performed for this exceptional
 read-only boot guard. Documentation changes after the frozen guard are checked
 separately and do not relabel its source boundary.
 
+### Hosted release compatibility follow-up
+
+Hosted run `37890989841` builds all twelve packages but fails two newer-Humble
+action-client fixture cases and three missing `nav2_bringup` resource cases.
+The compatibility source is frozen at `1da0313`. The fixture now initializes
+the official normal lock. A separately reproduced retained cancellation future
+requires one bounded production cleanup: remove only that already-cancelled
+future through the public API, tolerating its absence on older Humble. Original
+pending-map, repeated abandonment and late-callback assertions remain; an
+unrelated-future control is added. Released official rclpy 3.3.22 Python methods
+pass 14 cases, and the local older-Humble agent package passes 272 cases.
+
+Hosted setup retains its explicit dependency skip but extracts the actual
+official `ros-humble-nav2-bringup` package into an owned resource-only prefix.
+CI validates and restores that explicit ament resource prefix after its underlay
+reset; ordinary local full rosdep setup is unchanged. Actual isolated package
+`1.1.20-1jammy.20260908.021125` extraction resolves to the exact owned prefix.
+All 19 unchanged fleet launch tests pass, including real upstream localization
+and RViz assertions for two and ten robots. Provision/CI/reset contracts pass
+54 cases; Ruff, shell syntax, whitespace and 20 documentation cases pass.
+Two inherited Xacro warnings remain. The newer-rclpy proof loads unmodified
+official Python modules with the existing native-handle fixture boundary; it is
+not a hosted or upgraded-native-DDS execution.
+
+Receipts are retained under
+`artifacts/final-fix-20261009.rWzGz8/hosted-compatibility`. Previous 424-case full
+and 945-case covering receipts are not relabeled as containing these changes.
+A fresh complete repository command and the required new hosted gate are pending
+at this handoff. The hosted log's nonfatal `printed_strlen` status-extension
+diagnostic is retained; no unrelated toolchain upgrade or middleware change is
+made. No new physical fleet or media run is claimed for this compatibility work.
+
 ## Current local verification — historical Version 1 (3 October 2026)
 
 This section retains the original Version 1 receipt and its historical use of
