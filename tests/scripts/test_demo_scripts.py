@@ -90,7 +90,7 @@ def test_demo_sources_exact_install_and_builds_only_default(tmp_path, explicit):
     assert result.stdout.splitlines() == (
         ["INSTALL:fresh"]
         if explicit
-        else ["BUILD:build --symlink-install", "INSTALL:default"]
+        else ["BUILD:build --symlink-install --base-paths src", "INSTALL:default"]
     )
 
 

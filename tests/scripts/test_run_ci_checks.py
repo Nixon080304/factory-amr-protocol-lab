@@ -185,6 +185,23 @@ def test_gate_exports_its_exact_fresh_install_to_nested_public_drivers(runner):
     assert all(call["install_setup"] == selected for call in calls[5:])
 
 
+def test_gate_discovers_only_source_packages_without_hiding_retained_artifacts(
+    runner, tmp_path
+):
+    artifact = tmp_path / "artifacts/retained-fixture/src/protocol_observer/package.xml"
+    artifact.parent.mkdir(parents=True)
+    evidence = "<package><name>protocol_observer</name></package>\n"
+    artifact.write_text(evidence)
+    result, calls = runner()
+    assert result.returncode == 0, result.stdout + result.stderr
+    for call in calls[4:6]:
+        arguments = call["args"]
+        assert "--base-paths" in arguments
+        assert arguments[arguments.index("--base-paths") + 1] == "src"
+    assert artifact.read_text() == evidence
+    assert not (artifact.parents[2] / "COLCON_IGNORE").exists()
+
+
 def test_success_requires_every_stage_and_forces_ros_and_python_isolation(runner):
     result, calls = runner()
     assert result.returncode == 0, result.stdout + result.stderr

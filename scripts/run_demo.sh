@@ -139,7 +139,7 @@ for row in rows:
 fi
 # Incremental colcon builds changed inputs. Fail before sourcing stale installs.
 if [[ ! ${FACTORY_INSTALL_SETUP+x} ]]; then
-    colcon build --symlink-install
+    colcon build --symlink-install --base-paths src
 fi
 set +u
 source "${FACTORY_INSTALL_SETUP:-install/setup.bash}"

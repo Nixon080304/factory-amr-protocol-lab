@@ -41,7 +41,7 @@ run_root=$(mktemp -d "$project_root/artifacts/ci/$(date -u +%Y%m%dT%H%M%SZ)-run.
 result_base="$run_root/test-results"
 mkdir -p "$result_base"
 printf 'CI artifacts: %s\n' "$run_root"
-run_stage 'ROS build' colcon --log-base "$run_root/log" build --symlink-install \
+run_stage 'ROS build' colcon --log-base "$run_root/log" build --symlink-install --base-paths src \
     --build-base "$run_root/build" --install-base "$run_root/install" \
     --test-result-base "$result_base" \
     --event-handlers console_direct+
@@ -51,7 +51,7 @@ set -u
 export FACTORY_INSTALL_SETUP="$run_root/install/setup.bash"
 # Use only this invocation's generated results. Retain every historical run.
 printf 'Fresh non-Gazebo colcon results: %s\n' "$result_base"
-run_stage 'ROS tests' colcon --log-base "$run_root/log" test --return-code-on-test-failure \
+run_stage 'ROS tests' colcon --log-base "$run_root/log" test --return-code-on-test-failure --base-paths src \
     --executor sequential \
     --build-base "$run_root/build" --install-base "$run_root/install" \
     --test-result-base "$result_base" --event-handlers console_direct+ \
