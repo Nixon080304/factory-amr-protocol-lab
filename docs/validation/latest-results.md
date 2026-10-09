@@ -236,10 +236,35 @@ are under `artifacts/final-fix-20261009.rWzGz8/storage-guard`.
 
 The preceding 424-case repository and 1,631-record fresh CI receipts remain
 bound to `7356db8`; they are not relabeled as containing this guard. The
-controller's renewed complete repository command is running separately on the
-guard source and its result is pending. The targeted independent guard check
-and hosted verification also remain pending. No additional two-robot physical
-or media run was performed for this exceptional read-only boot guard.
+controller's renewed complete repository command on the guard source exits one:
+423 passed and one failed in 626.76 seconds. The initial 80-second startup
+predicate for `nav_reject_twice` times out before mission ingress. The launch
+records a lost `/amcl/change_state` response; localization never activates.
+The failure therefore does not establish a navigation-rejection mission outcome.
+The log and source manifest remain under `storage-guard/controller-repository.log`
+and `controller-full-source-before.sha256`. Timeout cleanup removes all 25 owned
+children and broker/PLC/control services, but includes interrupted children,
+planner exit -6 and localization-manager -9 escalation. This is not a successful
+zero-child cleanup receipt. Source hashes remain unchanged.
+
+An unchanged-code focused diagnostic of `nav_reject_twice` passes in 9.83
+seconds. A separate complete confirmation command then passes all 424 tests
+in 541.93 seconds and exits zero, using unique `controller-confirmation-proof`
+and `controller-confirmation.log` under the same storage-guard evidence root.
+The tracked runtime/test/script/workflow SHA-256 manifest still matches.
+These are separate commands: the failed full run is retained, not combined
+with passing results or reclassified. The intermittent lost startup response
+and forced timeout cleanup are not repaired by the storage-readiness guard.
+The later complete success does not certify that native startup failure cannot
+recur. No middleware change, skipped test or deadline extension is used.
+
+The targeted independent guard review approves the correction and closes the
+remaining review finding. The final guard source has its own green complete
+repository receipt; the preceding fresh CI remains bound to `7356db8`.
+These local receipts do not establish a new hosted workflow result.
+No additional two-robot physical or media run was performed for this exceptional
+read-only boot guard. Documentation changes after the frozen guard are checked
+separately and do not relabel its source boundary.
 
 ## Current local verification — historical Version 1 (3 October 2026)
 
