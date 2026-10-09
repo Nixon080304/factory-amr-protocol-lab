@@ -78,7 +78,9 @@ def main():
         try:
             for line in sys.stdin:
                 command = json.loads(line)
-                if command["command"] == "update":
+                if command["command"] == "capture":
+                    assert server.capture(adapter), "actual fixture capture failed"
+                elif command["command"] == "update":
                     adapter.registry.observe(
                         replace(
                             adapter.registry.get("amr_02", 100),

@@ -64,6 +64,11 @@ try {
   await waitFor(() => lines.some(line => line.ready) || fixture.exitCode !== null, 'production server startup');
   assert.equal(fixture.exitCode, null, fixtureErrors || 'dashboard fixture exited');
   const { url } = lines.find(line => line.ready);
+  const initialCapture = (await (await fetch(`${url}/api/snapshot`)).json()).updated_at;
+  assert.equal(typeof initialCapture, 'number');
+  // Deliberately age the real initial capture beyond the three-second cutoff.
+  // This is a freshness regression stimulus, not browser readiness or a retry.
+  await waitFor(() => Date.now() / 1000 - initialCapture >= 3.2, 'intentional aged initial fixture capture');
   browser = await chrome();
   browser.onEvent(message => {
     if (message.method === 'Runtime.exceptionThrown') exceptions.push(message.params.exceptionDetails);
@@ -76,8 +81,12 @@ try {
   await browser.send('Network.enable');
   await browser.send('Page.enable');
   await browser.send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 1100, deviceScaleFactor: 1, mobile: false });
+  await command('capture');
   await browser.send('Page.navigate', { url });
   await waitFor(() => browser.evaluate("document.querySelector('#connection')?.dataset.state === 'live'"), 'dashboard live');
+  const renewedCapture = await browser.evaluate("fetch('/api/snapshot').then(response => response.json()).then(value => value.updated_at)");
+  assert.ok(renewedCapture > initialCapture, 'acknowledged capture must replace the aged source timestamp');
+  console.log(`PASS startup capture freshness: initial age ${(Date.now() / 1000 - initialCapture).toFixed(3)}s, renewed age ${(Date.now() / 1000 - renewedCapture).toFixed(3)}s`);
   const text = await browser.evaluate('document.body.innerText');
   assert.match(text, /amr_01/);
   assert.match(text, /amr_02/);
