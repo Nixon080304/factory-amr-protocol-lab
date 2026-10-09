@@ -66,6 +66,7 @@ run_stage 'ROS test results' colcon --log-base "$run_root/log" test-result --ver
 run_stage 'Pure tests' python3 -m pytest -q tests/scripts tests/scenarios tests/docs src/plc_simulator/test
 run_stage 'Contracts and schemas' python3 -m pytest -q tests/contracts src/mqtt_gateway/test/test_validator.py
 run_stage 'Fleet bounded system' python3 -m pytest -q tests/system/test_two_robot_fleet.py tests/system/test_ten_robot_scale.py tests/system/test_endpoint_readiness.py tests/system/test_legacy_readiness.py
+run_stage 'Chrome helper ownership' node --test tests/browser/test_chrome_cdp.mjs
 run_stage 'Fleet dashboard browser' node tests/browser/test_fleet_dashboard.mjs
 # Existing reviewed fixtures own ephemeral loopback Mosquitto/Modbus peers and
 # verify their cleanup. The protocol driver replaces navigation, not services.

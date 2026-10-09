@@ -22,6 +22,7 @@ STAGES = [
     "Pure tests",
     "Contracts and schemas",
     "Fleet bounded system",
+    "Chrome helper ownership",
     "Fleet dashboard browser",
     "Real protocol integration",
 ]
@@ -273,6 +274,7 @@ def test_success_requires_every_stage_and_forces_ros_and_python_isolation(runner
         "python3",
         "python3",
         "node",
+        "node",
         "python3",
     ]
     for stage in STAGES:
@@ -303,7 +305,8 @@ def test_success_requires_every_stage_and_forces_ros_and_python_isolation(runner
     assert "tests/system/test_two_robot_fleet.py" in calls[9]["args"]
     assert "tests/system/test_ten_robot_scale.py" in calls[9]["args"]
     assert "tests/system/test_legacy_readiness.py" in calls[9]["args"]
-    assert calls[10]["args"] == ["tests/browser/test_fleet_dashboard.mjs"]
+    assert calls[10]["args"] == ["--test", "tests/browser/test_chrome_cdp.mjs"]
+    assert calls[11]["args"] == ["tests/browser/test_fleet_dashboard.mjs"]
     assert not any(
         argument.endswith(("test_successful_mission.py", "test_autonomy_faults.py"))
         for call in calls
