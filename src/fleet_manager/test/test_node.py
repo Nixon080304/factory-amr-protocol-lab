@@ -98,6 +98,7 @@ def test_durable_query_checks_identity_without_writes_or_execution(rig):
     adapter.submit(request())
     host = object.__new__(FleetManagerNode)
     host.journal = journal
+    host.adapter = adapter
     changes = journal._connection.total_changes
     lookup = GetFleetMission.Request(
         mission_id="m1",
@@ -114,6 +115,105 @@ def test_durable_query_checks_identity_without_writes_or_execution(rig):
     absent = host._query_mission(lookup, GetFleetMission.Response())
     assert not absent.found and not absent.matches
     assert journal._connection.total_changes == changes and robots.goals == []
+
+
+@pytest.mark.parametrize(
+    "ownership,evidence",
+    [("PICKED_UP", False), ("UNKNOWN", False), ("NOT_PICKED_UP", True)],
+)
+def test_durable_query_waits_for_historical_custody_reconciliation(
+    rig, ownership, evidence
+):
+    from fleet_manager.node import FleetManagerNode
+    from fleet_manager.journal import MissionState
+    from factory_interfaces.srv import GetFleetMission
+
+    api, adapter, journal, robots, now = rig
+    adapter.core.submit(request(), 100)
+    adapter.core.assign("m1", {"amr_01": CostEstimate(True, 1, 80)}, 100)
+    if evidence:
+        journal.record_observation(
+            RobotSnapshot("amr_01", "EXECUTING", Pose2D(0, 0, 0), 80, "LOADED", "m1"),
+            100,
+        )
+    journal.transition(
+        "m1",
+        MissionState.ASSIGNED,
+        MissionState.FAILED,
+        {
+            "payload_ownership": ownership,
+            "result": {
+                "success": False,
+                "final_state": "FAILED",
+                "error_code": "RESOURCE_WAIT_TIMEOUT",
+            },
+        },
+        100,
+    )
+    replacement = api.FleetAdapter(
+        adapter.config, journal, robots, clock=lambda: now[0]
+    )
+    host = object.__new__(FleetManagerNode)
+    host.journal, host.adapter = journal, replacement
+    lookup = GetFleetMission.Request(
+        mission_id="m1",
+        pickup_station="assembly",
+        dropoff_station="inspection",
+        part="motor",
+    )
+    changes = journal._connection.total_changes
+    reply = host._query_mission(lookup, GetFleetMission.Response())
+    assert reply.found and reply.matches and reply.state == "FAILED"
+    assert not getattr(reply, "ready", True)
+    assert journal._connection.total_changes == changes
+    for robot in adapter.config.robots:
+        replacement.observe(
+            RobotSnapshot(robot.robot_id, "AVAILABLE", robot.spawn, 80, "EMPTY")
+        )
+    replacement.tick()
+    reply = host._query_mission(lookup, GetFleetMission.Response())
+    assert reply.ready and reply.state == "RECOVERY_REQUIRED"
+    assert reply.error_code == "RESOURCE_WAIT_TIMEOUT"
+    assert journal.get("m1").payload_ownership == (
+        "PICKED_UP" if evidence else ownership
+    )
+
+
+@pytest.mark.parametrize(
+    "state,ownership", [("COMPLETED", "DELIVERED"), ("FAILED", "NOT_PICKED_UP")]
+)
+def test_durable_query_replays_proven_terminal_work_during_reconciliation(
+    rig, state, ownership
+):
+    from fleet_manager.node import FleetManagerNode
+    from factory_interfaces.srv import GetFleetMission
+    from fleet_manager.journal import MissionState
+
+    api, adapter, journal, robots, now = rig
+    adapter.core.submit(request(), 100)
+    journal.transition(
+        "m1",
+        MissionState.QUEUED,
+        MissionState(state),
+        {"payload_ownership": ownership},
+        100,
+    )
+    host = object.__new__(FleetManagerNode)
+    host.journal = journal
+    host.adapter = api.FleetAdapter(
+        adapter.config, journal, robots, clock=lambda: now[0]
+    )
+    reply = host._query_mission(
+        GetFleetMission.Request(
+            mission_id="m1",
+            pickup_station="assembly",
+            dropoff_station="inspection",
+            part="motor",
+        ),
+        GetFleetMission.Response(),
+    )
+    assert reply.found and reply.matches and reply.state == state
+    assert getattr(reply, "ready", False)
 
 
 @pytest.mark.parametrize("ownership", ["PICKED_UP", "UNKNOWN"])

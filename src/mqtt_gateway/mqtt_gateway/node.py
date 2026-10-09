@@ -565,6 +565,8 @@ class MqttGatewayNode(Node):
                     remember=False,
                 )
                 return
+            if not reply.ready:
+                return  # Reconciliation must commit before closing observation.
             self._associations[mission_id] = self._associations.get(mission_id, 0) + 1
             self.awaiting_acceptance.pop(mission_id, None)
             if reply.assigned_robot_id:

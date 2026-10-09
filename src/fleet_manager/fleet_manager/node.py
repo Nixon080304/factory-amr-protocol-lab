@@ -367,6 +367,10 @@ class FleetManagerNode(Node):
         response.matches = record.request == _request(request)
         if not response.matches:
             return response
+        response.ready = self.adapter.state != "RECONCILING" or not any(
+            active.request.mission_id == request.mission_id
+            for active in self.journal.load_active()
+        )
         response.state = record.state.value
         response.assigned_robot_id = record.assigned_robot_id or ""
         response.success = record.state == MissionState.COMPLETED

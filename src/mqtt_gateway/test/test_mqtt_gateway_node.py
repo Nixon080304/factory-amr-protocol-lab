@@ -91,6 +91,7 @@ def test_duplicate_refreshes_durable_manager_state_and_fences_old_callbacks(
         SimpleNamespace(
             found=True,
             matches=True,
+            ready=True,
             state="RECOVERY_REQUIRED",
             assigned_robot_id="amr_02",
             success=False,
@@ -169,6 +170,7 @@ def test_durable_query_deadline_fences_late_reply_and_paces_retry(
         SimpleNamespace(
             found=True,
             matches=True,
+            ready=True,
             state="COMPLETED",
             assigned_robot_id="amr_01",
             success=True,
@@ -180,6 +182,68 @@ def test_durable_query_deadline_fences_late_reply_and_paces_retry(
     assert statuses(broker)[-1]["state"] == "QUEUED"
     assert len(replies) == 2 and removed == [replies[0]]
     assert len(goals) == 1
+
+
+def test_unreconciled_durable_failure_does_not_stop_gateway_observation(
+    without_dds, monkeypatch
+):
+    from types import SimpleNamespace
+    from rclpy.task import Future
+
+    node, broker, goals = without_dds
+    now = [100.0]
+    monkeypatch.setattr("mqtt_gateway.node.time.monotonic", lambda: now[0])
+    raw = b'{"mission_id":"restart","pickup":"assembly","dropoff":"inspection","part":"motor"}'
+    node._request(raw)
+    node._drain()
+    node.awaiting_acceptance.clear()
+    node.publish_status("restart", "QUEUED")
+    replies = []
+
+    def query(request):
+        future = Future()
+        replies.append(future)
+        return future
+
+    node.mission_query = SimpleNamespace(
+        service_is_ready=lambda: True,
+        call_async=query,
+        remove_pending_request=lambda future: None,
+    )
+    node._request(raw)
+    node._drain()
+    replies[0].set_result(
+        SimpleNamespace(
+            found=True,
+            matches=True,
+            ready=False,
+            state="FAILED",
+            assigned_robot_id="amr_01",
+            success=False,
+            error_code="RESOURCE_WAIT_TIMEOUT",
+            message="",
+        )
+    )
+    node._drain()
+    assert statuses(broker)[-1]["state"] == "QUEUED"
+    assert "restart" in node._refreshes and len(goals) == 1
+    now[0] += 1.1
+    node._drain()
+    replies[1].set_result(
+        SimpleNamespace(
+            found=True,
+            matches=True,
+            ready=True,
+            state="RECOVERY_REQUIRED",
+            assigned_robot_id="amr_01",
+            success=False,
+            error_code="RESOURCE_WAIT_TIMEOUT",
+            message="",
+        )
+    )
+    node._drain()
+    assert statuses(broker)[-1]["state"] == "RECOVERY_REQUIRED"
+    assert node._refreshes == {} and len(goals) == 1
 
 
 def test_without_dds_automatic_request_uses_empty_fleet_pin(without_dds):
