@@ -339,10 +339,31 @@ desktop/mobile dashboard commands separately pass with executed Chrome
 run in normal CI before the unchanged real browser stage. RED and GREEN receipts
 remain under `artifacts/final-fix-20261009.rWzGz8/hosted-compatibility`.
 
+The controller's fresh complete `scripts/run_ci_checks.sh` command exits zero
+on frozen source `1949c37`. Its unique root is
+`artifacts/ci/20261009T094913Z-run.MJu4mk`: all twelve packages build in 55.1
+seconds and finish serial tests in 4 minutes 13 seconds. Its exact result gate
+contains 1,640 records with zero errors, failures or skips. Separate stages
+pass 338 pure cases in 225.81 seconds, 63 contract/schema cases, 30 bounded
+fleet cases, all nine browser ownership contracts with zero skips, the complete
+actual desktop/mobile dashboard check and 95 real protocol cases in 67.86
+seconds. These categories overlap and must not be summed as distinct tests.
+The actual browser is Chrome/154.0.8037.97 under owned official Node 22.23.3;
+screenshots are retained under `artifacts/dashboard/browser-MIGeW7`. This is
+local execution with the declared ROS underlay and genuine upstream Nav2
+resources, not a hosted result or a system-wide dependency upgrade. Runtime,
+test, script and workflow hashes match before and after the complete command.
+
+Scoped independent review approves the correction with no Critical or
+Important finding. One pre-existing minor edge remains: an explicitly empty
+`CHROME` override throws synchronously before cleanup and leaves its fresh
+empty profile, without spawning a child. Use an unset override or a valid
+executable path. This invalid-configuration edge is not the hosted stall.
+
 The preceding 433-case full receipt and failed hosted 1,640-record receipt are
-not relabeled as containing this test-only correction. A fresh complete public
-CI command, scoped independent approval and new hosted execution are pending
-at this handoff. No ROS/dashboard product change, retry, dependency pin,
+not relabeled as containing this test-only correction. New hosted execution
+remains pending at this publication handoff; the earlier startup stall's cause
+remains unproven. No ROS/dashboard product change, retry, dependency pin,
 deadline extension, two-robot all-scenario or new media result is claimed.
 
 ## Current local verification — historical Version 1 (3 October 2026)
